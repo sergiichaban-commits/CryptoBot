@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+aiohttp
+websockets
+pandas
+numpy
+pytz
