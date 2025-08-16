@@ -1,11 +1,12 @@
 """
-CryptoBot — Bybit 1m Candles Test (Render-ready, JobQueue + fallback)
+CryptoBot — Bybit 1m Candles Test (Render free Web Service)
 - Secure: whitelist chat_ids (env: ALLOWED_CHAT_IDS)
 - Recipients from TELEGRAM_CHAT_ID filtered by whitelist
-- Health-check every 60 minutes
 - Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
 - Sends a compact candle summary every 5 minutes (on confirmed candle)
-- Render: Background Worker | Build: pip install -r requirements.txt | Start: python cryptobot_telegram_bot.py
+- Health ping every 60 minutes
+- Mini HTTP server binds to $PORT (/, /health) so Render Web Service stays up on free plan
+- Start Command: python cryptobot_telegram_bot.py
 """
 
 import os
@@ -32,6 +33,7 @@ POST_EVERY_N_MIN = 5
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
 
+HTTP_PORT = int(os.environ.get("PORT", "8000"))  # Render присваивает $PORT для Web Service
 
 def _parse_id_list(value: str) -> List[int]:
     """Парсер chat_id, устойчивый к пробелам/кавычкам."""
@@ -48,20 +50,17 @@ def _parse_id_list(value: str) -> List[int]:
             print(f"[warn] cannot parse chat id from: {repr(part)}")
     return out
 
-
 ALLOWED_CHAT_IDS: Set[int] = set(_parse_id_list(os.environ.get("ALLOWED_CHAT_IDS", ""))) or ALLOWED_DEFAULT
 RECIPIENTS: List[int] = [cid for cid in _parse_id_list(os.environ.get("TELEGRAM_CHAT_ID", "")) if cid in ALLOWED_CHAT_IDS]
 
-# Диагностика в логи Render
 print(f"[info] ALLOWED_CHAT_IDS = {sorted(ALLOWED_CHAT_IDS)}")
 print(f"[info] TELEGRAM_CHAT_ID(raw) = {os.environ.get('TELEGRAM_CHAT_ID', '')!r}")
 print(f"[info] RECIPIENTS (whitelisted) = {RECIPIENTS}")
 print(f"[info] BYBIT_SYMBOL = {SYMBOL!r}")
-
+print(f"[info] HTTP_PORT = {HTTP_PORT}")
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
 
 # ---------------- Handlers (whitelist) ----------------
 
@@ -88,7 +87,6 @@ async def ignore_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in ALLOWED_CHAT_IDS:
         return
-
 
 # ---------------- Bybit WS consumer ----------------
 
@@ -133,11 +131,9 @@ async def bybit_candles(application: Application):
             print("[warn] WS reconnecting due to:", e)
             await asyncio.sleep(3)  # backoff
 
-
 # ---------------- Health-check ----------------
 
 async def health_loop(application: Application):
-    """Фолбэк-цикл пинга, если JobQueue недоступен."""
     if not RECIPIENTS:
         return
     while True:
@@ -148,56 +144,64 @@ async def health_loop(application: Application):
                 print(f"[warn] health-check -> {cid}: {e}")
         await asyncio.sleep(PING_INTERVAL_MIN * 60)
 
+# ---------------- Tiny HTTP server (for Render Web Service) ----------------
+
+async def run_http_server():
+    # Мини-сервер на aiohttp: / и /health
+    from aiohttp import web
+
+    async def hello(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", hello)
+    app.router.add_get("/health", hello)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=HTTP_PORT)
+    await site.start()
+    print(f"[info] HTTP server listening on 0.0.0.0:{HTTP_PORT}")
 
 # ---------------- App lifecycle ----------------
 
 async def post_init(application: Application):
-    # Если получателей нет — логируем и не падаем
-    if not RECIPIENTS:
-        print("[error] RECIPIENTS is empty. Check TELEGRAM_CHAT_ID and ALLOWED_CHAT_IDS env vars.")
-
     # Стартовое сообщение (если есть кому слать)
     for cid in RECIPIENTS:
         try:
-            await application.bot.send_message(chat_id=cid, text=f"✅ Render: бот запущен. Symbol={SYMBOL}")
+            await application.bot.send_message(chat_id=cid, text=f"✅ Render Web Service: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
 
-    # Если JobQueue есть (установлен extra 'job-queue') — используем его
-    if getattr(application, "job_queue", None) is not None:
-        try:
-            application.job_queue.run_repeating(
-                lambda ctx: ctx.application.create_task(health_loop(ctx.application)),
-                interval=timedelta(minutes=PING_INTERVAL_MIN),
-                first=timedelta(seconds=2),
-                name="health-wrapper",
-            )
-            application.job_queue.run_once(
-                lambda ctx: ctx.application.create_task(bybit_candles(ctx.application)),
-                when=timedelta(seconds=2),
-                name="start-ws",
-            )
-            print("[info] JobQueue is enabled.")
-            return
-        except Exception as e:
-            print(f"[warn] JobQueue scheduling failed, falling back: {e}")
-
-    # Фолбэк без JobQueue: запускаем корутины напрямую (без PTB warning)
-    print("[info] JobQueue not available -> fallback to background tasks.")
+    # Запускаем фоновые задачи (без JobQueue, чистый asyncio)
     asyncio.create_task(health_loop(application))
     asyncio.create_task(bybit_candles(application))
 
-
-def main():
+async def run_all():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
-    app = Application.builder().token(token).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(MessageHandler(filters.ALL, ignore_all))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
+    # 1) Telegram App
+    tg_app = Application.builder().token(token).post_init(post_init).build()
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("status", status))
+    tg_app.add_handler(MessageHandler(filters.ALL, ignore_all))
+
+    # Запускаем polling как задачу (не блокируем цикл)
+    tg_task = asyncio.create_task(tg_app.run_polling(allowed_updates=Update.ALL_TYPES))
+
+    # 2) HTTP health server for Render Web Service
+    await run_http_server()
+
+    # 3) Ждём завершения Telegram задачи
+    await tg_task
+
+def main():
+    try:
+        asyncio.run(run_all())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
