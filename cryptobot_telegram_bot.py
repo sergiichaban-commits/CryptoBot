@@ -6,7 +6,7 @@ import json
 import math
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -67,11 +67,19 @@ BODY_ATR_MULT = float(os.environ.get("BODY_ATR_MULT", "0.6"))
 BODY_ATR_STRONG = float(os.environ.get("BODY_ATR_STRONG", "0.8"))
 OI_DELTA_PCT_5M = float(os.environ.get("OI_DELTA_PCT_5M", "2.0"))
 OI_DELTA_PCT_15M = float(os.environ.get("OI_DELTA_PCT_15M", "3.0"))
-LIQ_PCTL = float(os.environ.get("LIQ_PCTL", "95"))  # 95-й перцентиль
+LIQ_PCTL = float(os.environ.get("LIQ_PCTL", "95"))
 VWAP_DEV_PCT = float(os.environ.get("VWAP_DEV_PCT", "0.5"))
-BTC_SYNC_MAX_DIV = float(os.environ.get("BTC_SYNC_MAX_DIV", "0.4"))  # %
+BTC_SYNC_MAX_DIV = float(os.environ.get("BTC_SYNC_MAX_DIV", "0.4"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "240"))
 SNAPSHOT_ENABLED = (os.environ.get("SNAPSHOT_ENABLED", "1") != "0")
+
+# Авто-подбор по волатильности
+AUTO_VOL_ENABLED = (os.environ.get("AUTO_VOL_ENABLED", "1") != "0")
+AUTO_VOL_TOP_N = int(os.environ.get("AUTO_VOL_TOP_N", "15"))
+AUTO_VOL_SCAN_COUNT = int(os.environ.get("AUTO_VOL_SCAN_COUNT", "60"))
+AUTO_VOL_UTC_HOUR = int(os.environ.get("AUTO_VOL_UTC_HOUR", "0"))
+AUTO_VOL_UTC_MIN = int(os.environ.get("AUTO_VOL_UTC_MIN", "10"))
+MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", "30"))
 
 # частоты задач
 HEALTH_INTERVAL_SEC = 60 * 60
@@ -87,6 +95,7 @@ if PUBLIC_URL:
 print(f"[info] WEBHOOK_PATH = '{WEBHOOK_PATH}'")
 print(f"[info] Volume trigger params: VOL_MULT={VOL_MULT}, VOL_SMA_PERIOD={VOL_SMA_PERIOD}, "
       f"BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s")
+print(f"[info] AutoVol: enabled={AUTO_VOL_ENABLED}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, time={AUTO_VOL_UTC_HOUR:02d}:{AUTO_VOL_UTC_MIN:02d}Z, max={MAX_SYMBOLS}")
 
 # ====================== STATE & MODELS ======================
 
@@ -109,10 +118,10 @@ class SymState:
     vwap_num: float = 0.0
     vwap_den: float = 0.0
     vwap: float = float("nan")
-    last_daily_reset: Optional[int] = None  # day epoch in UTC (ms)
-    oi_series: List[Tuple[int, float]] = field(default_factory=list)  # (ts_ms, oi)
-    liq_5m_history: List[float] = field(default_factory=list)  # notional per 5m
-    liq_bucket_start: Optional[int] = None  # sec epoch (start of 5m)
+    last_daily_reset: Optional[int] = None
+    oi_series: List[Tuple[int, float]] = field(default_factory=list)
+    liq_5m_history: List[float] = field(default_factory=list)
+    liq_bucket_start: Optional[int] = None
     liq_bucket_notional: float = 0.0
     last_alert_ms: int = 0
 
@@ -122,6 +131,8 @@ class GlobalState:
         self.symbols: List[str] = []
         self.syms: Dict[str, SymState] = {}
         self.ws_task: Optional[asyncio.Task] = None
+        self.last_autovol_at: Optional[str] = None
+        self.last_autovol_added: List[str] = []
 
     async def load_symbols(self):
         symbols = list(ENV_SYMBOLS)
@@ -145,7 +156,6 @@ class GlobalState:
             self.symbols = new_symbols
             for s in new_symbols:
                 self.syms.setdefault(s, SymState())
-            # удалить стейты для исключённых символов не обязательно
             try:
                 with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                     json.dump({"symbols": self.symbols}, f, ensure_ascii=False, indent=2)
@@ -195,10 +205,7 @@ async def get_kline_1m(symbol: str, limit: int = 200) -> List[Candle]:
         return out
     rows = (data.get("result") or {}).get("list") or []
     for row in rows:
-        # [start, open, high, low, close, volume, turnover]
-        t = int(row[0])
-        o, h, l, c = map(float, row[1:5])
-        v = float(row[5])
+        t = int(row[0]); o, h, l, c = map(float, row[1:5]); v = float(row[5])
         out.append(Candle(t, o, h, l, c, v, True))
     out.sort(key=lambda x: x.t)
     return out
@@ -212,10 +219,8 @@ async def get_oi_snapshots(symbol: str, interval: str = "5min", limit: int = 4) 
     if not data or data.get("retCode") != 0:
         return out
     rows = (data.get("result") or {}).get("list") or []
-    # Bybit возвращает newest first
     for row in reversed(rows):
-        ts = int(row["timestamp"])
-        oi = float(row["openInterest"])
+        ts = int(row["timestamp"]); oi = float(row["openInterest"])
         out.append((ts, oi))
     return out
 
@@ -233,8 +238,7 @@ def atr(candles: List[Candle], period: int = 14) -> float:
         return float("nan")
     trs = []
     for i in range(1, period + 1):
-        c0 = candles[-i-1]
-        c1 = candles[-i]
+        c0 = candles[-i-1]; c1 = candles[-i]
         tr = max(c1.h - c1.l, abs(c1.h - c0.c), abs(c1.l - c0.c))
         trs.append(tr)
     return float(sum(trs) / period)
@@ -275,13 +279,9 @@ def detect_sweep(candles: List[Candle], lookback: int = 30) -> Optional[str]:
     return None
 
 def maybe_reset_vwap(st: SymState, t_ms: int):
-    # daily reset @ 00:00 UTC
     day_ms = int(datetime.fromtimestamp(t_ms/1000, tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     if st.last_daily_reset is None or day_ms != st.last_daily_reset:
-        st.vwap_num = 0.0
-        st.vwap_den = 0.0
-        st.vwap = float("nan")
-        st.last_daily_reset = day_ms
+        st.vwap_num = 0.0; st.vwap_den = 0.0; st.vwap = float("nan"); st.last_daily_reset = day_ms
 
 def update_vwap(st: SymState, c: Candle):
     typical = (c.h + c.l + c.c) / 3.0
@@ -316,12 +316,22 @@ async def bootstrap_history():
             continue
         st.candles = kl
         for c in kl:
-            maybe_reset_vwap(st, c.t)
-            update_vwap(st, c)
+            maybe_reset_vwap(st, c.t); update_vwap(st, c)
+        st.oi_series = await get_oi_snapshots(sym, "5min", 4)
+
+async def bootstrap_for_symbols(symbols: List[str]):
+    for sym in symbols:
+        st = await STATE.get_symstate(sym)
+        kl = await get_kline_1m(sym, limit=220)
+        if not kl:
+            continue
+        st.candles = kl
+        st.vwap_num = st.vwap_den = 0.0; st.vwap = float("nan"); st.last_daily_reset = None
+        for c in kl:
+            maybe_reset_vwap(st, c.t); update_vwap(st, c)
         st.oi_series = await get_oi_snapshots(sym, "5min", 4)
 
 async def ws_liq_loop():
-    """Собираем ликвидации через WS и аггрегируем в 5m бакеты."""
     syms = await STATE.get_symbols()
     if not syms:
         return
@@ -339,28 +349,24 @@ async def ws_liq_loop():
                 continue
             _, symbol = topic.split(".", 1)
             st = await STATE.get_symstate(symbol)
-            now_bucket = (int(datetime.now(timezone.utc).timestamp()) // 300) * 300  # sec
+            now_bucket = (int(datetime.now(timezone.utc).timestamp()) // 300) * 300
             if st.liq_bucket_start is None:
                 st.liq_bucket_start = now_bucket
             if now_bucket != st.liq_bucket_start:
-                # rotate
                 st.liq_5m_history.append(st.liq_bucket_notional)
-                # ограничим историю ~7 дней (7*24*12 = 2016 бакетов)
                 if len(st.liq_5m_history) > 2100:
                     st.liq_5m_history = st.liq_5m_history[-2100:]
                 st.liq_bucket_notional = 0.0
                 st.liq_bucket_start = now_bucket
             for it in data.get("data", []):
                 try:
-                    qty = float(it.get("execQty", 0.0))
-                    price = float(it.get("execPrice", 0.0))
+                    qty = float(it.get("execQty", 0.0)); price = float(it.get("execPrice", 0.0))
                     st.liq_bucket_notional += qty * price
                 except Exception:
                     continue
 
 async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     st = await STATE.get_symstate(symbol)
-    # подкачиваем последний бар (1-2 бара, чтобы поймать новый закрывшийся)
     recent = await get_kline_1m(symbol, limit=2)
     if recent:
         last = recent[-1]
@@ -368,17 +374,14 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
             st.candles[-1] = last
         else:
             st.candles.extend(recent if not st.candles else [last])
-            st.candles = st.candles[-240:]  # ~4 часа истории
-        maybe_reset_vwap(st, last.t)
-        update_vwap(st, last)
+            st.candles = st.candles[-240:]
+        maybe_reset_vwap(st, last.t); update_vwap(st, last)
     if len(st.candles) < max(ATR_PERIOD+1, VOL_SMA_PERIOD):
         return None
 
-    # обновим OI
     oi_last = await get_oi_snapshots(symbol, "5min", 1)
     if oi_last:
-        st.oi_series.extend(oi_last)
-        st.oi_series = st.oi_series[-40:]
+        st.oi_series.extend(oi_last); st.oi_series = st.oi_series[-40:]
 
     c = st.candles[-1]
     body = abs(c.c - c.o)
@@ -387,7 +390,6 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     if math.isnan(atr14) or math.isnan(vol_sma) or vol_sma == 0:
         return None
 
-    # ΔOI
     def oi_change_pct(minutes: int) -> Optional[float]:
         if len(st.oi_series) < 2:
             return None
@@ -406,32 +408,25 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     oi_trigger = False
     oi_hint: Optional[str] = None
     if oi5 is not None and abs(oi5) >= OI_DELTA_PCT_5M:
-        oi_trigger = True
-        oi_hint = "short" if oi5 > 0 else "long"
+        oi_trigger = True; oi_hint = "short" if oi5 > 0 else "long"
     elif oi15 is not None and abs(oi15) >= OI_DELTA_PCT_15M:
-        oi_trigger = True
-        oi_hint = "short" if oi15 > 0 else "long"
+        oi_trigger = True; oi_hint = "short" if oi15 > 0 else "long"
 
-    # ликвидации
     liq_p95 = percentile(st.liq_5m_history[-500:], LIQ_PCTL) if st.liq_5m_history else float("nan")
     liq_now = st.liq_bucket_notional
     liq_trigger = (not math.isnan(liq_p95)) and liq_now >= liq_p95
 
-    # импульс + объём
     impulse = (body >= BODY_ATR_MULT * atr14) and (c.v >= VOL_MULT * vol_sma)
     strong_impulse = (body >= BODY_ATR_STRONG * atr14)
 
-    # контекст: sweep + FVG
     sweep = detect_sweep(st.candles, 30)
     fvg = detect_recent_fvg(st.candles[-20:])
 
-    # vwap dev (optional filter)
     vwap_ok = True
     if st.vwap and st.vwap > 0:
         dev_pct = abs(c.c - st.vwap) / st.vwap * 100.0
         vwap_ok = (dev_pct >= VWAP_DEV_PCT)
 
-    # BTC sync veto
     btc_ok = True
     if symbol != "BTCUSDT":
         bstate = await STATE.get_symstate("BTCUSDT")
@@ -442,7 +437,6 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
             if sweep == "down" and br < -BTC_SYNC_MAX_DIV:
                 btc_ok = False
 
-    # решение
     side: Optional[str] = None
     reasons: List[str] = []
 
@@ -453,38 +447,30 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
                 f"impulse {body/atr14:.2f}×ATR",
                 f"vol {c.v/vol_sma:.2f}×SMA{VOL_SMA_PERIOD}",
                 f"ΔOI {oi5:.2f}%" if oi5 is not None else f"ΔOI15 {oi15:.2f}%",
-                "liq≥P95",
-                "down-sweep"
+                "liq≥P95", "down-sweep"
             ]
-            if fvg == "bull":
-                reasons.append("bull FVG")
+            if fvg == "bull": reasons.append("bull FVG")
         elif sweep == "up":
             side = "SHORT"
             reasons += [
                 f"impulse {body/atr14:.2f}×ATR",
                 f"vol {c.v/vol_sma:.2f}×SMA{VOL_SMA_PERIOD}",
                 f"ΔOI {oi5:.2f}%" if oi5 is not None else f"ΔOI15 {oi15:.2f}%",
-                "liq≥P95",
-                "up-sweep"
+                "liq≥P95", "up-sweep"
             ]
-            if fvg == "bear":
-                reasons.append("bear FVG")
+            if fvg == "bear": reasons.append("bear FVG")
 
     if not side:
         return None
 
-    # антиспам
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     if now_ms - st.last_alert_ms < ALERT_COOLDOWN_SEC * 1000:
         return None
     st.last_alert_ms = now_ms
 
-    # entry: тело импульсной свечи, SL — экстремум
-    entry_from = min(c.o, c.c)
-    entry_to = max(c.o, c.c)
+    entry_from = min(c.o, c.c); entry_to = max(c.o, c.c)
     if side == "LONG":
         sl = c.l
-        # ближайший swing high
         hi = max([x.h for x in st.candles[-20:]], default=c.c)
         tp1 = hi if hi > c.c else c.c + (entry_to - sl)
     else:
@@ -503,21 +489,15 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     conf = max(0, min(100, conf))
 
     return Signal(
-        symbol=symbol,
-        side=side,
-        entry_from=entry_from,
-        entry_to=entry_to,
-        sl=sl,
-        tp1=tp1,
-        rr_tp1=rr_tp1,
-        confidence=int(round(conf)),
-        notes=reasons,
+        symbol=symbol, side=side,
+        entry_from=entry_from, entry_to=entry_to,
+        sl=sl, tp1=tp1, rr_tp1=rr_tp1,
+        confidence=int(round(conf)), notes=reasons,
     )
 
 async def send_signals(app: Application, sigs: List[Signal]):
     if not sigs:
         return
-    # сортировка по уверенности
     sigs.sort(key=lambda s: (-s.confidence, s.symbol))
     lines = [
         "*ChaSerBot — Intraday Setups*",
@@ -583,6 +563,110 @@ async def job_engine(context: ContextTypes.DEFAULT_TYPE):
     if sigs:
         await send_signals(app, sigs)
 
+# ====================== AUTO-VOL PICKER ======================
+
+async def fetch_top_by_turnover(session: aiohttp.ClientSession, n: int) -> List[str]:
+    """Bybit tickers (linear), top-N by 24h turnover, USDT only."""
+    data = await bybit_get(session, "/v5/market/tickers", {"category": "linear"})
+    out: List[Tuple[str, float]] = []
+    if not data or data.get("retCode") != 0:
+        return []
+    rows = (data.get("result") or {}).get("list") or []
+    for r in rows:
+        sym = str(r.get("symbol", ""))
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            turn = float(r.get("turnover24h", 0.0))
+        except Exception:
+            turn = 0.0
+        out.append((sym, turn))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in out[:max(1, n)]]
+
+async def get_kline_daily_closes(session: aiohttp.ClientSession, symbol: str, limit: int = 8) -> List[float]:
+    data = await bybit_get(session, "/v5/market/kline", {
+        "category": "linear", "symbol": symbol, "interval": "D", "limit": str(limit)
+    })
+    closes: List[float] = []
+    if not data or data.get("retCode") != 0:
+        return closes
+    rows = (data.get("result") or {}).get("list") or []
+    for row in rows:
+        closes.append(float(row[4]))
+    closes.sort()  # Bybit может вернуть newest->oldest; для std нам нужен порядок — отсортим по времени
+    return closes
+
+def realized_vol_pct(closes: List[float]) -> float:
+    """std проц. доходностей за ~неделю (D-бары), без ежегодной шкалы — для ранжирования."""
+    if len(closes) < 5:
+        return float("nan")
+    rets = []
+    for i in range(1, len(closes)):
+        if closes[i-1] <= 0:
+            return float("nan")
+        rets.append((closes[i] - closes[i-1]) / closes[i-1] * 100.0)
+    if not rets:
+        return float("nan")
+    return float(np.std(np.array(rets, dtype=float), ddof=1))
+
+async def pick_symbols_by_week_vol(top_n: int, scan_count: int) -> List[str]:
+    async with aiohttp.ClientSession() as s:
+        pool = await fetch_top_by_turnover(s, scan_count)
+        if not pool:
+            return []
+        sem = asyncio.Semaphore(10)
+        vols: Dict[str, float] = {}
+
+        async def worker(sym: str):
+            async with sem:
+                closes = await get_kline_daily_closes(s, sym, limit=8)
+                vol = realized_vol_pct(closes)
+                if not math.isnan(vol):
+                    vols[sym] = vol
+                await asyncio.sleep(0.03)
+
+        await asyncio.gather(*(worker(sym) for sym in pool))
+        ranked = sorted(vols.items(), key=lambda kv: kv[1], reverse=True)
+        return [sym for sym, _ in ranked[:max(1, top_n)]]
+
+async def job_autovol(context: ContextTypes.DEFAULT_TYPE, manual_topn: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    """Считает топ волатильных и ДОБАВЛЯЕТ к текущему списку (уникально, с лимитом)."""
+    topn = manual_topn if manual_topn is not None else AUTO_VOL_TOP_N
+    added: List[str] = []
+    before = await STATE.get_symbols()
+    try:
+        picked = await pick_symbols_by_week_vol(topn, AUTO_VOL_SCAN_COUNT)
+        if not picked:
+            return [], before
+        new = list(before)
+        for sym in picked:
+            if sym not in new:
+                new.append(sym)
+        # ужмём по MAX_SYMBOLS (оставим первые — текущие в приоритете)
+        if len(new) > MAX_SYMBOLS:
+            new = new[:MAX_SYMBOLS]
+        await STATE.set_symbols(new)
+        # инициализируем историю для новых
+        to_bootstrap = [s for s in new if s not in before]
+        if to_bootstrap:
+            await bootstrap_for_symbols(to_bootstrap)
+        added = [s for s in new if s not in before]
+        STATE.last_autovol_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+        STATE.last_autovol_added = added
+        # пересобрать WS подписку на ликвидации — в простом варианте достаточно перезапуска контейнера;
+        # здесь мягко предупредим (движок по ликвидациям продолжит работать по текущему списку до рестарта WS).
+        try:
+            await context.application.bot.send_message(
+                chat_id=RECIPIENTS[0],
+                text=f"🔁 AutoVol обновил список.\nДобавлены: {', '.join(added) if added else '—'}\nИтог: {', '.join(new)}"
+            )
+        except Exception:
+            pass
+        return added, new
+    except Exception:
+        return [], before
+
 # ====================== COMMANDS ======================
 
 async def safe_reply(update: Update, text: str):
@@ -601,7 +685,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /about — сведения\n"
         "• /status — активные символы\n"
         "• /symbol <SYMBOL>\n"
-        "• /symbols — показать/установить список (через запятую)"
+        "• /symbols — показать/установить список (через запятую)\n"
+        "• /autosymbols [N] — добавить топ-N самых волатильных за неделю"
     )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -613,13 +698,15 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return
     syms = await STATE.get_symbols()
-    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}")
+    auto_line = f"AutoVol: {'ON' if AUTO_VOL_ENABLED else 'OFF'}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, max={MAX_SYMBOLS}"
+    last_auto = f"Последний автосчёт: {STATE.last_autovol_at or '—'}; добавлено: {', '.join(STATE.last_autovol_added) or '—'}"
+    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}\n{last_auto}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return
     syms = await STATE.get_symbols()
-    await safe_reply(update, f"Активные символы: {', '.join(syms)}")
+    await safe_reply(update, f"Активные символы ({len(syms)}): {', '.join(syms)}")
 
 def _normalize_symbols_arg(args: List[str]) -> List[str]:
     joined = " ".join(args).replace(";", ",")
@@ -643,6 +730,7 @@ async def cmd_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"Нет такого linear на Bybit: {bad[0]}")
         return
     await STATE.set_symbols(ok)
+    await bootstrap_for_symbols(ok)
     await safe_reply(update, f"Готово: {ok[0]}")
 
 async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,26 +745,44 @@ async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Пример: /symbols BTCUSDT,ETHUSDT")
         return
     ok, bad = await validate_symbols_linear(wanted)
+    msg = []
     if bad:
-        await safe_reply(update, f"Не найдены: {', '.join(bad)}")
+        msg.append(f"Не найдены: {', '.join(bad)}")
     if ok:
         await STATE.set_symbols(ok)
-        await safe_reply(update, f"Новые символы: {', '.join(ok)}")
+        await bootstrap_for_symbols(ok)
+        msg.append(f"Новые символы: {', '.join(ok)}")
+    await safe_reply(update, "\n".join(msg) if msg else "Не удалось обновить список.")
+
+async def cmd_autosymbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id not in ALLOWED_CHAT_IDS:
+        return
+    topn = None
+    if context.args:
+        try:
+            topn = int(context.args[0])
+            if topn <= 0:
+                topn = None
+        except Exception:
+            topn = None
+    added, newlist = await job_autovol(context, manual_topn=topn)
+    if not added:
+        await safe_reply(update, "AutoVol: ничего не добавлено (возможно, уже в списке).")
+    else:
+        await safe_reply(update, f"AutoVol: добавил {len(added)} — {', '.join(added)}\nИтог ({len(newlist)}): {', '.join(newlist)}")
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return
-    await safe_reply(update, "Неизвестная команда. Попробуй /ping, /about, /status, /symbol, /symbols.")
+    await safe_reply(update, "Неизвестная команда. Попробуй /ping, /about, /status, /symbol, /symbols, /autosymbols.")
 
 # ====================== APP BOOTSTRAP ======================
 
 async def post_init(app: Application):
-    # загрузим стартовый список и истории
     await STATE.load_symbols()
     syms = await STATE.get_symbols()
     print(f"[info] Symbols at start: {', '.join(syms)}")
     await bootstrap_history()
-    # запустим WS ликвидаций
     app.create_task(ws_liq_loop())
 
 def build_application() -> Application:
@@ -689,28 +795,34 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", cmd_status, filters=common))
     app.add_handler(CommandHandler("symbol", cmd_symbol, filters=common))
     app.add_handler(CommandHandler("symbols", cmd_symbols, filters=common))
+    app.add_handler(CommandHandler("autosymbols", cmd_autosymbols, filters=common))
     app.add_handler(MessageHandler(filters.COMMAND & common, unknown_command))
 
-    # Планировщик
     jq = app.job_queue
     jq.run_repeating(job_health, interval=HEALTH_INTERVAL_SEC, first=10)
     if SNAPSHOT_ENABLED:
         jq.run_repeating(job_snapshots, interval=SNAPSHOT_INTERVAL_SEC, first=15)
     jq.run_repeating(job_engine, interval=ENGINE_INTERVAL_SEC, first=20)
 
+    if AUTO_VOL_ENABLED:
+        # ежедневный пересчёт в заданное UTC-время
+        jq.run_daily(
+            callback=lambda ctx: job_autovol(ctx),
+            time=dtime(hour=AUTO_VOL_UTC_HOUR, minute=AUTO_VOL_UTC_MIN, tzinfo=timezone.utc),
+        )
+
     return app
 
 def main():
     app = build_application()
     if PUBLIC_URL:
-        # чистый webhook режим, всё остальное внутри PTB
         app.run_webhook(
             listen="0.0.0.0",
             port=HTTP_PORT,
             url_path=WEBHOOK_PATH.lstrip("/"),
             webhook_url=f"{PUBLIC_URL.rstrip('/')}{WEBHOOK_PATH}",
             allowed_updates=Update.ALL_TYPES,
-            stop_signals=None,  # не трогаем сигналы в контейнере
+            stop_signals=None,
         )
     else:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
