@@ -1,23 +1,23 @@
 # cryptobot_telegram_bot.py
-# Telegram bot: webhook + health ping + self-ping for Render free tier
+# Telegram bot: webhook + access control + health ping + self-ping (Render)
 # Requirements (requirements.txt):
 #   python-telegram-bot[job-queue,webhooks]==21.6
 #   httpx~=0.27
-# Env:
-#   TELEGRAM_BOT_TOKEN           - обязательно
-#   TELEGRAM_CHAT_ID             - главный получатель (канал/чат)
-#   ALLOWED_CHAT_IDS             - CSV: список разрешённых chat_id
-#   RENDER_EXTERNAL_URL / PUBLIC_URL (Render сам проставляет первое)
-#   PORT                         - Render задаёт порт для вебсервиса
-#   (опц.) WEBHOOK_PATH          - путь вебхука, по умолчанию /wh-<token_prefix>
-#   (опц.) HEALTH_INTERVAL_SEC   - интервал "🟢 online" (по умолчанию 1200 = 20 мин)
-#   (опц.) SELF_PING_ENABLED     - "1"/"0" (по умолчанию 1)
-#   (опц.) SELF_PING_INTERVAL_SEC- интервал self-ping (по умолчанию 780 ≈ 13 мин)
-#   (опц.) SELF_PING_URL         - если нужно пинговать конкретный URL
-#   (опц.) SELF_PING_PATH        - если SELF_PING_URL не задан, используем PUBLIC_URL + PATH (по умолчанию "/")
 #
-# Команды:
-#   /start  /ping
+# Env:
+#   TELEGRAM_BOT_TOKEN           (required)
+#   TELEGRAM_CHAT_ID             (primary recipient: channel/chat id)
+#   ALLOWED_CHAT_IDS             (CSV of allowed chat ids; must include TELEGRAM_CHAT_ID)
+#   RENDER_EXTERNAL_URL or PUBLIC_URL (Render sets the first automatically)
+#   PORT                         (Render sets)
+#   (opt) WEBHOOK_PATH           (default /wh-<token_prefix8>)
+#   (opt) HEALTH_INTERVAL_SEC    (default 1200 = 20 min)
+#   (opt) HEALTH_FIRST_SEC       (default 60)  <-- первый health сразу через минуту
+#   (opt) STARTUP_PING_SEC       (default 10)  <-- единоразовый «бот запущен» после старта
+#   (opt) SELF_PING_ENABLED      ("1"/"0", default 1)
+#   (opt) SELF_PING_INTERVAL_SEC (default 780 ≈ 13 min)
+#   (opt) SELF_PING_URL          (if empty -> PUBLIC_URL + SELF_PING_PATH)
+#   (opt) SELF_PING_PATH         (default "/")
 
 from __future__ import annotations
 import os
@@ -35,8 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("cryptobot")
 
-# -------------------- Config helpers --------------------
-
+# ---------- helpers ----------
 def parse_int_list(csv: str) -> List[int]:
     out = []
     for part in (csv or "").split(","):
@@ -55,8 +54,7 @@ def getenv_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-# -------------------- Env --------------------
-
+# ---------- env ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN is required.")
@@ -68,7 +66,6 @@ PRIMARY_RECIPIENTS: List[int] = []
 if primary_chat_raw:
     try:
         cid = int(primary_chat_raw)
-        # в список получателей добавляем только те, кто есть в whitelist
         if cid in ALLOWED_CHAT_IDS:
             PRIMARY_RECIPIENTS.append(cid)
     except ValueError:
@@ -80,53 +77,49 @@ token_prefix = BOT_TOKEN.split(":")[0] if ":" in BOT_TOKEN else BOT_TOKEN[:8]
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/wh-{token_prefix[:8]}")
 WEBHOOK_URL = (PUBLIC_URL.rstrip("/") + WEBHOOK_PATH) if PUBLIC_URL else ""
 
-HEALTH_INTERVAL_SEC = getenv_int("HEALTH_INTERVAL_SEC", 1200)  # 20 минут
-SELF_PING_ENABLED = os.environ.get("SELF_PING_ENABLED", "1").lower() not in {"0", "false", "no"}
-SELF_PING_INTERVAL_SEC = getenv_int("SELF_PING_INTERVAL_SEC", 780)  # ~13 минут
-SELF_PING_URL = os.environ.get("SELF_PING_URL", "").strip()
-SELF_PING_PATH = os.environ.get("SELF_PING_PATH", "/")
+HEALTH_INTERVAL_SEC = getenv_int("HEALTH_INTERVAL_SEC", 1200)     # 20 мин
+HEALTH_FIRST_SEC    = getenv_int("HEALTH_FIRST_SEC", 60)          # первый health через 1 мин
+STARTUP_PING_SEC    = getenv_int("STARTUP_PING_SEC", 10)          # «бот запущен» через 10 сек
 
+SELF_PING_ENABLED        = os.environ.get("SELF_PING_ENABLED", "1").lower() not in {"0","false","no"}
+SELF_PING_INTERVAL_SEC   = getenv_int("SELF_PING_INTERVAL_SEC", 780)  # ~13 мин
+SELF_PING_URL            = os.environ.get("SELF_PING_URL", "").strip()
+SELF_PING_PATH           = os.environ.get("SELF_PING_PATH", "/")
 if not SELF_PING_URL and PUBLIC_URL:
     SELF_PING_URL = PUBLIC_URL.rstrip("/") + SELF_PING_PATH
 
 log.info("[cfg] ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_CHAT_IDS))
 log.info("[cfg] PRIMARY_RECIPIENTS=%s", PRIMARY_RECIPIENTS)
 log.info("[cfg] PUBLIC_URL='%s' PORT=%s WEBHOOK_PATH='%s'", PUBLIC_URL, PORT, WEBHOOK_PATH)
-log.info("[cfg] HEALTH_INTERVAL_SEC=%s", HEALTH_INTERVAL_SEC)
-log.info("[cfg] SELF_PING_ENABLED=%s SELF_PING_INTERVAL_SEC=%s SELF_PING_URL='%s'",
+log.info("[cfg] HEALTH_INTERVAL=%ss FIRST=%ss STARTUP_PING_SEC=%s",
+         HEALTH_INTERVAL_SEC, HEALTH_FIRST_SEC, STARTUP_PING_SEC)
+log.info("[cfg] SELF_PING_ENABLED=%s INTERVAL=%s URL='%s'",
          SELF_PING_ENABLED, SELF_PING_INTERVAL_SEC, SELF_PING_URL or "(disabled)")
 
-# -------------------- Access control --------------------
-
+# ---------- access control ----------
 def is_allowed(update: Update) -> bool:
-    """Разрешаем команды только из whitelisted чатов."""
-    cid = None
-    if update.effective_chat:
-        cid = update.effective_chat.id
+    cid = update.effective_chat.id if update.effective_chat else None
     return (cid in ALLOWED_CHAT_IDS) if cid is not None else False
 
 async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if is_allowed(update):
         return True
-    # Молча игнорируем чужаков
-    return False
+    return False  # молча игнорируем чужие чаты
 
-# -------------------- Handlers --------------------
-
+# ---------- commands ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update, context):
         return
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Привет! Я онлайн. Используй /ping для проверки.")
+    await context.bot.send_message(chat_id=update.effective_chat.id,
+                                   text="Привет! Я онлайн. Используй /ping для проверки.")
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update, context):
         return
     await context.bot.send_message(chat_id=update.effective_chat.id, text="🟢 online")
 
-# -------------------- Jobs (JobQueue) --------------------
-
+# ---------- jobs ----------
 async def job_health(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Периодический 'я жив' — отправляем только whitelisted получателям."""
     for chat_id in PRIMARY_RECIPIENTS:
         try:
             await context.bot.send_message(chat_id=chat_id, text="🟢 online", disable_notification=True)
@@ -134,7 +127,6 @@ async def job_health(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("[health] send to %s failed: %s", chat_id, repr(e))
 
 async def job_self_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Self-ping: дергаем свой URL, чтобы Render считал сервис активным."""
     url = SELF_PING_URL
     if not (SELF_PING_ENABLED and url):
         return
@@ -146,23 +138,31 @@ async def job_self_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         log.warning("[self-ping] %s failed: %s", url, repr(e))
 
-# -------------------- App bootstrap --------------------
+async def job_startup_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for chat_id in PRIMARY_RECIPIENTS:
+        try:
+            await context.bot.send_message(chat_id=chat_id,
+                                           text="✅ Бот запущен (webhook активен).")
+        except Exception as e:
+            log.warning("[startup] send to %s failed: %s", chat_id, repr(e))
 
+# ---------- app ----------
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команды
+    # команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
 
-    # Планировщик задач
+    # job queue
     if app.job_queue is None:
-        log.warning("JobQueue отсутствует — убедитесь, что установлен пакет 'python-telegram-bot[job-queue]'.")
+        log.warning("JobQueue отсутствует — убедитесь, что установлен 'python-telegram-bot[job-queue]'.")
     else:
-        # Health every HEALTH_INTERVAL_SEC, стартуем через ту же паузу
-        app.job_queue.run_repeating(job_health, interval=HEALTH_INTERVAL_SEC, first=HEALTH_INTERVAL_SEC)
-        # Self-ping каждые ~13 минут (или из ENV), старт — через 60 сек после запуска,
-        # чтобы успел подняться вебсервер/вебхук.
+        # единоразовый стартовый пинг
+        app.job_queue.run_once(job_startup_ping, when=STARTUP_PING_SEC)
+        # периодический health
+        app.job_queue.run_repeating(job_health, interval=HEALTH_INTERVAL_SEC, first=HEALTH_FIRST_SEC)
+        # self-ping
         if SELF_PING_ENABLED and SELF_PING_URL:
             app.job_queue.run_repeating(job_self_ping, interval=SELF_PING_INTERVAL_SEC, first=60)
 
@@ -172,28 +172,22 @@ def main():
     app = build_application()
 
     if not PUBLIC_URL:
-        # Fallback на polling (локальный запуск без Render), но лучше на сервере всегда WEBHOOK.
-        log.warning("PUBLIC_URL не задан — запускаю polling-режим (для локальных тестов).")
+        log.warning("PUBLIC_URL не задан — запускаю polling-режим (локально).")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
         return
 
-    # Чистим старый вебхук (если был), чтобы избежать конфликтов.
-    # Drop pending updates — так не подтянутся старые очереди.
+    # обнуляем старый вебхук и очередь обновлений
     log.info("Удаляю старый webhook (если был) и сбрасываю pending updates…")
-    # NB: в run_webhook можно указать webhook_url, PTB сам поставит хук. Но явная очистка — полезна.
     app.bot.delete_webhook(drop_pending_updates=True)
 
-    # Webhook-сервер PTB (tornado) слушает порт и обрабатывает пути.
-    # Любые GET к корню ("/") вернут 404, но это достаточно для self-ping,
-    # а POST на WEBHOOK_PATH принимает апдейты от Telegram.
-    log.info("Стартую webhook-сервер: listen=0.0.0.0 port=%s path=%s url=%s", PORT, WEBHOOK_PATH, WEBHOOK_URL)
+    log.info("Стартую webhook: listen=0.0.0.0 port=%s path=%s url=%s", PORT, WEBHOOK_PATH, WEBHOOK_URL)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=WEBHOOK_PATH,
-        webhook_url=WEBHOOK_URL,           # Telegram будет слать POST сюда
+        webhook_url=WEBHOOK_URL,
         allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,                 # не трогаем системные сигналы в контейнерах
+        stop_signals=None,  # безопасно для контейнеров на Render
     )
 
 if __name__ == "__main__":
