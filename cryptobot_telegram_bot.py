@@ -1,29 +1,25 @@
 """
-CryptoBot — Bybit 1m Candles Test (Render free Web Service)
+CryptoBot — Bybit 1m Candles Test (Render FREE Web Service, stable)
 - Secure: whitelist chat_ids (env: ALLOWED_CHAT_IDS)
 - Recipients from TELEGRAM_CHAT_ID filtered by whitelist
 - Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
 - Sends a compact candle summary every 5 minutes (on confirmed candle)
 - Health ping every 60 minutes
-- Mini HTTP server binds to $PORT (/, /health) so Render Web Service stays up on free plan
-- Start Command: python cryptobot_telegram_bot.py
+- Mini HTTP server binds to $PORT (/, /health) using stdlib http.server (no asyncio conflicts)
+- Start Command (Render Web Service): python cryptobot_telegram_bot.py
 """
 
 import os
-import asyncio
 import json
+import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
 from typing import List, Set, Optional
-from datetime import datetime, timezone, timedelta
 
 import websockets
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------------- Config / Security ----------------
 
@@ -62,7 +58,7 @@ print(f"[info] HTTP_PORT = {HTTP_PORT}")
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-# ---------------- Handlers (whitelist) ----------------
+# ---------------- Telegram handlers (whitelist) ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -83,7 +79,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ignore_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Полная тишина для чужих
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in ALLOWED_CHAT_IDS:
         return
@@ -144,64 +139,57 @@ async def health_loop(application: Application):
                 print(f"[warn] health-check -> {cid}: {e}")
         await asyncio.sleep(PING_INTERVAL_MIN * 60)
 
-# ---------------- Tiny HTTP server (for Render Web Service) ----------------
+# ---------------- Tiny HTTP server (no asyncio) ----------------
 
-async def run_http_server():
-    # Мини-сервер на aiohttp: / и /health
-    from aiohttp import web
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
 
-    async def hello(request):
-        return web.Response(text="OK")
+    def log_message(self, fmt, *args):
+        # тише лог
+        return
 
-    app = web.Application()
-    app.router.add_get("/", hello)
-    app.router.add_get("/health", hello)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=HTTP_PORT)
-    await site.start()
+def start_http_server():
+    srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
     print(f"[info] HTTP server listening on 0.0.0.0:{HTTP_PORT}")
 
 # ---------------- App lifecycle ----------------
 
 async def post_init(application: Application):
-    # Стартовое сообщение (если есть кому слать)
+    # стартовое сообщение (если есть кому слать)
     for cid in RECIPIENTS:
         try:
             await application.bot.send_message(chat_id=cid, text=f"✅ Render Web Service: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
-
-    # Запускаем фоновые задачи (без JobQueue, чистый asyncio)
+    # фоновые задачи в event loop PTB (без JobQueue)
     asyncio.create_task(health_loop(application))
     asyncio.create_task(bybit_candles(application))
 
-async def run_all():
+def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
 
-    # 1) Telegram App
-    tg_app = Application.builder().token(token).post_init(post_init).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("status", status))
-    tg_app.add_handler(MessageHandler(filters.ALL, ignore_all))
+    # 1) поднять HTTP-порт для Render (в отдельном потоке, без asyncio)
+    start_http_server()
 
-    # Запускаем polling как задачу (не блокируем цикл)
-    tg_task = asyncio.create_task(tg_app.run_polling(allowed_updates=Update.ALL_TYPES))
-
-    # 2) HTTP health server for Render Web Service
-    await run_http_server()
-
-    # 3) Ждём завершения Telegram задачи
-    await tg_task
-
-def main():
-    try:
-        asyncio.run(run_all())
-    except KeyboardInterrupt:
-        pass
+    # 2) Telegram bot (PTB управляет своим event loop сам — без asyncio.run вокруг)
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.ALL, ignore_all))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
