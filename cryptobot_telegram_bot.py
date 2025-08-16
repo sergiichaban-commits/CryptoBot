@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Утилиты ENV
+# ENV helpers
 # =========================
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -65,7 +65,7 @@ def _parse_id_list(s: Optional[str]) -> List[int]:
     return out
 
 # =========================
-# Конфиг
+# Config
 # =========================
 
 @dataclass
@@ -77,7 +77,7 @@ class Config:
     public_url: str
     webhook_path: str
 
-    # режимы/ротация
+    # universe / rotation
     universe_mode: str = os.getenv("UNIVERSE_MODE", "all").lower()  # all|topn
     ws_symbols_max: int = _env_int("WS_SYMBOLS_MAX", 60)
     universe_rotate_min: int = _env_int("UNIVERSE_ROTATE_MIN", 5)
@@ -90,14 +90,14 @@ class Config:
     self_ping_enabled: bool = _env_bool("SELF_PING_ENABLED", True)
     self_ping_interval_sec: int = _env_int("SELF_PING_INTERVAL_SEC", 780)  # 13m
 
-    # фильтры сигналов
+    # signal filters
     prob_min: float = _env_float("PROB_MIN", 69.9)
     rr_min: float = _env_float("RR_MIN", 2.0)
     profit_min_pct: float = _env_float("PROFIT_MIN_PCT", 1.0)
     signal_cooldown_sec: int = _env_int("SIGNAL_COOLDOWN_SEC", 600)
     signal_ttl_min: int = _env_int("SIGNAL_TTL_MIN", 12)
 
-    # параметры триггеров
+    # trigger params
     vol_mult: float = _env_float("VOL_MULT", 2.0)
     vol_sma_period: int = _env_int("VOL_SMA_PERIOD", 20)
     body_atr_mult: float = _env_float("BODY_ATR_MULT", 0.6)
@@ -241,7 +241,7 @@ def pct(a: float, b: float) -> float:
     return (a - b) / b * 100.0
 
 # =========================
-# Движок сигналов
+# Engine
 # =========================
 
 class TradeEngine:
@@ -537,7 +537,7 @@ async def self_ping_job(url: str):
         pass
 
 # =========================
-# Команды
+# Commands
 # =========================
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,12 +562,11 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# Application lifecycle
+# Lifecycle
 # =========================
 
 async def post_init(app: Application):
     cfg: Config = app.bot_data["cfg"]
-    # безопасно сбрасываем и выставляем вебхук
     await app.bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(0.1)
     await app.bot.set_webhook(url=cfg.public_url.rstrip("/") + cfg.webhook_path)
@@ -577,7 +576,6 @@ async def post_init(app: Application):
 
 def build_application(cfg: Config) -> Application:
     application = ApplicationBuilder().token(cfg.token).post_init(post_init).build()
-    # глобальные данные — в bot_data (mutable)
     application.bot_data["cfg"] = cfg
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
@@ -602,13 +600,12 @@ async def main_async():
     engine = TradeEngine(cfg, bybit, bot_send)
     app.bot_data["engine"] = engine
 
-    # universe до старта бота — ок
+    # bootstrap universe before app.start()
     try:
         await engine.bootstrap_universe()
     except Exception as e:
         logging.exception("bootstrap_universe failed: %s", e)
 
-    # планируем джобы до старта — job_queue поднимется при app.start()
     jq = app.job_queue
     jq.run_once(engine.job_start_ws, when=1)
     if cfg.universe_mode == "all":
@@ -618,39 +615,41 @@ async def main_async():
     if cfg.self_ping_enabled and cfg.public_url:
         jq.run_repeating(lambda c: self_ping_job(cfg.public_url), first=30, interval=cfg.self_ping_interval_sec)
 
-    # ---------- ВАЖНО: ручной async-режим вместо run_webhook ----------
-    await app.initialize()
-    await app.start()
-    # post_init уже отработает внутри initialize(), вебхук выставлен
-    await app.updater.start_webhook(
-        listen="0.0.0.0",
-        port=cfg.port,
-        url_path=cfg.webhook_path,
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,  # без перехвата сигналов — безопаснее для Render
-    )
-
+    # ---- ручной async-режим (без run_webhook)
     try:
-        # держим процесс живым
-        await asyncio.Event().wait()
-    finally:
-        # аккуратный shutdown
-        try:
-            await app.updater.stop()
-        except Exception:
-            pass
-        try:
-            await app.stop()
-        except Exception:
-            pass
-        try:
-            await app.shutdown()
-        except Exception:
-            pass
+        await app.initialize()
+        await app.start()
+        # ВАЖНО: у Updater.start_webhook НЕТ аргумента stop_signals
+        await app.updater.start_webhook(
+            listen="0.0.0.0",
+            port=cfg.port,
+            url_path=cfg.webhook_path,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Exception:
+        # если что-то упало ДО вечного ожидания — корректно закрыть сессию
         await aio_sess.close()
+        raise
+    else:
+        try:
+            # держим процесс живым
+            await asyncio.Event().wait()
+        finally:
+            try:
+                await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            await aio_sess.close()
 
 def main():
-    # чистый заход: полностью полагаемся на main_async (без повторных манипуляций с loop)
     asyncio.run(main_async())
 
 if __name__ == "__main__":
