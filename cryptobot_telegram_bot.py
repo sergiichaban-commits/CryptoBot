@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Конфигурация из ENV
+# Утилиты ENV
 # =========================
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -63,6 +63,10 @@ def _parse_id_list(s: Optional[str]) -> List[int]:
             if part.startswith("-") and part[1:].isdigit():
                 out.append(int(part))
     return out
+
+# =========================
+# Конфиг
+# =========================
 
 @dataclass
 class Config:
@@ -153,7 +157,7 @@ def load_config() -> Config:
     return cfg
 
 # =========================
-# Bybit API Клиент
+# Bybit API
 # =========================
 
 BYBIT_REST = "https://api.bybit.com"
@@ -211,10 +215,9 @@ class BybitClient:
             return None
 
 # =========================
-# Вспомогательные функции TA
+# TA helpers
 # =========================
 
-from typing import Iterable
 def atr_from_bars(bars: Deque[Tuple[float, float, float, float]], period: int) -> Optional[float]:
     if len(bars) < period + 1:
         return None
@@ -238,7 +241,7 @@ def pct(a: float, b: float) -> float:
     return (a - b) / b * 100.0
 
 # =========================
-# Торговый движок (скрининг + сигналы)
+# Движок сигналов
 # =========================
 
 class TradeEngine:
@@ -494,6 +497,7 @@ class TradeEngine:
         await self.bot_send(msg)
         self.last_signal_ts[sym] = time.time()
 
+    # jobs
     async def job_start_ws(self, ctx: ContextTypes.DEFAULT_TYPE):
         await self.ensure_ws()
 
@@ -504,7 +508,7 @@ class TradeEngine:
         await self.poll_oi_once()
 
 # =========================
-# Утилиты: Telegram и сервисные задачи
+# Telegram helpers
 # =========================
 
 async def send_to_recipients(application: Application, recipients: List[int], text: str):
@@ -533,7 +537,7 @@ async def self_ping_job(url: str):
         pass
 
 # =========================
-# Команды бота
+# Команды
 # =========================
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,11 +562,12 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================
-# MAIN
+# Application lifecycle
 # =========================
 
 async def post_init(app: Application):
     cfg: Config = app.bot_data["cfg"]
+    # безопасно сбрасываем и выставляем вебхук
     await app.bot.delete_webhook(drop_pending_updates=True)
     await asyncio.sleep(0.1)
     await app.bot.set_webhook(url=cfg.public_url.rstrip("/") + cfg.webhook_path)
@@ -572,12 +577,15 @@ async def post_init(app: Application):
 
 def build_application(cfg: Config) -> Application:
     application = ApplicationBuilder().token(cfg.token).post_init(post_init).build()
-    # ВАЖНО: кладём всё в bot_data (mutable), а НЕ в user_data (mappingproxy/read-only)
+    # глобальные данные — в bot_data (mutable)
     application.bot_data["cfg"] = cfg
-
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     return application
+
+# =========================
+# MAIN
+# =========================
 
 async def main_async():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -594,11 +602,13 @@ async def main_async():
     engine = TradeEngine(cfg, bybit, bot_send)
     app.bot_data["engine"] = engine
 
+    # universe до старта бота — ок
     try:
         await engine.bootstrap_universe()
     except Exception as e:
         logging.exception("bootstrap_universe failed: %s", e)
 
+    # планируем джобы до старта — job_queue поднимется при app.start()
     jq = app.job_queue
     jq.run_once(engine.job_start_ws, when=1)
     if cfg.universe_mode == "all":
@@ -608,21 +618,40 @@ async def main_async():
     if cfg.self_ping_enabled and cfg.public_url:
         jq.run_repeating(lambda c: self_ping_job(cfg.public_url), first=30, interval=cfg.self_ping_interval_sec)
 
-    app.run_webhook(
+    # ---------- ВАЖНО: ручной async-режим вместо run_webhook ----------
+    await app.initialize()
+    await app.start()
+    # post_init уже отработает внутри initialize(), вебхук выставлен
+    await app.updater.start_webhook(
         listen="0.0.0.0",
         port=cfg.port,
         url_path=cfg.webhook_path,
-        stop_signals=None,
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None,  # без перехвата сигналов — безопаснее для Render
     )
 
-def main():
     try:
-        asyncio.run(main_async())
-    except RuntimeError as e:
-        logging.warning("RuntimeError(main_async): %s — fallback to direct call", e)
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main_async())
+        # держим процесс живым
+        await asyncio.Event().wait()
+    finally:
+        # аккуратный shutdown
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+        await aio_sess.close()
+
+def main():
+    # чистый заход: полностью полагаемся на main_async (без повторных манипуляций с loop)
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
