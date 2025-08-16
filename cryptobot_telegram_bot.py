@@ -542,46 +542,91 @@ async def self_ping_job(url: str):
 # Commands
 # =========================
 
+def _check_auth(update: Update, cfg: Config) -> bool:
+    return update.effective_chat and update.effective_chat.id in cfg.allowed_chat_ids
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     cfg: Config = context.application.bot_data.get("cfg")
-    if chat_id not in cfg.allowed_chat_ids:
+    if not _check_auth(update, cfg):
         return
     now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     await update.effective_message.reply_text(f"pong — {now}")
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     cfg: Config = context.application.bot_data.get("cfg")
-    if chat_id not in cfg.allowed_chat_ids:
+    if not _check_auth(update, cfg):
         return
     eng: TradeEngine = context.application.bot_data.get("engine")
     total = len(eng.rotation_order)
     active = len(eng.active_symbols)
     idx = eng.rot_idx
     await update.effective_message.reply_text(
-        f"Вселенная: total={total}, active={active}, batch#{idx}, ws_topics={eng.ws_topics_count}"
+        f"Вселенная: total={total}, active={active}, batch#={idx}, ws_topics={eng.ws_topics_count}"
     )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.application.bot_data.get("cfg")
+    if not _check_auth(update, cfg):
+        return
+    eng: TradeEngine = context.application.bot_data.get("engine")
+    ws_ok = (eng.ws is not None) and (not eng.ws.closed)
+    bars_syms = sum(1 for s, q in eng.bars.items() if len(q) > 0)
+    oi_syms = len(eng.last_oi)
+    last_signals = len(eng.last_signal_ts)
+    msg = (
+        "🧪 <b>Status</b>\n"
+        f"WS: {'connected' if ws_ok else 'DISCONNECTED'} | topics={eng.ws_topics_count}\n"
+        f"Universe: total={len(eng.rotation_order)} active={len(eng.active_symbols)} batch#={eng.rot_idx}\n"
+        f"Data: bars_syms={bars_syms} oi_syms={oi_syms}\n"
+        f"Signals (cooldown map size): {last_signals}\n"
+        f"Filters: prob>{cfg.prob_min:.1f} R/R≥{cfg.rr_min:.2f} profit≥{cfg.profit_min_pct:.1f}%"
+    )
+    await update.effective_message.reply_html(msg, disable_web_page_preview=True)
+
+async def cmd_startws(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.application.bot_data.get("cfg")
+    if not _check_auth(update, cfg):
+        return
+    eng: TradeEngine = context.application.bot_data.get("engine")
+    try:
+        await eng.ensure_ws()
+        await update.effective_message.reply_text("WS: ensure/connect requested")
+    except Exception as e:
+        await update.effective_message.reply_text(f"WS error: {e}")
+
+async def cmd_rotate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.application.bot_data.get("cfg")
+    if not _check_auth(update, cfg):
+        return
+    eng: TradeEngine = context.application.bot_data.get("engine")
+    await eng.rotate_batch()
+    await update.effective_message.reply_text(f"Rotate → batch#{eng.rot_idx}, active={len(eng.active_symbols)}")
 
 # =========================
 # Lifecycle
 # =========================
 
 async def post_init(app: Application):
-    # Очищаем старый вебхук, но новый ставит сам start_webhook (ниже через webhook_url)
+    # Чистим старый вебхук; новый будет выставлен в start_webhook(webhook_url=...)
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logging.warning("WARN delete_webhook: %s", e)
     cfg: Config = app.bot_data["cfg"]
-    await send_to_recipients(app, cfg.recipients,
-                             f"✅ Render Web Service: бот запускается… Mode={cfg.universe_mode}, rotation={cfg.universe_rotate_min}m, WS={cfg.ws_symbols_max}")
+    try:
+        await send_to_recipients(app, cfg.recipients,
+                                 f"✅ Bot starting… mode={cfg.universe_mode}, rotation={cfg.universe_rotate_min}m, WS={cfg.ws_symbols_max}")
+    except Exception:
+        pass
 
 def build_application(cfg: Config) -> Application:
     application = ApplicationBuilder().token(cfg.token).post_init(post_init).build()
     application.bot_data["cfg"] = cfg
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("startws", cmd_startws))
+    application.add_handler(CommandHandler("rotate", cmd_rotate))
     return application
 
 # =========================
@@ -603,14 +648,16 @@ async def main_async():
     engine = TradeEngine(cfg, bybit, bot_send)
     app.bot_data["engine"] = engine
 
-    # Подготовим вселенную до запуска аппа
+    # 1) Подготовим вселенную и сразу поднимем WS, чтобы topics>0 были сразу
     try:
         await engine.bootstrap_universe()
+        await engine.ensure_ws()
     except Exception as e:
-        logging.exception("bootstrap_universe failed: %s", e)
+        logging.exception("bootstrap/WS failed: %s", e)
 
+    # 2) Планировщик задач
     jq = app.job_queue
-    jq.run_once(engine.job_start_ws, when=1)
+    jq.run_once(engine.job_start_ws, when=0)  # на всякий случай
     if cfg.universe_mode == "all":
         jq.run_repeating(engine.job_rotate, first=cfg.universe_rotate_min * 60, interval=cfg.universe_rotate_min * 60)
     jq.run_repeating(engine.job_poll_oi, first=10, interval=60)
@@ -618,11 +665,10 @@ async def main_async():
     if cfg.self_ping_enabled and cfg.public_url:
         jq.run_repeating(lambda c: self_ping_job(cfg.public_url), first=30, interval=cfg.self_ping_interval_sec)
 
-    # Ручной lifecycle без run_webhook
+    # 3) Ручной lifecycle без run_webhook
     try:
         await app.initialize()
         await app.start()
-        # ВАЖНО: передаём полный https-адрес вебхука, иначе Telegram отвергнет запрос
         full_hook = cfg.public_url.rstrip("/") + cfg.webhook_path
         await app.updater.start_webhook(
             listen="0.0.0.0",
