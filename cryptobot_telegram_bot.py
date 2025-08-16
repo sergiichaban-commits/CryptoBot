@@ -36,7 +36,6 @@ def _parse_int_list(val: str) -> List[int]:
     if not val:
         return []
     try:
-        # Разрешаем форматы: "1,2,3" или JSON "[1,2,3]"
         if val.strip().startswith("["):
             arr = json.loads(val)
             return [int(x) for x in arr]
@@ -155,18 +154,10 @@ class Config:
             ATR_PERIOD=atr_period,
         )
 
-        log.info(
-            "INFO [cfg] ALLOWED_CHAT_IDS=%s",
-            cfg.ALLOWED_CHAT_IDS,
-        )
+        log.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.ALLOWED_CHAT_IDS)
         log.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.PRIMARY_RECIPIENTS)
         log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%s", cfg.PUBLIC_URL, cfg.PORT)
-        log.info(
-            "INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=%ss",
-            cfg.HEALTH_SECONDS,
-            cfg.FIRST_HEALTH_DELAY,
-            cfg.SELF_PING_SECONDS,
-        )
+        log.info("INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=%ss", cfg.HEALTH_SECONDS, cfg.FIRST_HEALTH_DELAY, cfg.SELF_PING_SECONDS)
         log.info(
             "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_MODE=%s "
             "UNIVERSE_TOP_N=%s WS_SYMBOLS_MAX=%s ROTATE_MIN=%s PROB_MIN>%.1f "
@@ -197,9 +188,6 @@ class BybitClient:
             return data
 
     async def get_symbols_linear(self) -> List[str]:
-        """
-        Получить все фьючерсные (linear/USDT Perpetual) торгуемые символы.
-        """
         out: List[str] = []
         cursor = ""
         while True:
@@ -226,10 +214,8 @@ class BybitClient:
         if data.get("retCode") != 0:
             raise RuntimeError(f"Bybit kline error: {data}")
         rows = (data.get("result", {}) or {}).get("list", []) or []
-        # Bybit возвращает отсортированные по времени с конца к началу или наоборот — нормализуем по времени
         candles: List[Dict] = []
         for r in rows:
-            # r: [start, open, high, low, close, volume, turnover]
             candles.append(
                 {
                     "t": int(r[0]),
@@ -251,7 +237,6 @@ class BybitClient:
         rows = (data.get("result", {}) or {}).get("list", []) or []
         out: List[Tuple[int, float]] = []
         for r in rows:
-            # r: [timestamp, value]
             out.append((int(r[0]), float(r[1])))
         out.sort(key=lambda x: x[0])
         return out
@@ -326,7 +311,6 @@ def _analyze_symbol(
     candles: List[Dict],
     oi: List[Tuple[int, float]],
 ) -> Optional[Signal]:
-    # Требуется история для ATR/EMA/объёма
     need = max(cfg.VOL_SMA_PERIOD, cfg.ATR_PERIOD, 30) + 2
     if len(candles) < need:
         return None
@@ -344,31 +328,24 @@ def _analyze_symbol(
         return None
 
     vol_last = last["v"]
-    # Базовые фильтры — не «выравниваем» сигналы на самом пороге
     if body <= cfg.BODY_ATR_MULT * atr:
         return None
     if vol_last <= (cfg.VOL_MULT * vol_sma):
         return None
 
-    # Направление по телу свечи
     direction = "LONG" if last["c"] > last["o"] else "SHORT"
 
-    # ===== ТРЕНД / ДИНАМИЧЕСКИЕ МНОЖИТЕЛИ =====
     closes = [c["c"] for c in candles]
     ema20_ser = _ema_series(closes, 20)
     ema20, ema20_prev = ema20_ser[-1], ema20_ser[-2]
 
-    # сила тренда: насколько EMA20 движется за бар в единицах ATR
     trend_unit = abs((ema20 - ema20_prev) / max(1e-9, atr))
-    # базовое «растяжение» 0.9..1.4
     trend_strength = max(0.9, min(1.4, 0.9 + trend_unit * 0.6))
-    # бонус/штраф, если торгуем по наклону EMA20
     ema_dir = 1 if ema20 > ema20_prev else -1
     dir_sign = 1 if direction == "LONG" else -1
     trend_strength *= (1.05 if ema_dir == dir_sign else 0.95)
     trend_strength = max(0.85, min(1.5, trend_strength))
 
-    # Динамические множители ATR
     TAKE_ATR_BASE = 1.20
     STOP_ATR_BASE = 0.60
     if direction == "LONG":
@@ -386,7 +363,6 @@ def _analyze_symbol(
     take_pct = (abs(take - entry) / entry) * 100.0 if entry > 0 else 0.0
     stop_pct = (abs(entry - stop) / entry) * 100.0 if entry > 0 else 0.0
 
-    # Мини-структура: пробой/отбой от экстремума последних 20 баров
     breakout_units = 0.0
     lookback = 20
     if direction == "LONG":
@@ -398,18 +374,16 @@ def _analyze_symbol(
         if math.isfinite(ll):
             breakout_units = max(0.0, (ll - close) / max(1e-9, atr))
 
-    # Открытый интерес — величина и знак
     oi_boost = 0.0
     if len(oi) >= 2 and oi[-2][1] > 0:
         oi_delta_pct = (oi[-1][1] - oi[-2][1]) / oi[-2][1] * 100.0
         oi_boost = max(-8.0, min(8.0, 0.6 * oi_delta_pct * dir_sign))
 
-    # Вероятность: объём, тело/ATR, тренд, пробой, OI, сонаправленность с EMA
     vol_spike = vol_last / max(1e-9, vol_sma)
     body_rel = body / max(1e-9, atr)
 
     prob = 50.0
-    prob += 10.0 * math.log2(max(1.0, vol_spike))      # 2x=+10; 3x~+15.9
+    prob += 10.0 * math.log2(max(1.0, vol_spike))
     prob += 8.0 * (body_rel / cfg.BODY_ATR_MULT - 1.0)
     prob += 6.0 * (trend_strength - 1.0) * 5.0
     prob += 10.0 * breakout_units
@@ -417,7 +391,6 @@ def _analyze_symbol(
     prob += (4.0 if ema_dir == dir_sign else -6.0)
     prob = max(0.0, min(99.9, prob))
 
-    # ФИЛЬТРЫ
     if prob < cfg.PROB_MIN:
         return None
     if rr < cfg.RR_MIN:
@@ -446,8 +419,8 @@ class State:
         self.total_symbols: List[str] = []
         self.active_symbols: List[str] = []
         self.batch_idx: int = 0
-        self.last_signal_sent: Dict[str, float] = {}  # symbol -> ts
-        self.live_signals: Dict[str, Signal] = {}     # символы с активным TTL
+        self.last_signal_sent: Dict[str, float] = {}
+        self.live_signals: Dict[str, Signal] = {}
 
 
 # --------------------------- TELEGRAM ХЭНДЛЕРЫ ---------------------------
@@ -513,19 +486,20 @@ async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
     if not cfg.PUBLIC_URL:
         return
     url = cfg.PUBLIC_URL
-    # пингуем корень — Render держит инстанс бодрым
+    session: aiohttp.ClientSession = context.bot_data.get("aiohttp_session")
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-            async with s.get(url) as _:
+        if session and not session.closed:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as _:
                 pass
+        else:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+                async with s.get(url) as _:
+                    pass
     except Exception as e:
         log.debug("self-ping error: %s", e)
 
 
 async def job_load_universe(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Загружаем полный список линейных USDT-перпетуалов и активируем батч.
-    """
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
     client: BybitClient = context.bot_data["bybit"]
@@ -533,12 +507,10 @@ async def job_load_universe(context: ContextTypes.DEFAULT_TYPE):
     try:
         all_syms = await client.get_symbols_linear()
         if cfg.UNIVERSE_MODE == "top" and cfg.UNIVERSE_TOP_N > 0:
-            # Тут можно сортировать по обороту/volatility, но оставим как есть (пример).
             st.total_symbols = all_syms[: cfg.UNIVERSE_TOP_N]
         else:
             st.total_symbols = all_syms
 
-        # первая активация
         await _rotate_active(context)
         log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
     except Exception as e:
@@ -546,16 +518,12 @@ async def job_load_universe(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _rotate_active(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Ротация активных символов «по кольцу».
-    """
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
     if not st.total_symbols:
         return
     n = cfg.WS_SYMBOLS_MAX
     start = (st.batch_idx * n) % len(st.total_symbols)
-    # набираем n символов по кругу
     new_active: List[str] = []
     i = start
     while len(new_active) < n and st.total_symbols:
@@ -563,11 +531,7 @@ async def _rotate_active(context: ContextTypes.DEFAULT_TYPE):
         i += 1
     st.active_symbols = new_active
     st.batch_idx += 1
-    log.info(
-        "INFO [universe] rotated: active=%d batch#%d",
-        len(st.active_symbols),
-        st.batch_idx,
-    )
+    log.info("INFO [universe] rotated: active=%d batch#%d", len(st.active_symbols), st.batch_idx)
 
 
 async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
@@ -575,10 +539,6 @@ async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_scan(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Периодически сканируем активные символы и выдаём только актуальные сетапы,
-    отсортированные по вероятности (без публикации «нет сетапов»).
-    """
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
     client: BybitClient = context.bot_data["bybit"]
@@ -594,7 +554,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
             sig = _analyze_symbol(cfg, sym, candles, oi)
             if sig:
                 candidates.append(sig)
-            # маленькая пауза, чтобы не бить лимиты
             await asyncio.sleep(0.05)
         except Exception as e:
             log.debug("scan %s error: %s", sym, e)
@@ -602,7 +561,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
     if not candidates:
         return
 
-    # сортировка по вероятности убыв.
     candidates.sort(key=lambda s: (-s.prob, -s.rr, -s.take_pct))
 
     now_ts = time.time()
@@ -610,20 +568,16 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
 
     for s in candidates:
         last_ts = st.last_signal_sent.get(s.symbol, 0.0)
-        # Кулдаун на символ
         if now_ts - last_ts < cfg.SIGNAL_COOLDOWN_SEC:
             continue
-        # Если есть «живой» сигнал — не дублируем, если прежний ещё жив
         live = st.live_signals.get(s.symbol)
         if live and (now_ts - live.created_ts) < (live.ttl_min * 60):
-            # если новый явно лучше по prob — заменим
             if s.prob <= live.prob:
                 continue
 
         st.last_signal_sent[s.symbol] = now_ts
         st.live_signals[s.symbol] = s
 
-        # Формат вывода (только вероятные, как выше отфильтровано)
         sign = "ЛОНГ" if s.dir == "LONG" else "ШОРТ"
         take_delta = s.take_pct
         stop_delta = s.stop_pct
@@ -638,7 +592,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
         )
         out_msgs.append((msg, s))
 
-    # Публикуем в порядке убывания вероятности
     if not out_msgs:
         return
 
@@ -648,7 +601,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=cid, text=msg)
             except Exception as e:
                 log.warning("send signal failed: %s", e)
-        # маленькая пауза между сообщениями
         await asyncio.sleep(0.6)
 
 
@@ -669,7 +621,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"not found")
 
-    # глушим лишний лог http.server
     def log_message(self, format, *args):
         return
 
@@ -685,19 +636,15 @@ def _start_health_server(port: int):
     return th
 
 
-# --------------------------- MAIN ---------------------------
-def _random_path(n=8) -> str:
-    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
+# --------------------------- POST_INIT (PTB) ---------------------------
+async def _post_init(app: Application):
+    cfg: Config = app.bot_data["cfg"]
 
-
-async def _bootstrap(app: Application, cfg: Config):
-    """
-    Планирование задач и инициализация общего состояния.
-    """
     # Общее состояние
     st = State()
     app.bot_data["state"] = st
-    # HTTP сессия для Bybit
+
+    # Общая HTTP-сессия и Bybit клиент
     session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     app.bot_data["aiohttp_session"] = session
     app.bot_data["bybit"] = BybitClient(session)
@@ -707,76 +654,57 @@ async def _bootstrap(app: Application, cfg: Config):
     app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Задачи
+    # Джобы
     jq = app.job_queue
-    # здоровье в чат раз в HEALTH_SECONDS
     jq.run_repeating(job_health, interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
-    # self-ping (если задан PUBLIC_URL)
     if cfg.PUBLIC_URL:
         jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
-    # загрузка универса при старте + ротация
     jq.run_once(job_load_universe, when=3)
     jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
-    # сканер сигналов
     jq.run_repeating(job_scan, interval=30, first=15, name="scan")
 
 
+# --------------------------- MAIN ---------------------------
+def _random_path(n=8) -> str:
+    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
+
+
 def main():
-    # Настройка конфигурации
     cfg = Config.load()
 
-    # Собираем приложение
-    application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
+    # Сборка приложения: переносим инициализацию в post_init (оно async и вызовется PTB)
+    application = (
+        Application.builder()
+        .token(cfg.TELEGRAM_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
     application.bot_data["cfg"] = cfg
 
-    # Поднимаем минимальный HTTP сервер ВСЕГДА в polling-режиме,
-    # чтобы Render видел открытый порт и не падал с Port Scan Timeout.
     use_webhook = bool(cfg.PUBLIC_URL and cfg.PUBLIC_URL.startswith("https://"))
     if not use_webhook:
+        # Для Render обязательно открыть порт, даже в polling
         _start_health_server(cfg.PORT)
 
-    async def runner():
-        await _bootstrap(application, cfg)
-        if use_webhook:
-            # Вебхук-режим (порт открывает PTB сам)
-            webhook_url = cfg.PUBLIC_URL.rstrip("/") + (cfg.WEBHOOK_PATH or _random_path())
-            # сбросить старый вебхук на всякий случай
-            try:
-                await application.bot.delete_webhook()
-            except Exception:
-                pass
-            log.info("Setting webhook to %s", webhook_url)
-            await application.run_webhook(
-                listen="0.0.0.0",
-                port=cfg.PORT,
-                webhook_url=webhook_url,
-                allowed_updates=Update.ALL_TYPES,
-            )
-        else:
-            # Polling-режим (блокирующий вызов)
-            try:
-                # убеждаемся, что вебхук снят
-                await application.bot.delete_webhook()
-            except Exception:
-                pass
-            log.info("Polling started (fallback)")
-            await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
-
-    # Аккуратно запускаем основной async-раннер
-    try:
-        asyncio.run(runner())
-    finally:
-        # Грамотно закрываем aiohttp-сессию если она была создана
+    if use_webhook:
+        # Сбросить старый вебхук (PTB внутри тоже разрулит, но на всякий пожарный)
         try:
-            session: aiohttp.ClientSession = application.bot_data.get("aiohttp_session")
-            if session and not session.closed:
-                # Здесь нельзя использовать asyncio.run — уже в finally.
-                # Откроем временный цикл:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(session.close())
-                loop.close()
+            # В sync-контексте нельзя await: PTB сам вызовет это при запуске вебхука
+            pass
         except Exception:
             pass
+        webhook_url = cfg.PUBLIC_URL.rstrip("/") + (cfg.WEBHOOK_PATH or _random_path())
+        log.info("Setting webhook to %s", webhook_url)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=cfg.PORT,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        log.info("Polling started (fallback)")
+        # PTB внутри сам снимет вебхук и запустит polling с собственным loop
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
