@@ -39,14 +39,14 @@ def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     try:
         return float(v) if v is not None else default
-    except:
+    except Exception:
         return default
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     try:
         return int(v) if v is not None else default
-    except:
+    except Exception:
         return default
 
 def _parse_id_list(s: Optional[str]) -> List[int]:
@@ -59,7 +59,7 @@ def _parse_id_list(s: Optional[str]) -> List[int]:
             continue
         try:
             out.append(int(part))
-        except:
+        except Exception:
             if part.startswith("-") and part[1:].isdigit():
                 out.append(int(part))
     return out
@@ -113,7 +113,7 @@ def load_config() -> Config:
     if chat_raw:
         try:
             recipients.append(int(chat_raw))
-        except:
+        except Exception:
             pass
 
     allowed = _parse_id_list(os.getenv("ALLOWED_CHAT_IDS"))
@@ -124,7 +124,9 @@ def load_config() -> Config:
     port = _env_int("PORT", 10000)
     public_url = os.getenv("PUBLIC_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()
     if not public_url:
-        raise RuntimeError("PUBLIC_URL/RENDER_EXTERNAL_URL is required")
+        raise RuntimeError("PUBLIC_URL or RENDER_EXTERNAL_URL is required")
+    if not public_url.startswith("https://"):
+        raise RuntimeError(f"PUBLIC_URL must be https: got '{public_url}'")
 
     rnd = random.randint(10_000_000, 99_999_999)
     webhook_path = os.getenv("WEBHOOK_PATH", f"/wh-{rnd}").strip()
@@ -386,7 +388,7 @@ class TradeEngine:
         self.bars[sym].append((o,h,l,c))
         self.vols[sym].append(v)
         self.last_price[sym] = c
-        self.liq_5m[sym] *= 0.96
+        self.liq_5m[sym] *= 0.96  # затухание «памяти» по ликвидациям
 
         if k.get("confirm"):
             await self._maybe_signal(sym)
@@ -401,7 +403,7 @@ class TradeEngine:
                 side = str(it.get("side", ""))
             except Exception:
                 continue
-            sgn = -1.0 if side == "Buy" else 1.0
+            sgn = -1.0 if side == "Buy" else 1.0  # продажи ⇒ давление вниз
             self.liq_5m[sym] += sgn * val
 
     async def poll_oi_once(self):
@@ -566,13 +568,14 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def post_init(app: Application):
+    # Очищаем старый вебхук, но новый ставит сам start_webhook (ниже через webhook_url)
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning("WARN delete_webhook: %s", e)
     cfg: Config = app.bot_data["cfg"]
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(0.1)
-    await app.bot.set_webhook(url=cfg.public_url.rstrip("/") + cfg.webhook_path)
-    logging.info("INFO webhook set: %s", cfg.public_url.rstrip("/") + cfg.webhook_path)
     await send_to_recipients(app, cfg.recipients,
-                             f"✅ Render Web Service: бот запущен. Mode={cfg.universe_mode}, rotation={cfg.universe_rotate_min}m, WS={cfg.ws_symbols_max}")
+                             f"✅ Render Web Service: бот запускается… Mode={cfg.universe_mode}, rotation={cfg.universe_rotate_min}m, WS={cfg.ws_symbols_max}")
 
 def build_application(cfg: Config) -> Application:
     application = ApplicationBuilder().token(cfg.token).post_init(post_init).build()
@@ -600,7 +603,7 @@ async def main_async():
     engine = TradeEngine(cfg, bybit, bot_send)
     app.bot_data["engine"] = engine
 
-    # bootstrap universe before app.start()
+    # Подготовим вселенную до запуска аппа
     try:
         await engine.bootstrap_universe()
     except Exception as e:
@@ -615,24 +618,27 @@ async def main_async():
     if cfg.self_ping_enabled and cfg.public_url:
         jq.run_repeating(lambda c: self_ping_job(cfg.public_url), first=30, interval=cfg.self_ping_interval_sec)
 
-    # ---- ручной async-режим (без run_webhook)
+    # Ручной lifecycle без run_webhook
     try:
         await app.initialize()
         await app.start()
-        # ВАЖНО: у Updater.start_webhook НЕТ аргумента stop_signals
+        # ВАЖНО: передаём полный https-адрес вебхука, иначе Telegram отвергнет запрос
+        full_hook = cfg.public_url.rstrip("/") + cfg.webhook_path
         await app.updater.start_webhook(
             listen="0.0.0.0",
             port=cfg.port,
             url_path=cfg.webhook_path,
+            webhook_url=full_hook,
             allowed_updates=Update.ALL_TYPES,
         )
+        logging.info("INFO webhook set: %s", full_hook)
+        logging.info("INFO Scheduler started")
+        logging.info("INFO Application started")
     except Exception:
-        # если что-то упало ДО вечного ожидания — корректно закрыть сессию
         await aio_sess.close()
         raise
     else:
         try:
-            # держим процесс живым
             await asyncio.Event().wait()
         finally:
             try:
