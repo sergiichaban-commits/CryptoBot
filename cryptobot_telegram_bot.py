@@ -1,329 +1,312 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import asyncio
-import logging
 import json
+import logging
 import math
+import os
+import random
+import string
+import threading
+import time
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-from aiohttp import web
-
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
-# -----------------------------
-# ЛОГГИРОВАНИЕ
-# -----------------------------
+# --------------------------- ЛОГИ ---------------------------
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
 
-# -----------------------------
-# .env ХЕЛПЕР (по просьбе)
-# -----------------------------
-def _load_envfile():
-    """
-    Опционально подхватить переменные из .env (если есть).
-    Не затирает уже заданные переменные окружения.
-    """
+# --------------------------- КОНФИГ ---------------------------
+def _parse_int_list(val: str) -> List[int]:
+    if not val:
+        return []
     try:
-        path = os.path.join(os.path.dirname(__file__), ".env")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k = k.strip()
-                    v = v.strip().strip('"').strip("'")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
-            log.info("[env] Loaded .env variables")
-    except Exception as e:
-        log.warning("[env] .env load skipped: %s", e)
+        # Разрешаем форматы: "1,2,3" или JSON "[1,2,3]"
+        if val.strip().startswith("["):
+            arr = json.loads(val)
+            return [int(x) for x in arr]
+        return [int(x.strip()) for x in val.split(",") if x.strip()]
+    except Exception:
+        return []
 
 
-# -----------------------------
-# КОНФИГ
-# -----------------------------
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 @dataclass
 class Config:
     TELEGRAM_TOKEN: str
-    PRIMARY_RECIPIENTS: List[int]
     ALLOWED_CHAT_IDS: List[int]
+    PRIMARY_RECIPIENTS: List[int]
 
     PUBLIC_URL: str
     PORT: int
+    WEBHOOK_PATH: str
 
-    HEALTH_INTERVAL_SEC: int
-    SELF_PING_SEC: int
-    FIRST_DELAY_SEC: int
+    HEALTH_SECONDS: int
+    FIRST_HEALTH_DELAY: int
+    SELF_PING_SECONDS: int
 
     SIGNAL_COOLDOWN_SEC: int
     SIGNAL_TTL_MIN: int
 
-    UNIVERSE_MODE: str  # 'all' (все линейные USDT фьючи с Bybit)
+    UNIVERSE_MODE: str
     UNIVERSE_TOP_N: int
     WS_SYMBOLS_MAX: int
     ROTATE_MIN: int
 
-    PROB_MIN: float            # 69.9
-    PROFIT_MIN_PCT: float      # 1.0 (%)
-    RR_MIN: float              # 2.0
+    PROB_MIN: float
+    PROFIT_MIN_PCT: float
+    RR_MIN: float
 
-    # Триггеры (простые)
     VOL_MULT: float
     VOL_SMA_PERIOD: int
     BODY_ATR_MULT: float
     ATR_PERIOD: int
 
     @staticmethod
-    def _parse_ids(s: str) -> List[int]:
-        out = []
-        for part in s.replace(" ", "").split(","):
-            if not part:
-                continue
-            try:
-                out.append(int(part))
-            except Exception:
-                pass
-        return out
-
-    @classmethod
-    def load(cls) -> "Config":
-        # Подхват из .env если нужно
-        _load_envfile()
-
-        token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    def load() -> "Config":
+        token = os.getenv("TELEGRAM_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN is required")
 
-        allowed = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
-        primary = os.environ.get("TELEGRAM_CHAT_ID", allowed)
+        allowed = _parse_int_list(os.getenv("ALLOWED_CHAT_IDS", ""))
+        primary = _parse_int_list(os.getenv("PRIMARY_RECIPIENTS", "")) or allowed
 
-        public_url = os.environ.get("PUBLIC_URL", "").strip()
-        port = int(os.environ.get("PORT", "10000"))
+        public_url = os.getenv("PUBLIC_URL", "").strip()
+        port = _env_int("PORT", 10000)
+        wh_path = os.getenv("WEBHOOK_PATH", f"/wh-{random.randint(10_000_000, 99_999_999)}")
 
-        health_sec = int(os.environ.get("HEALTH_INTERVAL_SEC", "1200"))  # 20 минут
-        self_ping_sec = int(os.environ.get("SELF_PING_SEC", "780"))      # ~13 мин
-        first_delay = int(os.environ.get("FIRST_DELAY_SEC", "60"))
+        health = _env_int("HEALTH_SECONDS", 20 * 60)  # 20 минут
+        first = _env_int("FIRST_HEALTH_DELAY", 60)
+        self_ping = _env_int("SELF_PING_SECONDS", 13 * 60)
 
-        cooldown = int(os.environ.get("SIGNAL_COOLDOWN_SEC", "600"))
-        ttl_min = int(os.environ.get("SIGNAL_TTL_MIN", "12"))
+        cooldown = _env_int("SIGNAL_COOLDOWN_SEC", 600)
+        ttl = _env_int("SIGNAL_TTL_MIN", 12)
 
-        universe_mode = os.environ.get("UNIVERSE_MODE", "all")
-        top_n = int(os.environ.get("UNIVERSE_TOP_N", "15"))
-        ws_symbols_max = int(os.environ.get("WS_SYMBOLS_MAX", "60"))
-        rotate_min = int(os.environ.get("ROTATE_MIN", "5"))
+        universe_mode = os.getenv("UNIVERSE_MODE", "all").strip()
+        universe_top = _env_int("UNIVERSE_TOP_N", 15)
+        ws_symbols = _env_int("WS_SYMBOLS_MAX", 60)
+        rotate_min = _env_int("ROTATE_MIN", 5)
 
-        prob_min = float(os.environ.get("PROB_MIN", "69.9"))
-        profit_min_pct = float(os.environ.get("PROFIT_MIN_PCT", "1.0"))
-        rr_min = float(os.environ.get("RR_MIN", "2.0"))
+        prob_min = _env_float("PROB_MIN", 69.9)
+        profit_min_pct = _env_float("PROFIT_MIN_PCT", 1.0)  # снижено до 1%
+        rr_min = _env_float("RR_MIN", 2.0)
 
-        vol_mult = float(os.environ.get("VOL_MULT", "2.0"))
-        vol_sma_period = int(os.environ.get("VOL_SMA_PERIOD", "20"))
-        body_atr_mult = float(os.environ.get("BODY_ATR_MULT", "0.60"))
-        atr_period = int(os.environ.get("ATR_PERIOD", "14"))
+        vol_mult = _env_float("VOL_MULT", 2.0)
+        vol_sma = _env_int("VOL_SMA_PERIOD", 20)
+        body_atr = _env_float("BODY_ATR_MULT", 0.60)
+        atr_period = _env_int("ATR_PERIOD", 14)
 
-        cfg = cls(
+        cfg = Config(
             TELEGRAM_TOKEN=token,
-            PRIMARY_RECIPIENTS=cls._parse_ids(primary),
-            ALLOWED_CHAT_IDS=cls._parse_ids(allowed),
-
+            ALLOWED_CHAT_IDS=allowed,
+            PRIMARY_RECIPIENTS=primary,
             PUBLIC_URL=public_url,
             PORT=port,
-
-            HEALTH_INTERVAL_SEC=health_sec,
-            SELF_PING_SEC=self_ping_sec,
-            FIRST_DELAY_SEC=first_delay,
-
+            WEBHOOK_PATH=wh_path,
+            HEALTH_SECONDS=health,
+            FIRST_HEALTH_DELAY=first,
+            SELF_PING_SECONDS=self_ping,
             SIGNAL_COOLDOWN_SEC=cooldown,
-            SIGNAL_TTL_MIN=ttl_min,
-
+            SIGNAL_TTL_MIN=ttl,
             UNIVERSE_MODE=universe_mode,
-            UNIVERSE_TOP_N=top_n,
-            WS_SYMBOLS_MAX=ws_symbols_max,
+            UNIVERSE_TOP_N=universe_top,
+            WS_SYMBOLS_MAX=ws_symbols,
             ROTATE_MIN=rotate_min,
-
             PROB_MIN=prob_min,
             PROFIT_MIN_PCT=profit_min_pct,
             RR_MIN=rr_min,
-
             VOL_MULT=vol_mult,
-            VOL_SMA_PERIOD=vol_sma_period,
-            BODY_ATR_MULT=body_atr_mult,
+            VOL_SMA_PERIOD=vol_sma,
+            BODY_ATR_MULT=body_atr,
             ATR_PERIOD=atr_period,
         )
-        # Лог-конфиг
+
         log.info(
-            "INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.ALLOWED_CHAT_IDS
+            "INFO [cfg] ALLOWED_CHAT_IDS=%s",
+            cfg.ALLOWED_CHAT_IDS,
+        )
+        log.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.PRIMARY_RECIPIENTS)
+        log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%s", cfg.PUBLIC_URL, cfg.PORT)
+        log.info(
+            "INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=%ss",
+            cfg.HEALTH_SECONDS,
+            cfg.FIRST_HEALTH_DELAY,
+            cfg.SELF_PING_SECONDS,
         )
         log.info(
-            "INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.PRIMARY_RECIPIENTS
+            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_MODE=%s "
+            "UNIVERSE_TOP_N=%s WS_SYMBOLS_MAX=%s ROTATE_MIN=%s PROB_MIN>%.1f "
+            "PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+            cfg.SIGNAL_COOLDOWN_SEC, cfg.SIGNAL_TTL_MIN, cfg.UNIVERSE_MODE,
+            cfg.UNIVERSE_TOP_N, cfg.WS_SYMBOLS_MAX, cfg.ROTATE_MIN, cfg.PROB_MIN,
+            cfg.PROFIT_MIN_PCT, cfg.RR_MIN,
         )
         log.info(
-            "INFO [cfg] PUBLIC_URL='%s' PORT=%s",
-            cfg.PUBLIC_URL, cfg.PORT
-        )
-        log.info(
-            "INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=True/%ss",
-            cfg.HEALTH_INTERVAL_SEC, cfg.FIRST_DELAY_SEC, cfg.SELF_PING_SEC
-        )
-        log.info(
-            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s "
-            "UNIVERSE_MODE=%s UNIVERSE_TOP_N=%s WS_SYMBOLS_MAX=%s ROTATE_MIN=%s "
-            "PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
-            cfg.SIGNAL_COOLDOWN_SEC, cfg.SIGNAL_TTL_MIN,
-            cfg.UNIVERSE_MODE, cfg.UNIVERSE_TOP_N, cfg.WS_SYMBOLS_MAX, cfg.ROTATE_MIN,
-            cfg.PROB_MIN, cfg.PROFIT_MIN_PCT, cfg.RR_MIN,
-        )
-        log.info(
-            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, "
-            "BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
-            cfg.VOL_MULT, cfg.VOL_SMA_PERIOD, cfg.BODY_ATR_MULT, cfg.ATR_PERIOD
+            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
+            cfg.VOL_MULT, cfg.VOL_SMA_PERIOD, cfg.BODY_ATR_MULT, cfg.ATR_PERIOD,
         )
         return cfg
 
 
-# -----------------------------
-# BYBIT CLIENT
-# -----------------------------
+# --------------------------- BYBIT API ---------------------------
 class BybitClient:
-    BASE = "https://api.bybit.com"
+    BASE_URL = "https://api.bybit.com"
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
 
-    async def get_linear_symbols(self) -> List[str]:
+    async def _get(self, path: str, params: Dict) -> Dict:
+        url = f"{self.BASE_URL}{path}"
+        async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data
+
+    async def get_symbols_linear(self) -> List[str]:
         """
-        Все линейные фьючерсы в USDT (category=linear).
+        Получить все фьючерсные (linear/USDT Perpetual) торгуемые символы.
         """
-        out = []
-        url = f"{self.BASE}/v5/market/instruments-info"
-        params = {"category": "linear", "limit": 1000}
-        cursor = None
+        out: List[str] = []
+        cursor = ""
         while True:
-            p = dict(params)
-            if cursor:
-                p["cursor"] = cursor
-            async with self._session.get(url, params=p, timeout=15) as r:
-                data = await r.json()
+            params = {"category": "linear", "cursor": cursor, "limit": 500}
+            data = await self._get("/v5/market/instruments-info", params)
             if data.get("retCode") != 0:
-                log.warning("[bybit] instruments retCode=%s retMsg=%s",
-                            data.get("retCode"), data.get("retMsg"))
-                break
-            result = data.get("result", {}) or {}
+                raise RuntimeError(f"Bybit instruments error: {data}")
+            result = data.get("result", {})
             rows = result.get("list", []) or []
-            for it in rows:
-                # Фильтр по USDT
-                sym = it.get("symbol")
-                quote = it.get("quoteCoin") or it.get("quoteCurrency")
-                status = it.get("status", "Trading")
-                if sym and (quote == "USDT") and status == "Trading":
-                    out.append(sym)
-            cursor = result.get("nextPageCursor")
+            for r in rows:
+                if r.get("status") == "Trading" and r.get("quoteCoin") == "USDT" and r.get("contractType") == "LinearPerpetual":
+                    sym = r.get("symbol")
+                    if sym:
+                        out.append(sym)
+            cursor = result.get("nextPageCursor") or ""
             if not cursor:
                 break
+            await asyncio.sleep(0.05)
         return sorted(list(set(out)))
 
-    async def get_kline(self, symbol: str, interval: str = "5", limit: int = 300) -> List[Dict]:
-        """
-        Kline: category=linear
-        """
-        url = f"{self.BASE}/v5/market/kline"
+    async def get_klines(self, symbol: str, interval: str = "5", limit: int = 300) -> List[Dict]:
         params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-        async with self._session.get(url, params=params, timeout=15) as r:
-            data = await r.json()
+        data = await self._get("/v5/market/kline", params)
         if data.get("retCode") != 0:
-            return []
-        # list: [[start, open, high, low, close, volume, turnover], ...]
-        rows = data.get("result", {}).get("list", []) or []
-        # Преобразуем в dict
-        out = []
-        for row in rows:
-            # Bybit: все строки как строки
-            ts = int(row[0])
-            open_, high, low, close = map(float, row[1:5])
-            volume = float(row[5])
-            out.append(
-                dict(ts=ts, o=open_, h=high, l=low, c=close, v=volume)
+            raise RuntimeError(f"Bybit kline error: {data}")
+        rows = (data.get("result", {}) or {}).get("list", []) or []
+        # Bybit возвращает отсортированные по времени с конца к началу или наоборот — нормализуем по времени
+        candles: List[Dict] = []
+        for r in rows:
+            # r: [start, open, high, low, close, volume, turnover]
+            candles.append(
+                {
+                    "t": int(r[0]),
+                    "o": float(r[1]),
+                    "h": float(r[2]),
+                    "l": float(r[3]),
+                    "c": float(r[4]),
+                    "v": float(r[5]),
+                }
             )
-        # Возвращает старые->новые; нам удобно именно так
-        out.sort(key=lambda x: x["ts"])
-        return out
+        candles.sort(key=lambda x: x["t"])
+        return candles
 
     async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> List[Tuple[int, float]]:
-        """
-        OI (open interest) history.
-        """
-        url = f"{self.BASE}/v5/market/open-interest"
         params = {"category": "linear", "symbol": symbol, "intervalTime": interval, "limit": limit}
-        async with self._session.get(url, params=params, timeout=15) as r:
-            data = await r.json()
+        data = await self._get("/v5/market/open-interest", params)
         if data.get("retCode") != 0:
-            # логгируем, но не валим
-            log.debug("[bybit] OI bad ret: %s %s", data.get("retCode"), data.get("retMsg"))
-            return []
-        rows = data.get("result", {}).get("list", []) or []
-        out = []
-        for row in rows:
-            # ["1719739800000","1618.676"]
-            try:
-                ts = int(row[0])
-                val = float(row[1])
-                out.append((ts, val))
-            except Exception:
-                pass
+            raise RuntimeError(f"Bybit OI error: {data}")
+        rows = (data.get("result", {}) or {}).get("list", []) or []
+        out: List[Tuple[int, float]] = []
+        for r in rows:
+            # r: [timestamp, value]
+            out.append((int(r[0]), float(r[1])))
         out.sort(key=lambda x: x[0])
         return out
 
 
-# -----------------------------
-# ВСЕЛЕННАЯ С И Р О Т А Ц И Е Й
-# -----------------------------
-class Universe:
-    def __init__(self, symbols_all: List[str], batch_size: int):
-        self.symbols_all = symbols_all[:]  # полный список
-        self.batch_size = max(1, batch_size)
-        self.batch_idx = 0
-
-    def active(self) -> List[str]:
-        if not self.symbols_all:
-            return []
-        start = (self.batch_idx * self.batch_size) % len(self.symbols_all)
-        end = start + self.batch_size
-        if end <= len(self.symbols_all):
-            return self.symbols_all[start:end]
-        return self.symbols_all[start:] + self.symbols_all[:end - len(self.symbols_all)]
-
-    def rotate(self):
-        if not self.symbols_all:
-            return
-        self.batch_idx = (self.batch_idx + 1) % math.ceil(len(self.symbols_all) / self.batch_size)
+# --------------------------- МАТЕМАТИКА/ИНДИКАТОРЫ ---------------------------
+def _atr(candles: List[Dict], period: int) -> float:
+    if len(candles) < period + 1:
+        return float("nan")
+    trs: List[float] = []
+    for i in range(1, len(candles)):
+        h = candles[i]["h"]
+        l = candles[i]["l"]
+        pc = candles[i - 1]["c"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return float("nan")
+    return sum(trs[-period:]) / period
 
 
-# -----------------------------
-# СИГНАЛЫ (минимальный анализ)
-# -----------------------------
+def _volume_sma(candles: List[Dict], period: int) -> float:
+    if len(candles) < period:
+        return float("nan")
+    vs = [c["v"] for c in candles[-period:]]
+    return sum(vs) / max(1, len(vs))
+
+
+def _ema_series(vals: List[float], period: int) -> List[float]:
+    if not vals:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema = []
+    for i, v in enumerate(vals):
+        if i == 0:
+            ema.append(v)
+        else:
+            ema.append(v * k + ema[-1] * (1.0 - k))
+    return ema
+
+
+def _rolling_high(candles: List[Dict], lookback: int) -> float:
+    hi = [c["h"] for c in candles[-lookback:]] if len(candles) >= lookback else [c["h"] for c in candles]
+    return max(hi) if hi else float("nan")
+
+
+def _rolling_low(candles: List[Dict], lookback: int) -> float:
+    lo = [c["l"] for c in candles[-lookback:]] if len(candles) >= lookback else [c["l"] for c in candles]
+    return min(lo) if lo else float("nan")
+
+
 @dataclass
 class Signal:
     symbol: str
-    dir: str             # "LONG" | "SHORT"
+    dir: str  # "LONG" / "SHORT"
     price: float
     entry: float
     take: float
@@ -331,55 +314,27 @@ class Signal:
     take_pct: float
     stop_pct: float
     rr: float
-    prob: float          # 0..100
+    prob: float
     ttl_min: int
+    created_ts: float = time.time()
 
 
-def _sma(vals: List[float], period: int) -> float:
-    if len(vals) < period or period <= 0:
-        return float("nan")
-    return sum(vals[-period:]) / period
-
-
-def _atr(candles: List[Dict], period: int) -> float:
-    # очень упрощённо
-    if len(candles) < period + 1:
-        return float("nan")
-    trs = []
-    prev_close = candles[-period - 1]["c"]
-    for c in candles[-period:]:
-        tr = max(c["h"] - c["l"], abs(c["h"] - prev_close), abs(c["l"] - prev_close))
-        trs.append(tr)
-        prev_close = c["c"]
-    return sum(trs) / period if trs else float("nan")
-
-
-def _volume_sma(candles: List[Dict], period: int) -> float:
-    if len(candles) < period:
-        return float("nan")
-    return sum(c["v"] for c in candles[-period:]) / period
-
-
+# --------------------------- АНАЛИЗ ---------------------------
 def _analyze_symbol(
     cfg: Config,
     symbol: str,
     candles: List[Dict],
     oi: List[Tuple[int, float]],
 ) -> Optional[Signal]:
-    """
-    Очень упрощенная логика комбинированного анализа:
-    - всплеск объема: vol_last > VOL_MULT * vol_sma
-    - тело свечи > BODY_ATR_MULT * ATR
-    - подтверждение направлением изменения OI (рост для LONG, падение для SHORT)
-    """
-    if len(candles) < max(cfg.VOL_SMA_PERIOD, cfg.ATR_PERIOD) + 2:
+    # Требуется история для ATR/EMA/объёма
+    need = max(cfg.VOL_SMA_PERIOD, cfg.ATR_PERIOD, 30) + 2
+    if len(candles) < need:
         return None
 
     last = candles[-1]
-    prev = candles[-2]
-
     close = last["c"]
     body = abs(last["c"] - last["o"])
+
     atr = _atr(candles, cfg.ATR_PERIOD)
     if not math.isfinite(atr) or atr <= 0:
         return None
@@ -389,54 +344,80 @@ def _analyze_symbol(
         return None
 
     vol_last = last["v"]
-    body_ok = body > cfg.BODY_ATR_MULT * atr
-    vol_ok = vol_last > (cfg.VOL_MULT * vol_sma)
-
-    if not (body_ok and vol_ok):
+    # Базовые фильтры — не «выравниваем» сигналы на самом пороге
+    if body <= cfg.BODY_ATR_MULT * atr:
+        return None
+    if vol_last <= (cfg.VOL_MULT * vol_sma):
         return None
 
+    # Направление по телу свечи
     direction = "LONG" if last["c"] > last["o"] else "SHORT"
 
-    # OI: простое подтверждение направлением (последний - предпоследний)
-    oi_ok = True
-    if len(oi) >= 2:
-        delta_oi = oi[-1][1] - oi[-2][1]
-        if direction == "LONG" and delta_oi < 0:
-            oi_ok = False
-        if direction == "SHORT" and delta_oi > 0:
-            oi_ok = False
+    # ===== ТРЕНД / ДИНАМИЧЕСКИЕ МНОЖИТЕЛИ =====
+    closes = [c["c"] for c in candles]
+    ema20_ser = _ema_series(closes, 20)
+    ema20, ema20_prev = ema20_ser[-1], ema20_ser[-2]
 
-    if not oi_ok:
-        return None
+    # сила тренда: насколько EMA20 движется за бар в единицах ATR
+    trend_unit = abs((ema20 - ema20_prev) / max(1e-9, atr))
+    # базовое «растяжение» 0.9..1.4
+    trend_strength = max(0.9, min(1.4, 0.9 + trend_unit * 0.6))
+    # бонус/штраф, если торгуем по наклону EMA20
+    ema_dir = 1 if ema20 > ema20_prev else -1
+    dir_sign = 1 if direction == "LONG" else -1
+    trend_strength *= (1.05 if ema_dir == dir_sign else 0.95)
+    trend_strength = max(0.85, min(1.5, trend_strength))
 
-    # Элементарные уровни: entry=close, take=close ± 1.5*ATR, stop=close ∓ 0.75*ATR
+    # Динамические множители ATR
+    TAKE_ATR_BASE = 1.20
+    STOP_ATR_BASE = 0.60
     if direction == "LONG":
-        entry = close
-        take = close + 1.5 * atr
-        stop = close - 0.75 * atr
+        take = close + (TAKE_ATR_BASE * trend_strength) * atr
+        stop = close - (STOP_ATR_BASE / max(0.5, trend_strength)) * atr
     else:
-        entry = close
-        take = close - 1.5 * atr
-        stop = close + 0.75 * atr
+        take = close - (TAKE_ATR_BASE * trend_strength) * atr
+        stop = close + (STOP_ATR_BASE / max(0.5, trend_strength)) * atr
 
-    # RR
+    entry = close
     risk = abs(entry - stop)
     reward = abs(take - entry)
     rr = (reward / risk) if risk > 0 else 0.0
 
-    # Процент прибыли до тейка
     take_pct = (abs(take - entry) / entry) * 100.0 if entry > 0 else 0.0
     stop_pct = (abs(entry - stop) / entry) * 100.0 if entry > 0 else 0.0
 
-    # Простейшая оценка вероятности: масштабируем по силе тела и всплеску объема + OI-фактор
-    vol_ratio = min(3.0, vol_last / max(1e-9, vol_sma))
-    body_ratio = min(3.0, (body / max(1e-9, atr)) / cfg.BODY_ATR_MULT)
-    prob = 50.0 + 10.0 * (vol_ratio - 1.0) + 10.0 * (body_ratio - 1.0)
-    if len(oi) >= 2:
-        prob += 5.0  # небольшой бонус за подтверждение OI
+    # Мини-структура: пробой/отбой от экстремума последних 20 баров
+    breakout_units = 0.0
+    lookback = 20
+    if direction == "LONG":
+        hh = _rolling_high(candles, lookback)
+        if math.isfinite(hh):
+            breakout_units = max(0.0, (close - hh) / max(1e-9, atr))
+    else:
+        ll = _rolling_low(candles, lookback)
+        if math.isfinite(ll):
+            breakout_units = max(0.0, (ll - close) / max(1e-9, atr))
+
+    # Открытый интерес — величина и знак
+    oi_boost = 0.0
+    if len(oi) >= 2 and oi[-2][1] > 0:
+        oi_delta_pct = (oi[-1][1] - oi[-2][1]) / oi[-2][1] * 100.0
+        oi_boost = max(-8.0, min(8.0, 0.6 * oi_delta_pct * dir_sign))
+
+    # Вероятность: объём, тело/ATR, тренд, пробой, OI, сонаправленность с EMA
+    vol_spike = vol_last / max(1e-9, vol_sma)
+    body_rel = body / max(1e-9, atr)
+
+    prob = 50.0
+    prob += 10.0 * math.log2(max(1.0, vol_spike))      # 2x=+10; 3x~+15.9
+    prob += 8.0 * (body_rel / cfg.BODY_ATR_MULT - 1.0)
+    prob += 6.0 * (trend_strength - 1.0) * 5.0
+    prob += 10.0 * breakout_units
+    prob += oi_boost
+    prob += (4.0 if ema_dir == dir_sign else -6.0)
     prob = max(0.0, min(99.9, prob))
 
-    # Фильтры
+    # ФИЛЬТРЫ
     if prob < cfg.PROB_MIN:
         return None
     if rr < cfg.RR_MIN:
@@ -459,323 +440,343 @@ def _analyze_symbol(
     )
 
 
-# -----------------------------
-# ЭНДЖИН
-# -----------------------------
-class Engine:
-    def __init__(self, cfg: Config, session: aiohttp.ClientSession):
-        self.cfg = cfg
-        self.client = BybitClient(session)
-        self.universe: Optional[Universe] = None
-        self.signals_cache: Dict[str, Signal] = {}  # symbol -> signal
-        self.last_signal_ts: Dict[str, float] = {}  # cooldown
-
-    async def bootstrap(self):
-        # Загружаем вселенную
-        if self.cfg.UNIVERSE_MODE == "all":
-            syms = await self.client.get_linear_symbols()
-        else:
-            syms = await self.client.get_linear_symbols()  # на будущее можно иное
-        total = len(syms)
-        active_count = min(self.cfg.WS_SYMBOLS_MAX // 2, max(1, self.cfg.UNIVERSE_TOP_N * 2))
-        active_count = min(active_count, max(1, total))
-        self.universe = Universe(syms, batch_size=active_count)
-        log.info("INFO [universe] total=%d active=%d mode=%s",
-                 total, active_count, self.cfg.UNIVERSE_MODE)
-
-    def universe_stats(self) -> Tuple[int, int, int]:
-        if not self.universe:
-            return (0, 0, 0)
-        total = len(self.universe.symbols_all)
-        active = len(self.universe.active())
-        ws_topics = active * 2  # условно (kline+ticker), для вывода
-        return (total, active, ws_topics)
-
-    async def rotate(self):
-        if not self.universe:
-            return
-        self.universe.rotate()
-        total, active, ws_topics = self.universe_stats()
-        log.info("INFO [rotate] total=%d active=%d ws_topics~%d", total, active, ws_topics)
-
-    async def scan_active_and_signal(self, app: Application):
-        """
-        Простая склейка анализа по активным символам.
-        """
-        if not self.universe:
-            return
-        now = asyncio.get_event_loop().time()
-        out_signals: List[Signal] = []
-        syms = self.universe.active()
-
-        # ограничим параллелизм чтобы не ловить лимиты
-        sem = asyncio.Semaphore(10)
-
-        async def process(sym: str):
-            async with sem:
-                try:
-                    kl = await self.client.get_kline(sym, interval="5", limit=300)
-                    if not kl:
-                        return
-                    oi = await self.client.get_open_interest(sym, interval="5min", limit=6)
-                    sig = _analyze_symbol(self.cfg, sym, kl, oi)
-                    if not sig:
-                        return
-                    # cooldown
-                    last_ts = self.last_signal_ts.get(sym, 0.0)
-                    if now - last_ts < self.cfg.SIGNAL_COOLDOWN_SEC:
-                        return
-                    out_signals.append(sig)
-                except Exception as e:
-                    log.debug("[scan] %s err: %s", sym, e)
-
-        await asyncio.gather(*(process(s) for s in syms))
-
-        # Сортировка по вероятности (убывание)
-        out_signals.sort(key=lambda s: (-s.prob, -s.rr, -s.take_pct))
-
-        # Отправляем
-        for s in out_signals:
-            self.last_signal_ts[s.symbol] = now
-            await self._send_signal(app, s)
-
-    async def _send_signal(self, app: Application, s: Signal):
-        text = (
-            f"🔔 Сигнал\n"
-            f"{s.symbol}\n"
-            f"Цена: {s.price:.6g}\n"
-            f"Направление: {('ЛОНГ' if s.dir=='LONG' else 'ШОРТ')}\n"
-            f"Вход: {s.entry:.6g}\n"
-            f"Тейк: {s.take:.6g} (+{s.take_pct:.2f}%)\n"
-            f"Стоп: {s.stop:.6g} (-{s.stop_pct:.2f}%)\n"
-            f"R/R: {s.rr:.2f}\n"
-            f"Вероятность: {s.prob:.1f}%\n"
-            f"TTL: {s.ttl_min} мин"
-        )
-        for chat_id in self.cfg.PRIMARY_RECIPIENTS:
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=text)
-            except Exception as e:
-                log.warning("[tg] send_signal failed: %s", e)
+# --------------------------- УНИВЕРС / СОСТОЯНИЕ ---------------------------
+class State:
+    def __init__(self):
+        self.total_symbols: List[str] = []
+        self.active_symbols: List[str] = []
+        self.batch_idx: int = 0
+        self.last_signal_sent: Dict[str, float] = {}  # symbol -> ts
+        self.live_signals: Dict[str, Signal] = {}     # символы с активным TTL
 
 
-# -----------------------------
-# МАЛЕНЬКИЙ HTTP-СЕРВЕР (для Render port scan)
-# -----------------------------
-async def start_health_server(app: Application, port: int):
-    async def root(_):
-        return web.Response(text="ok")
-
-    runner = web.AppRunner(web.Application())
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    # Добавим маршрут после setup
-    # Создаём новый app, иначе проще:
-    health_app = web.Application()
-    health_app.router.add_get("/", root)
-    await runner.cleanup()
-    runner = web.AppRunner(health_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    app.bot_data["http_runner"] = runner
-    app.bot_data["http_site"] = site
-    log.info("HTTP server started on 0.0.0.0:%d", port)
-
-
-# -----------------------------
-# ТЕЛЕГРАМ ХЕНДЛЕРЫ
-# -----------------------------
-def _is_allowed(cfg: Config, chat_id: int) -> bool:
-    return (not cfg.ALLOWED_CHAT_IDS) or (chat_id in cfg.ALLOWED_CHAT_IDS)
-
+# --------------------------- TELEGRAM ХЭНДЛЕРЫ ---------------------------
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = context.application.bot_data["cfg"]
-    if update.effective_chat and not _is_allowed(cfg, update.effective_chat.id):
+    if not await _is_allowed(update, context):
         return
     await update.effective_message.reply_text("pong")
 
+
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = context.application.bot_data["cfg"]
-    if update.effective_chat and not _is_allowed(cfg, update.effective_chat.id):
+    if not await _is_allowed(update, context):
         return
-    engine: Engine = context.application.bot_data.get("engine")
-    if not engine or not engine.universe:
+    st: State = context.bot_data.get("state")
+    if not st or not st.total_symbols:
         await update.effective_message.reply_text("Вселенная пока не загружена (жду Bybit API/повторяю попытки)…")
         return
-    total, active, ws_topics = engine.universe_stats()
-    act_list = engine.universe.active()[:20]
-    suffix = f"\nАктивные (пример): {', '.join(act_list)} ..." if act_list else ""
-    await update.effective_message.reply_text(
-        f"Вселенная: total={total}, active={active}, batch#{engine.universe.batch_idx}, ws_topics={ws_topics}{suffix}"
+    sample = ", ".join(st.active_symbols[:15])
+    txt = (
+        f"Вселенная: total={len(st.total_symbols)}, active={len(st.active_symbols)}, "
+        f"batch#{st.batch_idx}, ws_topics={len(st.active_symbols)*2}\n"
+        f"Активные (пример): {sample} ..."
     )
+    await update.effective_message.reply_text(txt)
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = context.application.bot_data["cfg"]
-    if update.effective_chat and not _is_allowed(cfg, update.effective_chat.id):
+    if not await _is_allowed(update, context):
         return
-    engine: Engine = context.application.bot_data.get("engine")
-    if not engine or not engine.universe:
-        await update.effective_message.reply_text("Вселенная пока не загружена (жду Bybit API/повторяю попытки)…")
+    st: State = context.bot_data.get("state")
+    if not st:
+        await update.effective_message.reply_text("Статус недоступен…")
         return
-    total, active, ws_topics = engine.universe_stats()
-    await update.effective_message.reply_text(
-        f"Вселенная: total={total}, active={active}, batch#{engine.universe.batch_idx}, ws_topics={ws_topics}"
+    txt = f"Вселенная: total={len(st.total_symbols)}, active={len(st.active_symbols)}, batch#{st.batch_idx}, ws_topics={len(st.active_symbols)*2}"
+    await update.effective_message.reply_text(txt)
+
+
+async def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    cfg: Config = context.bot_data["cfg"]
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return False
+    if cfg.ALLOWED_CHAT_IDS and chat_id not in cfg.ALLOWED_CHAT_IDS:
+        try:
+            await update.effective_message.reply_text("⛔️ Доступ запрещён.")
+        except Exception:
+            pass
+        return False
+    return True
+
+
+# --------------------------- ДЖОБЫ ---------------------------
+async def job_health(context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
+    try:
+        for cid in cfg.PRIMARY_RECIPIENTS:
+            await context.bot.send_message(chat_id=cid, text="online")
+    except Exception as e:
+        log.warning("health send failed: %s", e)
+
+
+async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
+    if not cfg.PUBLIC_URL:
+        return
+    url = cfg.PUBLIC_URL
+    # пингуем корень — Render держит инстанс бодрым
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+            async with s.get(url) as _:
+                pass
+    except Exception as e:
+        log.debug("self-ping error: %s", e)
+
+
+async def job_load_universe(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Загружаем полный список линейных USDT-перпетуалов и активируем батч.
+    """
+    st: State = context.bot_data["state"]
+    cfg: Config = context.bot_data["cfg"]
+    client: BybitClient = context.bot_data["bybit"]
+
+    try:
+        all_syms = await client.get_symbols_linear()
+        if cfg.UNIVERSE_MODE == "top" and cfg.UNIVERSE_TOP_N > 0:
+            # Тут можно сортировать по обороту/volatility, но оставим как есть (пример).
+            st.total_symbols = all_syms[: cfg.UNIVERSE_TOP_N]
+        else:
+            st.total_symbols = all_syms
+
+        # первая активация
+        await _rotate_active(context)
+        log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
+    except Exception as e:
+        log.error("universe load failed: %s", e)
+
+
+async def _rotate_active(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ротация активных символов «по кольцу».
+    """
+    st: State = context.bot_data["state"]
+    cfg: Config = context.bot_data["cfg"]
+    if not st.total_symbols:
+        return
+    n = cfg.WS_SYMBOLS_MAX
+    start = (st.batch_idx * n) % len(st.total_symbols)
+    # набираем n символов по кругу
+    new_active: List[str] = []
+    i = start
+    while len(new_active) < n and st.total_symbols:
+        new_active.append(st.total_symbols[i % len(st.total_symbols)])
+        i += 1
+    st.active_symbols = new_active
+    st.batch_idx += 1
+    log.info(
+        "INFO [universe] rotated: active=%d batch#%d",
+        len(st.active_symbols),
+        st.batch_idx,
     )
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = context.application.bot_data["cfg"]
-    if update.effective_chat and not _is_allowed(cfg, update.effective_chat.id):
+
+async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
+    await _rotate_active(context)
+
+
+async def job_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Периодически сканируем активные символы и выдаём только актуальные сетапы,
+    отсортированные по вероятности (без публикации «нет сетапов»).
+    """
+    st: State = context.bot_data["state"]
+    cfg: Config = context.bot_data["cfg"]
+    client: BybitClient = context.bot_data["bybit"]
+
+    if not st.active_symbols:
         return
-    await update.effective_message.reply_text("Команда не распознана. Доступно: /ping, /universe, /status")
+
+    candidates: List[Signal] = []
+    for sym in st.active_symbols:
+        try:
+            candles = await client.get_klines(sym, interval="5", limit=300)
+            oi = await client.get_open_interest(sym, interval="5min", limit=6)
+            sig = _analyze_symbol(cfg, sym, candles, oi)
+            if sig:
+                candidates.append(sig)
+            # маленькая пауза, чтобы не бить лимиты
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            log.debug("scan %s error: %s", sym, e)
+
+    if not candidates:
+        return
+
+    # сортировка по вероятности убыв.
+    candidates.sort(key=lambda s: (-s.prob, -s.rr, -s.take_pct))
+
+    now_ts = time.time()
+    out_msgs: List[Tuple[str, Signal]] = []
+
+    for s in candidates:
+        last_ts = st.last_signal_sent.get(s.symbol, 0.0)
+        # Кулдаун на символ
+        if now_ts - last_ts < cfg.SIGNAL_COOLDOWN_SEC:
+            continue
+        # Если есть «живой» сигнал — не дублируем, если прежний ещё жив
+        live = st.live_signals.get(s.symbol)
+        if live and (now_ts - live.created_ts) < (live.ttl_min * 60):
+            # если новый явно лучше по prob — заменим
+            if s.prob <= live.prob:
+                continue
+
+        st.last_signal_sent[s.symbol] = now_ts
+        st.live_signals[s.symbol] = s
+
+        # Формат вывода (только вероятные, как выше отфильтровано)
+        sign = "ЛОНГ" if s.dir == "LONG" else "ШОРТ"
+        take_delta = s.take_pct
+        stop_delta = s.stop_pct
+
+        msg = (
+            f"#{s.symbol} — {sign}\n"
+            f"Текущая: {s.price:.6g}\n"
+            f"Вход: {s.entry:.6g}\n"
+            f"Тейк: {s.take:.6g} (+{take_delta:.2f}%)\n"
+            f"Стоп: {s.stop:.6g} (-{stop_delta:.2f}%)\n"
+            f"R/R: {s.rr:.2f} | Вероятность: {s.prob:.1f}%"
+        )
+        out_msgs.append((msg, s))
+
+    # Публикуем в порядке убывания вероятности
+    if not out_msgs:
+        return
+
+    for msg, _ in out_msgs:
+        for cid in cfg.PRIMARY_RECIPIENTS:
+            try:
+                await context.bot.send_message(chat_id=cid, text=msg)
+            except Exception as e:
+                log.warning("send signal failed: %s", e)
+        # маленькая пауза между сообщениями
+        await asyncio.sleep(0.6)
 
 
-# -----------------------------
-# ЗАПУСК
-# -----------------------------
-async def post_init(app: Application):
+# --------------------------- HTTP (для Render) ---------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"not found")
+            return
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+    # глушим лишний лог http.server
+    def log_message(self, format, *args):
+        return
+
+
+def _start_health_server(port: int):
+    def _run():
+        srv = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+        log.info("HTTP health server started on :%d", port)
+        srv.serve_forever()
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    return th
+
+
+# --------------------------- MAIN ---------------------------
+def _random_path(n=8) -> str:
+    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
+
+
+async def _bootstrap(app: Application, cfg: Config):
     """
-    Вызывается автоматически в run_polling (внутри PTB) перед стартом.
-    Здесь:
-    - поднимаем HTTP-сервер на PORT (для Render),
-    - создаём aiohttp.Session и Engine,
-    - грузим вселенную,
-    - настраиваем периодические задачи (APScheduler PTB).
+    Планирование задач и инициализация общего состояния.
     """
-    cfg: Config = app.bot_data["cfg"]
-
-    # HTTP server (порт для Render)
-    await start_health_server(app, cfg.PORT)
-
-    # AIOHTTP Session
+    # Общее состояние
+    st = State()
+    app.bot_data["state"] = st
+    # HTTP сессия для Bybit
     session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     app.bot_data["aiohttp_session"] = session
+    app.bot_data["bybit"] = BybitClient(session)
 
-    # Engine
-    engine = Engine(cfg, session)
-    app.bot_data["engine"] = engine
-
-    # Bootstrap с повторами
-    async def bootstrap_loop():
-        for i in range(10):
-            try:
-                await engine.bootstrap()
-                total, active, ws_topics = engine.universe_stats()
-                for chat_id in cfg.PRIMARY_RECIPIENTS:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"Стартую… Вселенная: total={total}, active={active}, batch#0, ws_topics={ws_topics}",
-                        )
-                    except Exception:
-                        pass
-                return
-            except Exception as e:
-                log.warning("[bootstrap] attempt %d failed: %s", i + 1, e)
-                await asyncio.sleep(3)
-        log.error("Failed to bootstrap after retries")
-
-    await bootstrap_loop()
+    # Команды
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("universe", cmd_universe))
+    app.add_handler(CommandHandler("status", cmd_status))
 
     # Задачи
     jq = app.job_queue
-
-    # 1) Ротация активов
-    jq.run_repeating(
-        lambda *_: app.create_task(engine.rotate()),
-        interval=cfg.ROTATE_MIN * 60,
-        first=cfg.FIRST_DELAY_SEC
-    )
-
-    # 2) Скан и сигналы
-    jq.run_repeating(
-        lambda *_: app.create_task(engine.scan_active_and_signal(app)),
-        interval=60,   # каждую минуту
-        first=cfg.FIRST_DELAY_SEC + 5
-    )
-
-    # 3) health сообщения раз в 20 минут
-    async def health_msg():
-        for chat_id in cfg.PRIMARY_RECIPIENTS:
-            try:
-                await app.bot.send_message(chat_id=chat_id, text="online")
-            except Exception:
-                pass
-
-    jq.run_repeating(
-        lambda *_: app.create_task(health_msg()),
-        interval=cfg.HEALTH_INTERVAL_SEC,
-        first=cfg.FIRST_DELAY_SEC + 10
-    )
-
-    # 4) self-ping, если есть PUBLIC_URL
+    # здоровье в чат раз в HEALTH_SECONDS
+    jq.run_repeating(job_health, interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
+    # self-ping (если задан PUBLIC_URL)
     if cfg.PUBLIC_URL:
-        async def self_ping():
-            try:
-                async with session.get(cfg.PUBLIC_URL, timeout=10) as r:
-                    _ = await r.text()
-            except Exception:
-                pass
-
-        jq.run_repeating(
-            lambda *_: app.create_task(self_ping()),
-            interval=cfg.SELF_PING_SEC,
-            first=cfg.FIRST_DELAY_SEC + 15
-        )
-
-
-async def post_shutdown(app: Application):
-    # Аккуратно закрыть HTTP и aiohttp
-    runner: web.AppRunner = app.bot_data.get("http_runner")
-    session: aiohttp.ClientSession = app.bot_data.get("aiohttp_session")
-    try:
-        if runner:
-            await runner.cleanup()
-    except Exception:
-        pass
-    try:
-        if session and not session.closed:
-            await session.close()
-    except Exception:
-        pass
-
-
-def build_application(cfg: Config) -> Application:
-    application = (
-        Application.builder()
-        .token(cfg.TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-    application.bot_data["cfg"] = cfg
-
-    # Команды
-    application.add_handler(CommandHandler("ping", cmd_ping))
-    application.add_handler(CommandHandler("universe", cmd_universe))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(MessageHandler(filters.COMMAND, fallback))
-    return application
-
-
-async def main_async():
-    cfg = Config.load()
-    app = build_application(cfg)
-
-    # RUN POLLING (никаких вебхуков — устойчиво для Render)
-    # allowed_updates берем все типы — удобно для будущего
-    await app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=(),     # на Render сигналы от ОС могут отсутствовать — не блокируемся на них
-        close_loop=False,    # петля принадлежит PTB — не закрываем насильно
-    )
+        jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
+    # загрузка универса при старте + ротация
+    jq.run_once(job_load_universe, when=3)
+    jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
+    # сканер сигналов
+    jq.run_repeating(job_scan, interval=30, first=15, name="scan")
 
 
 def main():
+    # Настройка конфигурации
+    cfg = Config.load()
+
+    # Собираем приложение
+    application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
+    application.bot_data["cfg"] = cfg
+
+    # Поднимаем минимальный HTTP сервер ВСЕГДА в polling-режиме,
+    # чтобы Render видел открытый порт и не падал с Port Scan Timeout.
+    use_webhook = bool(cfg.PUBLIC_URL and cfg.PUBLIC_URL.startswith("https://"))
+    if not use_webhook:
+        _start_health_server(cfg.PORT)
+
+    async def runner():
+        await _bootstrap(application, cfg)
+        if use_webhook:
+            # Вебхук-режим (порт открывает PTB сам)
+            webhook_url = cfg.PUBLIC_URL.rstrip("/") + (cfg.WEBHOOK_PATH or _random_path())
+            # сбросить старый вебхук на всякий случай
+            try:
+                await application.bot.delete_webhook()
+            except Exception:
+                pass
+            log.info("Setting webhook to %s", webhook_url)
+            await application.run_webhook(
+                listen="0.0.0.0",
+                port=cfg.PORT,
+                webhook_url=webhook_url,
+                allowed_updates=Update.ALL_TYPES,
+            )
+        else:
+            # Polling-режим (блокирующий вызов)
+            try:
+                # убеждаемся, что вебхук снят
+                await application.bot.delete_webhook()
+            except Exception:
+                pass
+            log.info("Polling started (fallback)")
+            await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False)
+
+    # Аккуратно запускаем основной async-раннер
     try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(runner())
+    finally:
+        # Грамотно закрываем aiohttp-сессию если она была создана
+        try:
+            session: aiohttp.ClientSession = application.bot_data.get("aiohttp_session")
+            if session and not session.closed:
+                # Здесь нельзя использовать asyncio.run — уже в finally.
+                # Откроем временный цикл:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(session.close())
+                loop.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
