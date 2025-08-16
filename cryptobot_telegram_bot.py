@@ -47,6 +47,9 @@ HARDCODED_ENV = {
     # Минутные отчёты отключены
     "SNAPSHOT_ENABLED": "0",
 
+    # Минимальный R/R для публикации сигнала
+    "RR_MIN": "2.0",
+
     # HTTP порт
     "PORT": "10000",
 }
@@ -117,6 +120,9 @@ HEALTH_INTERVAL_SEC = int(os.environ.get("HEALTH_INTERVAL_SEC", "3600"))
 ENGINE_INTERVAL_SEC = int(os.environ.get("ENGINE_INTERVAL_SEC", "60"))
 SNAPSHOT_ENABLED = (os.environ.get("SNAPSHOT_ENABLED", "0") != "0")
 
+# Минимальный R/R для публикации сигнала
+RR_MIN = float(os.environ.get("RR_MIN", "2.0"))
+
 print(f"[info] ALLOWED_CHAT_IDS = {sorted(ALLOWED_CHAT_IDS)}")
 print(f"[info] TELEGRAM_CHAT_ID(raw) = '{os.environ.get('TELEGRAM_CHAT_ID', '')}'")
 print(f"[info] RECIPIENTS (whitelisted) = {sorted(RECIPIENTS)}")
@@ -128,6 +134,7 @@ print(f"[info] Volume trigger params: VOL_MULT={VOL_MULT}, VOL_SMA_PERIOD={VOL_S
       f"BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s, RECENCY={RECENCY_MAX_SEC}s")
 print(f"[info] AutoVol: enabled={AUTO_VOL_ENABLED}, topN={AUTO_VOL_TOP_N}, "
       f"scan={AUTO_VOL_SCAN_COUNT}, time={AUTO_VOL_UTC_HOUR:02d}:{AUTO_VOL_UTC_MIN:02d}Z, max={MAX_SYMBOLS}")
+print(f"[info] Filters: RR_MIN={RR_MIN}")
 
 # ====================== STATE & MODELS ======================
 
@@ -270,7 +277,7 @@ async def get_oi_snapshots(symbol: str, interval: str = "5min", limit: int = 4) 
         out.append((ts, oi))
     return out
 
-# ====================== INDИКАТОРЫ / SMC ======================
+# ====================== ИНДИКАТОРЫ / SMC ======================
 
 def fmt_price(x: float) -> str:
     if x >= 100:
@@ -387,7 +394,7 @@ class Signal:
     confidence: int
     rr_ratio: float
     notes: List[str]
-    prob_pct: float  # << новая метрика: «вероятность (оценка)» в %
+    prob_pct: float  # «вероятность (оценка)» в %
 
 def rr_ratio_calc(side: str, entry: float, tp: float, sl: float) -> float:
     if side == "LONG":
@@ -708,7 +715,8 @@ async def job_engine(context: ContextTypes.DEFAULT_TYPE):
     sigs: List[Signal] = []
     for sym in syms:
         sig = await evaluate_symbol(sym)
-        if sig:
+        # ---- ФИЛЬТР ПО R/R ----
+        if sig and sig.rr_ratio >= RR_MIN:
             sigs.append(sig)
     # если пусто — НИЧЕГО не отправляем
     await send_signals(app, sigs)
@@ -830,7 +838,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     syms = await STATE.get_symbols()
     auto_line = f"AutoVol: {'ON' if AUTO_VOL_ENABLED else 'OFF'}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, max={MAX_SYMBOLS}"
-    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}")
+    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}\nFilters: RR_MIN={RR_MIN}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
