@@ -6,11 +6,10 @@ import json
 import logging
 import os
 import random
-import signal
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import aiohttp
 import httpx
@@ -24,6 +23,10 @@ from telegram.ext import (
     CallbackContext,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    ChannelPostHandler,
+    CallbackQueryHandler,  # на будущее
+    filters,
 )
 
 # =========================
@@ -36,11 +39,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("cryptobot")
 
 
 # =========================
-# КОНФИГ
+# УТИЛИТЫ
 # =========================
 
 def _parse_int_list(val: str) -> List[int]:
@@ -53,13 +56,13 @@ def _parse_int_list(val: str) -> List[int]:
         try:
             arr.append(int(p))
         except Exception:
-            # поддержка channel id вида "-100123..."
-            try:
-                arr.append(int(p))
-            except Exception:
-                pass
+            pass
     return arr
 
+
+# =========================
+# КОНФИГ
+# =========================
 
 @dataclass(frozen=True)
 class Cfg:
@@ -76,7 +79,7 @@ class Cfg:
     health_first_sec: int = 60        # первое сообщение через 60с
     startup_delay_sec: int = 10       # задержка стартовых джобов
     self_ping_enable: bool = True
-    self_ping_sec: int = 13 * 60      # раз в 13 минут (до 15, чтобы не уснул)
+    self_ping_sec: int = 13 * 60      # раз в 13 минут
     self_ping_timeout: float = 10.0
 
     # рынок/фильтры
@@ -107,15 +110,14 @@ def load_cfg() -> Cfg:
     webhook_path = os.environ.get("WEBHOOK_PATH") or f"/wh-{random.randint(10_000_000, 99_999_999)}"
 
     allowed = _parse_int_list(os.environ.get("ALLOWED_CHAT_IDS", "") or "")
-    # TELEGRAM_CHAT_ID может быть один (канал), добавим в whitelist
-    primary_raw = os.environ.get("TELEGRAM_CHAT_ID", "") or ""
+
     primary = []
+    primary_raw = os.environ.get("TELEGRAM_CHAT_ID", "") or ""
     if primary_raw:
         try:
             primary.append(int(primary_raw))
         except Exception:
             pass
-    # если ALLOWED пуст — добавим primary
     if primary and primary[0] not in allowed:
         allowed = allowed + primary
 
@@ -124,7 +126,6 @@ def load_cfg() -> Cfg:
         public_url=public_url,
         port=port,
         webhook_path=webhook_path,
-
         allowed_chat_ids=allowed or [],
         primary_recipients=primary or [],
 
@@ -152,52 +153,29 @@ def load_cfg() -> Cfg:
         atr_period=int(os.environ.get("ATR_PERIOD", "14") or 14),
     )
 
-    logger.info(
-        "INFO [cfg] ALLOWED_CHAT_IDS=%s",
-        cfg.allowed_chat_ids,
-    )
-    logger.info(
-        "INFO [cfg] PRIMARY_RECIPIENTS=%s",
-        cfg.primary_recipients,
-    )
-    logger.info(
-        "INFO [cfg] PUBLIC_URL='%s' PORT=%s WEBHOOK_PATH='%s'",
-        cfg.public_url,
-        cfg.port,
-        cfg.webhook_path,
-    )
+    logger.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.allowed_chat_ids)
+    logger.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.primary_recipients)
+    logger.info("INFO [cfg] PUBLIC_URL='%s' PORT=%s WEBHOOK_PATH='%s'", cfg.public_url, cfg.port, cfg.webhook_path)
     logger.info(
         "INFO [cfg] HEALTH=%ss FIRST=%ss STARTUP=%ss SELF_PING=%s/%ss",
-        cfg.health_sec,
-        cfg.health_first_sec,
-        cfg.startup_delay_sec,
-        "True" if cfg.self_ping_enable else "False",
-        cfg.self_ping_sec,
+        cfg.health_sec, cfg.health_first_sec, cfg.startup_delay_sec,
+        "True" if cfg.self_ping_enable else "False", cfg.self_ping_sec,
     )
     logger.info(
-        "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_MODE=%s UNIVERSE_TOP_N=%s WS_SYMBOLS_MAX=%s ROTATE_MIN=%s PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
-        cfg.signal_cooldown_sec,
-        cfg.signal_ttl_min,
-        cfg.universe_mode,
-        cfg.universe_top_n,
-        cfg.ws_symbols_max,
-        cfg.rotate_min,
-        cfg.prob_min,
-        cfg.profit_min_pct,
-        cfg.rr_min,
+        "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_MODE=%s UNIVERSE_TOP_N=%s "
+        "WS_SYMBOLS_MAX=%s ROTATE_MIN=%s PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+        cfg.signal_cooldown_sec, cfg.signal_ttl_min, cfg.universe_mode, cfg.universe_top_n,
+        cfg.ws_symbols_max, cfg.rotate_min, cfg.prob_min, cfg.profit_min_pct, cfg.rr_min,
     )
     logger.info(
         "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
-        cfg.vol_mult,
-        cfg.vol_sma_period,
-        cfg.body_atr_mult,
-        cfg.atr_period,
+        cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period,
     )
     return cfg
 
 
 # =========================
-# BYBIT CLIENT
+# BYBIT CLIENT (минимум)
 # =========================
 
 class BybitClient:
@@ -207,15 +185,13 @@ class BybitClient:
         self.sess = session
 
     async def get_linear_instruments(self) -> List[Dict]:
-        # Public linear instruments (USDT perpetual)
         url = f"{self.BASE}/v5/market/instruments-info"
         params = {"category": "linear", "limit": 1000}
         try:
             async with self.sess.get(url, params=params, timeout=15) as r:
                 data = await r.json()
                 if data.get("retCode") == 0:
-                    lst = data.get("result", {}).get("list", []) or []
-                    return lst
+                    return data.get("result", {}).get("list", []) or []
                 logger.warning("Bybit instruments retCode=%s retMsg=%s", data.get("retCode"), data.get("retMsg"))
         except Exception as e:
             logger.warning("Bybit instruments error: %s", e)
@@ -236,7 +212,7 @@ class BybitClient:
 
 
 # =========================
-# ДВИЖОК РЫНКА (минимально безопасный)
+# ДВИЖОК РЫНКА (каркас)
 # =========================
 
 class MarketEngine:
@@ -258,77 +234,54 @@ class MarketEngine:
             self.http_session = aiohttp.ClientSession()
         self.client = BybitClient(self.http_session)
 
-        # Загружаем «вселенную» линейных фьючерсов
         instruments = await self.client.get_linear_instruments()
         symbols = []
         for it in instruments:
             if it.get("status") == "Trading":
                 sym = it.get("symbol")
-                # фильтр только USDT перпетуалов
                 if sym and sym.endswith("USDT"):
                     symbols.append(sym)
 
         self._all_symbols = sorted(set(symbols))
         self.total_symbols = len(self._all_symbols)
 
-        # Стартовый активный набор
         if self.cfg.universe_mode == "top":
             self.active_symbols = self._all_symbols[: self.cfg.universe_top_n]
         else:
-            # режим all — берём первые ws_symbols_max
             self.active_symbols = self._all_symbols[: self.cfg.ws_symbols_max]
 
-        logger.info(
-            "INFO [universe] total=%d active=%d mode=%s",
-            self.total_symbols, len(self.active_symbols), self.cfg.universe_mode
-        )
+        logger.info("INFO [universe] total=%d active=%d mode=%s",
+                    self.total_symbols, len(self.active_symbols), self.cfg.universe_mode)
 
     async def rotate_active(self):
         if not self._all_symbols:
             return
         if self.cfg.universe_mode == "top":
-            # фиксированный топ
             self.active_symbols = self._all_symbols[: self.cfg.universe_top_n]
         else:
-            # роутируем равномерно по вселенной
             batch = self.cfg.ws_symbols_max
             now_slot = int(time.time() // (self.cfg.rotate_min * 60))
             start = (now_slot * batch) % max(1, self.total_symbols)
-            new = []
-            for i in range(batch):
-                idx = (start + i) % self.total_symbols
-                new.append(self._all_symbols[idx])
-            self.active_symbols = new
+            self.active_symbols = [self._all_symbols[(start + i) % self.total_symbols] for i in range(batch)]
         logger.info("INFO [rotate] active=%d", len(self.active_symbols))
 
     async def start_ws(self):
-        """Здесь должна быть реальная подписка на WS. Пока — лог и счётчик тем."""
-        # TODO: подключить реальный WS (kline/trade/liq) под вашу логику
         self.ws_started = True
-        # условная оценка количества топиков — по 2 топика на символ (пример)
         self.ws_topics = min(len(self.active_symbols) * 2, self.cfg.ws_symbols_max * 2)
         logger.info("INFO [ws] subscribed %d topics for %d symbols", self.ws_topics, len(self.active_symbols))
 
     async def poll_open_interest(self):
-        """Пуллим OI для активных символов (не ломаемся при ошибках)."""
         if not self.client:
             return
         syms = self.active_symbols[:]
         random.shuffle(syms)
         sample = syms[: min(10, len(syms))]
         for sym in sample:
-            data = await self.client.get_open_interest(sym, interval="5min", limit=4)
-            # Можно использовать data для оценки вероятности/сигнала
+            _ = await self.client.get_open_interest(sym, interval="5min", limit=4)
             await asyncio.sleep(0.1)
 
     async def analyze_and_emit_signals(self):
-        """Комбинированный анализ (SMC, объём, OI, ликвидации) и отправка сигналов.
-           Здесь — заглушка, не шлёт ничего, чтобы не спамить без условий."""
-        # TODO: вставьте вашу логику формирования сетапов.
-        # Пример фильтров (как ориентир):
-        # - вероятность > self.cfg.prob_min
-        # - ожидаемая прибыль >= self.cfg.profit_min_pct
-        # - R/R >= self.cfg.rr_min
+        # TODO: Ваша логика сетапов (SMC/объём/OI/ликвидации)
         pass
 
     async def close(self):
@@ -342,43 +295,59 @@ class MarketEngine:
 
 
 # =========================
-# ХЭНДЛЕРЫ БОТА
+# ДОСТУП
 # =========================
 
-def _is_allowed(cfg: Cfg, chat_id: int) -> bool:
-    return (not cfg.allowed_chat_ids) or (chat_id in cfg.allowed_chat_ids)
+def _is_allowed(cfg: Cfg, chat_id: int, user_id: Optional[int]) -> bool:
+    """Разрешаем, если whitelist пуст, либо chat_id в списке, либо user_id в списке."""
+    if not cfg.allowed_chat_ids:
+        return True
+    if chat_id in cfg.allowed_chat_ids:
+        return True
+    if user_id is not None and user_id in cfg.allowed_chat_ids:
+        return True
+    return False
+
+
+# =========================
+# ХЭНДЛЕРЫ КОМАНД
+# =========================
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Cfg = ctx.application.bot_data["cfg"]
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not _is_allowed(cfg, chat_id):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_allowed(cfg, chat_id, user_id):
         return
     await update.effective_message.reply_text("Привет! Бот запущен ✅")
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Cfg = ctx.application.bot_data["cfg"]
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not _is_allowed(cfg, chat_id):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_allowed(cfg, chat_id, user_id):
         return
     await update.effective_message.reply_text("🟢 online")
 
 async def cmd_universe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Cfg = ctx.application.bot_data["cfg"]
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not _is_allowed(cfg, chat_id):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_allowed(cfg, chat_id, user_id):
         return
     engine: MarketEngine = ctx.application.bot_data["engine"]
     total = engine.total_symbols
     active = len(engine.active_symbols)
     ws_topics = engine.ws_topics if engine.ws_started else 0
-    batch_num = 0  # можно считать по ROTATE_MIN и времени
+    batch_num = 0
     txt = f"Вселенная: total={total}, active={active}, batch#{batch_num}, ws_topics={ws_topics}"
     await update.effective_message.reply_text(txt)
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Cfg = ctx.application.bot_data["cfg"]
     chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not _is_allowed(cfg, chat_id):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not _is_allowed(cfg, chat_id, user_id):
         return
     engine: MarketEngine = ctx.application.bot_data["engine"]
     parts = [
@@ -389,6 +358,69 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"filters: prob>{cfg.prob_min:.1f}%, profit>={cfg.profit_min_pct:.1f}%, RR>={cfg.rr_min:.2f}",
     ]
     await update.effective_message.reply_text("Статус: " + ", ".join(parts))
+
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Вспомогательная команда — показывает, кто вы и где пишете."""
+    cfg: Cfg = ctx.application.bot_data["cfg"]
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id if chat else 0
+    user_id = user.id if user else None
+    allowed = _is_allowed(cfg, chat_id, user_id)
+    lines = [
+        f"chat_id={chat_id}",
+        f"user_id={user_id}",
+        f"type={chat.type if chat else 'unknown'}",
+        f"allowed={allowed}",
+    ]
+    await update.effective_message.reply_text("• " + "\n• ".join(lines))
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Краткая сводка для отладки."""
+    cfg: Cfg = ctx.application.bot_data["cfg"]
+    engine: MarketEngine = ctx.application.bot_data["engine"]
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    user_id = update.effective_user.id if update.effective_user else None
+    lines = [
+        f"cfg.public_url={cfg.public_url!r}",
+        f"port={cfg.port} webhook_path={cfg.webhook_path}",
+        f"universe: total={engine.total_symbols}, active={len(engine.active_symbols)}",
+        f"ws_started={engine.ws_started} ws_topics={engine.ws_topics}",
+        f"allowed_by_chat_or_user={_is_allowed(cfg, chat_id, user_id)}",
+    ]
+    await update.effective_message.reply_text("DEBUG:\n" + "\n".join(lines))
+
+
+# =========================
+# ГЛОБАЛЬНЫЕ ХЭНДЛЕРЫ/ЛОГИ
+# =========================
+
+async def on_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ловим любые Message-команды (для диагностики)."""
+    msg = update.message
+    if not msg:
+        return
+    if msg.text and msg.text.startswith("/"):
+        logger.info("[msg] command %r from chat=%s user=%s", msg.text, msg.chat_id, msg.from_user.id if msg.from_user else None)
+
+async def on_any_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ловим команды в каналах/supergroup channel_post."""
+    post = update.channel_post
+    if not post:
+        return
+    if post.text and post.text.startswith("/"):
+        from_id = post.sender_chat.id if post.sender_chat else None
+        logger.info("[channel_post] command %r in chat=%s sender_chat=%s", post.text, post.chat_id, from_id)
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Handler error:", exc_info=ctx.error)
+    # постараемся коротко уведомить владельца
+    try:
+        cfg: Cfg = ctx.application.bot_data.get("cfg")
+        if cfg and cfg.primary_recipients:
+            await ctx.application.bot.send_message(chat_id=cfg.primary_recipients[0], text=f"⚠️ Handler error: {ctx.error}")
+    except Exception:
+        pass
 
 
 # =========================
@@ -417,7 +449,7 @@ async def self_ping(cfg: Cfg):
 
 
 # =========================
-# МИНИ HTTP (для фолбэка)
+# МИНИ HTTP (фолбэк для Render)
 # =========================
 
 async def start_tiny_http_server(port: int):
@@ -426,10 +458,7 @@ async def start_tiny_http_server(port: int):
     async def ok(_):
         return web.Response(text="ok")
 
-    app.add_routes([
-        web.get("/", ok),
-        web.get("/healthz", ok),
-    ])
+    app.add_routes([web.get("/", ok), web.get("/healthz", ok)])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -444,7 +473,9 @@ async def start_tiny_http_server(port: int):
 
 def build_app(cfg: Cfg) -> Application:
     app = ApplicationBuilder().token(cfg.token).build()
-    # Делаем cfg и engine доступными в бот-данных
+    app.add_error_handler(on_error)
+
+    # bot_data
     app.bot_data["cfg"] = cfg
     app.bot_data["engine"] = MarketEngine(cfg, bot_send=lambda chat_id, text: app.bot.send_message(chat_id, text))
 
@@ -453,17 +484,22 @@ def build_app(cfg: Cfg) -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+
+    # Диагностика входящих команд через Message и через channel_post
+    app.add_handler(MessageHandler(filters.COMMAND, on_any_message), group=1)
+    app.add_handler(ChannelPostHandler(filters.ALL, on_any_channel_post), group=1)
+
     return app
 
 
 async def bootstrap_scheduled_jobs(app: Application, cfg: Cfg):
-    """Планировщик запускается уже ПОСЛЕ открытия порта/вебхука или tiny http."""
     engine: MarketEngine = app.bot_data["engine"]
 
     scheduler = AsyncIOScheduler()
     app.bot_data["scheduler"] = scheduler
 
-    # стартовые задачи (boot)
     async def job_bootstrap():
         try:
             await engine.bootstrap()
@@ -488,31 +524,25 @@ async def bootstrap_scheduled_jobs(app: Application, cfg: Cfg):
         except Exception as e:
             logger.warning("poll OI warn: %s", e)
 
-    # health и self-ping
     async def job_health():
         await send_health(app.bot, cfg)
 
     async def job_self_ping():
         await self_ping(cfg)
 
-    # Регистрируем
-    # первые «тяжёлые» куски — со стартовой задержкой, чтобы порт уже слушался
-    scheduler.add_job(job_bootstrap, "date", run_date=None, next_run_time=None)  # вызовем вручную
-    scheduler.add_job(job_start_ws, "date", run_date=None, next_run_time=None)  # вызовем вручную
+    # Регистрация
     scheduler.add_job(job_rotate, "interval", minutes=max(1, cfg.rotate_min))
     scheduler.add_job(job_poll_oi, "interval", minutes=2)
-
     scheduler.add_job(job_health, "interval", seconds=cfg.health_sec, next_run_time=None)
     scheduler.add_job(job_self_ping, "interval", seconds=cfg.self_ping_sec, next_run_time=None)
 
     scheduler.start()
     logger.info("Scheduler started")
 
-    # Первые запуски (после STARTUP_DELAY_SEC)
+    # Первичный прогон после задержки, чтобы порт точно был открыт
     await asyncio.sleep(max(0, cfg.startup_delay_sec))
     await job_bootstrap()
     await job_start_ws()
-    # health — первый раз через health_first_sec
     await asyncio.sleep(max(0, cfg.health_first_sec))
     await job_health()
 
@@ -521,22 +551,20 @@ async def main_async():
     cfg = load_cfg()
     application = build_app(cfg)
 
-    # Сначала — удалить вебхук (не критично, если не было)
+    # Сначала — снести старый вебхук
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.warning("delete_webhook warn: %s", e)
 
-    # Собрать URL вебхука
     webhook_url = f"{cfg.public_url.rstrip('/')}{cfg.webhook_path}" if cfg.public_url else ""
 
-    # Попытка запустить через вебхук
+    # Пытаемся вебхуком
     try:
         if not webhook_url.startswith("https://"):
             raise ValueError(f"PUBLIC_URL invalid or empty ('{cfg.public_url}')")
 
         logger.info("HTTP Request: POST setWebhook -> %s", webhook_url)
-        # В PTB порядок такой: initialize -> start_webhook -> start
         await application.initialize()
         await application.updater.start_webhook(
             listen="0.0.0.0",
@@ -547,11 +575,8 @@ async def main_async():
         )
         await application.start()
 
-        # Планировщик и фоновые джобы — уже после открытия порта
         await bootstrap_scheduled_jobs(application, cfg)
         logger.info("Application started")
-
-        # Ждём пока приложение живёт
         await application.updater.wait_until_idle()
         return
 
