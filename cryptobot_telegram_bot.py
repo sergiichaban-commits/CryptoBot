@@ -1,13 +1,13 @@
 """
 CryptoBot — Bybit 1m Candles + Volume Spike Signal (Render FREE Web Service)
-- Secure: whitelist chat_ids (env: ALLOWED_CHAT_IDS)
-- Recipients filtered by TELEGRAM_CHAT_ID
+- Безопасность: whitelist chat_ids (env: ALLOWED_CHAT_IDS), рассылка только TELEGRAM_CHAT_ID
 - Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
-- Candle summary every 5 minutes on confirmed 1m close
-- Health ping every 60 minutes
-- NEW: Volume spike signal (Volume >= VOL_MULT × SMA(V, VOL_SMA_PERIOD) and |body| >= BODY_ATR_MULT × ATR(ATR_PERIOD))
-- Mini HTTP server binds to $PORT (/, /health) so Render Web Service stays up
-- Start Command: python cryptobot_telegram_bot.py
+- Сводка свечи раз в 5 минут (на закрытии 1м)
+- Health ping каждые 60 минут
+- Сигнал ⚡ Volume spike: Volume >= VOL_MULT × SMA(V, VOL_SMA_PERIOD) и |body| >= BODY_ATR_MULT × ATR(ATR_PERIOD)
+- Мини HTTP сервер на $PORT (/, /health) — чтобы Web Service на Render оставался "живым" на бесплатном тарифе
+- При старте: delete_webhook(drop_pending_updates=True), чтобы исключить конфликт polling/webhook и очистить висящие апдейты
+- Start Command (Render Web Service): python cryptobot_telegram_bot.py
 """
 
 import os
@@ -18,7 +18,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from typing import List, Set, Optional
 from collections import deque
-import math
 
 import websockets
 from telegram import Update
@@ -28,7 +27,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 ALLOWED_DEFAULT: Set[int] = {533232884, -1002870952333}  # ты и канал ChaSerBot
 
-# env-переключатели для триггера (можно не трогать — есть дефолты)
+# Параметры триггера (можно менять через Environment на Render)
 VOL_SMA_PERIOD = int(os.environ.get("VOL_SMA_PERIOD", "20"))
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
 BODY_ATR_MULT = float(os.environ.get("BODY_ATR_MULT", "0.6"))
@@ -39,7 +38,8 @@ PING_INTERVAL_MIN = 60
 POST_EVERY_N_MIN = 5
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
-HTTP_PORT = int(os.environ.get("PORT", "8000"))  # Render присваивает $PORT
+
+HTTP_PORT = int(os.environ.get("PORT", "8000"))  # Render присваивает $PORT для Web Service
 
 def _parse_id_list(value: str) -> List[int]:
     """Парсер chat_id, устойчивый к пробелам/кавычкам."""
@@ -86,11 +86,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Whitelist: {sorted(ALLOWED_CHAT_IDS)}\n"
         f"Recipients: {RECIPIENTS}\n"
         f"Symbol: {SYMBOL}\n"
-        f"Trigger: Volume ≥ {VOL_MULT}×SMA{VOL_SMA_PERIOD} and |body| ≥ {BODY_ATR_MULT}×ATR{ATR_PERIOD}\n"
+        f"Trigger: Volume ≥ {VOL_MULT}×SMA{VOL_SMA_PERIOD} и |body| ≥ {BODY_ATR_MULT}×ATR{ATR_PERIOD}\n"
         f"Uptime: {utcnow().isoformat()}"
     )
 
 async def ignore_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Полная тишина для чужих
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in ALLOWED_CHAT_IDS:
         return
@@ -255,13 +256,21 @@ def start_http_server():
 # ---------------- App lifecycle ----------------
 
 async def post_init(application: Application):
-    # стартовое сообщение (если есть кому слать)
+    # 0) гарантируем режим polling: снимаем webhook и очищаем очередь апдейтов
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        print("[info] Webhook deleted, pending updates dropped.")
+    except Exception as e:
+        print(f"[warn] delete_webhook failed: {e}")
+
+    # 1) стартовое сообщение (если есть кому слать)
     for cid in RECIPIENTS:
         try:
             await application.bot.send_message(chat_id=cid, text=f"✅ Render Web Service: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
-    # фоновые задачи (без JobQueue)
+
+    # 2) фоновые задачи (без JobQueue)
     asyncio.create_task(health_loop(application))
     asyncio.create_task(bybit_candles(application))
 
