@@ -11,7 +11,6 @@ import string
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 
@@ -21,17 +20,19 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# --------------------------- ЛОГИ ---------------------------
+# ============================ ЛОГИ ============================
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("cryptobot")
 
 
-# --------------------------- КОНФИГ ---------------------------
+# ============================ УТИЛС ============================
 def _parse_int_list(val: str) -> List[int]:
     if not val:
         return []
@@ -64,6 +65,11 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _random_path(n=8) -> str:
+    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
+
+
+# ============================ КОНФИГ ============================
 @dataclass
 class Config:
     TELEGRAM_TOKEN: str
@@ -106,16 +112,16 @@ class Config:
 
         public_url = os.getenv("PUBLIC_URL", "").strip()
         port = _env_int("PORT", 10000)
-        wh_path = os.getenv("WEBHOOK_PATH", f"/wh-{random.randint(10_000_000, 99_999_999)}")
+        wh_path = os.getenv("WEBHOOK_PATH", "") or _random_path()
 
-        health = _env_int("HEALTH_SECONDS", 20 * 60)  # 20 минут
+        health = _env_int("HEALTH_SECONDS", 20 * 60)
         first = _env_int("FIRST_HEALTH_DELAY", 60)
         self_ping = _env_int("SELF_PING_SECONDS", 13 * 60)
 
         cooldown = _env_int("SIGNAL_COOLDOWN_SEC", 600)
         ttl = _env_int("SIGNAL_TTL_MIN", 12)
 
-        universe_mode = os.getenv("UNIVERSE_MODE", "all").strip()
+        universe_mode = os.getenv("UNIVERSE_MODE", "all").strip()  # all/top
         universe_top = _env_int("UNIVERSE_TOP_N", 15)
         ws_symbols = _env_int("WS_SYMBOLS_MAX", 60)
         rotate_min = _env_int("ROTATE_MIN", 5)
@@ -173,7 +179,7 @@ class Config:
         return cfg
 
 
-# --------------------------- BYBIT API ---------------------------
+# ============================ BYBIT API ============================
 class BybitClient:
     BASE_URL = "https://api.bybit.com"
 
@@ -195,7 +201,7 @@ class BybitClient:
             data = await self._get("/v5/market/instruments-info", params)
             if data.get("retCode") != 0:
                 raise RuntimeError(f"Bybit instruments error: {data}")
-            result = data.get("result", {})
+            result = data.get("result", {}) or {}
             rows = result.get("list", []) or []
             for r in rows:
                 if r.get("status") == "Trading" and r.get("quoteCoin") == "USDT" and r.get("contractType") == "LinearPerpetual":
@@ -216,20 +222,11 @@ class BybitClient:
         rows = (data.get("result", {}) or {}).get("list", []) or []
         candles: List[Dict] = []
         for r in rows:
-            candles.append(
-                {
-                    "t": int(r[0]),
-                    "o": float(r[1]),
-                    "h": float(r[2]),
-                    "l": float(r[3]),
-                    "c": float(r[4]),
-                    "v": float(r[5]),
-                }
-            )
+            candles.append({"t": int(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]), "v": float(r[5])})
         candles.sort(key=lambda x: x["t"])
         return candles
 
-    async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> List[Tuple[int, float]]:
+    async def get_oi(self, symbol: str, interval: str = "5min", limit: int = 6) -> List[Tuple[int, float]]:
         params = {"category": "linear", "symbol": symbol, "intervalTime": interval, "limit": limit}
         data = await self._get("/v5/market/open-interest", params)
         if data.get("retCode") != 0:
@@ -242,7 +239,7 @@ class BybitClient:
         return out
 
 
-# --------------------------- МАТЕМАТИКА/ИНДИКАТОРЫ ---------------------------
+# ============================ ИНДИКАТОРЫ ============================
 def _atr(candles: List[Dict], period: int) -> float:
     if len(candles) < period + 1:
         return float("nan")
@@ -288,10 +285,13 @@ def _rolling_low(candles: List[Dict], lookback: int) -> float:
     return min(lo) if lo else float("nan")
 
 
-@dataclass
+# ============================ СИГНАЛ ============================
+from dataclasses import dataclass as _dataclass
+
+@_dataclass
 class Signal:
     symbol: str
-    dir: str  # "LONG" / "SHORT"
+    dir: str  # "LONG"/"SHORT"
     price: float
     entry: float
     take: float
@@ -304,13 +304,7 @@ class Signal:
     created_ts: float = time.time()
 
 
-# --------------------------- АНАЛИЗ ---------------------------
-def _analyze_symbol(
-    cfg: Config,
-    symbol: str,
-    candles: List[Dict],
-    oi: List[Tuple[int, float]],
-) -> Optional[Signal]:
+def _analyze(cfg: Config, symbol: str, candles: List[Dict], oi: List[Tuple[int, float]]) -> Optional[Signal]:
     need = max(cfg.VOL_SMA_PERIOD, cfg.ATR_PERIOD, 30) + 2
     if len(candles) < need:
         return None
@@ -327,10 +321,9 @@ def _analyze_symbol(
     if not math.isfinite(vol_sma) or vol_sma <= 0:
         return None
 
-    vol_last = last["v"]
     if body <= cfg.BODY_ATR_MULT * atr:
         return None
-    if vol_last <= (cfg.VOL_MULT * vol_sma):
+    if last["v"] <= (cfg.VOL_MULT * vol_sma):
         return None
 
     direction = "LONG" if last["c"] > last["o"] else "SHORT"
@@ -338,11 +331,11 @@ def _analyze_symbol(
     closes = [c["c"] for c in candles]
     ema20_ser = _ema_series(closes, 20)
     ema20, ema20_prev = ema20_ser[-1], ema20_ser[-2]
+    ema_dir = 1 if ema20 > ema20_prev else -1
+    dir_sign = 1 if direction == "LONG" else -1
 
     trend_unit = abs((ema20 - ema20_prev) / max(1e-9, atr))
     trend_strength = max(0.9, min(1.4, 0.9 + trend_unit * 0.6))
-    ema_dir = 1 if ema20 > ema20_prev else -1
-    dir_sign = 1 if direction == "LONG" else -1
     trend_strength *= (1.05 if ema_dir == dir_sign else 0.95)
     trend_strength = max(0.85, min(1.5, trend_strength))
 
@@ -379,7 +372,7 @@ def _analyze_symbol(
         oi_delta_pct = (oi[-1][1] - oi[-2][1]) / oi[-2][1] * 100.0
         oi_boost = max(-8.0, min(8.0, 0.6 * oi_delta_pct * dir_sign))
 
-    vol_spike = vol_last / max(1e-9, vol_sma)
+    vol_spike = last["v"] / max(1e-9, vol_sma)
     body_rel = body / max(1e-9, atr)
 
     prob = 50.0
@@ -391,11 +384,7 @@ def _analyze_symbol(
     prob += (4.0 if ema_dir == dir_sign else -6.0)
     prob = max(0.0, min(99.9, prob))
 
-    if prob < cfg.PROB_MIN:
-        return None
-    if rr < cfg.RR_MIN:
-        return None
-    if take_pct < cfg.PROFIT_MIN_PCT:
+    if prob < cfg.PROB_MIN or rr < cfg.RR_MIN or take_pct < cfg.PROFIT_MIN_PCT:
         return None
 
     return Signal(
@@ -413,7 +402,7 @@ def _analyze_symbol(
     )
 
 
-# --------------------------- УНИВЕРС / СОСТОЯНИЕ ---------------------------
+# ============================ СОСТОЯНИЕ ============================
 class State:
     def __init__(self):
         self.total_symbols: List[str] = []
@@ -421,9 +410,24 @@ class State:
         self.batch_idx: int = 0
         self.last_signal_sent: Dict[str, float] = {}
         self.live_signals: Dict[str, Signal] = {}
+        self.ready: bool = False
 
 
-# --------------------------- TELEGRAM ХЭНДЛЕРЫ ---------------------------
+# ============================ ХЭНДЛЕРЫ ============================
+async def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    cfg: Config = context.bot_data["cfg"]
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return False
+    if cfg.ALLOWED_CHAT_IDS and chat_id not in cfg.ALLOWED_CHAT_IDS:
+        try:
+            await update.effective_message.reply_text("⛔️ Доступ запрещён.")
+        except Exception:
+            pass
+        return False
+    return True
+
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _is_allowed(update, context):
         return
@@ -457,101 +461,63 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt)
 
 
-async def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    cfg: Config = context.bot_data["cfg"]
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return False
-    if cfg.ALLOWED_CHAT_IDS and chat_id not in cfg.ALLOWED_CHAT_IDS:
-        try:
-            await update.effective_message.reply_text("⛔️ Доступ запрещён.")
-        except Exception:
-            pass
-        return False
-    return True
+async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error: %s", context.error)
 
 
-# --------------------------- ДЖОБЫ ---------------------------
+# ============================ ДЖОБЫ ============================
 async def job_health(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.bot_data["cfg"]
-    try:
-        for cid in cfg.PRIMARY_RECIPIENTS:
+    for cid in cfg.PRIMARY_RECIPIENTS:
+        try:
             await context.bot.send_message(chat_id=cid, text="online")
-    except Exception as e:
-        log.warning("health send failed: %s", e)
+        except Exception as e:
+            log.warning("health send failed: %s", e)
 
 
 async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.bot_data["cfg"]
     if not cfg.PUBLIC_URL:
         return
-    url = cfg.PUBLIC_URL
     session: aiohttp.ClientSession = context.bot_data.get("aiohttp_session")
     try:
+        url = cfg.PUBLIC_URL
         if session and not session.closed:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as _:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)):
                 pass
         else:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-                async with s.get(url) as _:
+                async with s.get(url):
                     pass
     except Exception as e:
         log.debug("self-ping error: %s", e)
 
 
-async def job_load_universe(context: ContextTypes.DEFAULT_TYPE):
-    st: State = context.bot_data["state"]
-    cfg: Config = context.bot_data["cfg"]
-    client: BybitClient = context.bot_data["bybit"]
-
-    try:
-        all_syms = await client.get_symbols_linear()
-        if cfg.UNIVERSE_MODE == "top" and cfg.UNIVERSE_TOP_N > 0:
-            st.total_symbols = all_syms[: cfg.UNIVERSE_TOP_N]
-        else:
-            st.total_symbols = all_syms
-
-        await _rotate_active(context)
-        log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
-    except Exception as e:
-        log.error("universe load failed: %s", e)
-
-
-async def _rotate_active(context: ContextTypes.DEFAULT_TYPE):
+async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
     if not st.total_symbols:
         return
     n = cfg.WS_SYMBOLS_MAX
     start = (st.batch_idx * n) % len(st.total_symbols)
-    new_active: List[str] = []
-    i = start
-    while len(new_active) < n and st.total_symbols:
-        new_active.append(st.total_symbols[i % len(st.total_symbols)])
-        i += 1
-    st.active_symbols = new_active
+    st.active_symbols = [st.total_symbols[(start + i) % len(st.total_symbols)] for i in range(min(n, len(st.total_symbols)))]
     st.batch_idx += 1
     log.info("INFO [universe] rotated: active=%d batch#%d", len(st.active_symbols), st.batch_idx)
-
-
-async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
-    await _rotate_active(context)
 
 
 async def job_scan(context: ContextTypes.DEFAULT_TYPE):
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
-    client: BybitClient = context.bot_data["bybit"]
-
-    if not st.active_symbols:
+    client: BybitClient = context.bot_data.get("bybit")
+    if not st.active_symbols or not client:
         return
 
     candidates: List[Signal] = []
     for sym in st.active_symbols:
         try:
             candles = await client.get_klines(sym, interval="5", limit=300)
-            oi = await client.get_open_interest(sym, interval="5min", limit=6)
-            sig = _analyze_symbol(cfg, sym, candles, oi)
+            oi = await client.get_oi(sym, interval="5min", limit=6)
+            sig = _analyze(cfg, sym, candles, oi)
             if sig:
                 candidates.append(sig)
             await asyncio.sleep(0.05)
@@ -562,40 +528,32 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
         return
 
     candidates.sort(key=lambda s: (-s.prob, -s.rr, -s.take_pct))
-
     now_ts = time.time()
-    out_msgs: List[Tuple[str, Signal]] = []
+    out_msgs: List[str] = []
 
     for s in candidates:
         last_ts = st.last_signal_sent.get(s.symbol, 0.0)
         if now_ts - last_ts < cfg.SIGNAL_COOLDOWN_SEC:
             continue
         live = st.live_signals.get(s.symbol)
-        if live and (now_ts - live.created_ts) < (live.ttl_min * 60):
-            if s.prob <= live.prob:
-                continue
+        if live and (now_ts - live.created_ts) < (live.ttl_min * 60) and s.prob <= live.prob:
+            continue
 
         st.last_signal_sent[s.symbol] = now_ts
         st.live_signals[s.symbol] = s
 
         sign = "ЛОНГ" if s.dir == "LONG" else "ШОРТ"
-        take_delta = s.take_pct
-        stop_delta = s.stop_pct
-
         msg = (
             f"#{s.symbol} — {sign}\n"
             f"Текущая: {s.price:.6g}\n"
             f"Вход: {s.entry:.6g}\n"
-            f"Тейк: {s.take:.6g} (+{take_delta:.2f}%)\n"
-            f"Стоп: {s.stop:.6g} (-{stop_delta:.2f}%)\n"
+            f"Тейк: {s.take:.6g} (+{s.take_pct:.2f}%)\n"
+            f"Стоп: {s.stop:.6g} (-{s.stop_pct:.2f}%)\n"
             f"R/R: {s.rr:.2f} | Вероятность: {s.prob:.1f}%"
         )
-        out_msgs.append((msg, s))
+        out_msgs.append(msg)
 
-    if not out_msgs:
-        return
-
-    for msg, _ in out_msgs:
+    for msg in out_msgs:
         for cid in cfg.PRIMARY_RECIPIENTS:
             try:
                 await context.bot.send_message(chat_id=cid, text=msg)
@@ -604,24 +562,69 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.6)
 
 
-# --------------------------- HTTP (для Render) ---------------------------
+async def job_bootstrap(context: ContextTypes.DEFAULT_TYPE):
+    """Стартовая джоба: создаёт HTTP-сессию, Bybit клиент, грузит вселенную,
+    а затем регистрирует остальные джобы."""
+    cfg: Config = context.bot_data["cfg"]
+    st: State = context.bot_data["state"]
+
+    if context.bot_data.get("bootstrapped"):
+        return
+
+    log.info("BOOTSTRAP: start")
+
+    # 1) HTTP-сессия/Bybit
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+    context.bot_data["aiohttp_session"] = session
+    client = BybitClient(session)
+    context.bot_data["bybit"] = client
+
+    # 2) Вселенная
+    try:
+        all_syms = await client.get_symbols_linear()
+        if cfg.UNIVERSE_MODE == "top" and cfg.UNIVERSE_TOP_N > 0:
+            st.total_symbols = all_syms[: cfg.UNIVERSE_TOP_N]
+        else:
+            st.total_symbols = all_syms
+        await job_rotate(context)
+        st.ready = True
+        log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
+    except Exception as e:
+        log.error("universe load failed: %s", e)
+
+    # 3) Регулярные джобы
+    jq = context.job_queue
+    jq.run_repeating(job_health, interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
+    if cfg.PUBLIC_URL:
+        jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
+    jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
+    jq.run_repeating(job_scan, interval=30, first=15, name="scan")
+
+    # 4) Уведомление о старте
+    for cid in cfg.PRIMARY_RECIPIENTS:
+        try:
+            await context.bot.send_message(chat_id=cid, text="✅ Bot started. Universe loading done.")
+        except Exception:
+            pass
+
+    context.bot_data["bootstrapped"] = True
+    log.info("BOOTSTRAP: done")
+
+
+# ============================ HTTP HEALTH ============================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"not found")
-            return
         if self.path == "/healthz":
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        self.send_response(404)
+        # Чтобы Render видел порт — на / тоже отвечаем 200
+        self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"not found")
+        self.wfile.write(b"web-ok")
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         return
 
 
@@ -636,65 +639,33 @@ def _start_health_server(port: int):
     return th
 
 
-# --------------------------- POST_INIT (PTB) ---------------------------
-async def _post_init(app: Application):
-    cfg: Config = app.bot_data["cfg"]
-
-    # Общее состояние
-    st = State()
-    app.bot_data["state"] = st
-
-    # Общая HTTP-сессия и Bybit клиент
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-    app.bot_data["aiohttp_session"] = session
-    app.bot_data["bybit"] = BybitClient(session)
-
-    # Команды
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("universe", cmd_universe))
-    app.add_handler(CommandHandler("status", cmd_status))
-
-    # Джобы
-    jq = app.job_queue
-    jq.run_repeating(job_health, interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
-    if cfg.PUBLIC_URL:
-        jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
-    jq.run_once(job_load_universe, when=3)
-    jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
-    jq.run_repeating(job_scan, interval=30, first=15, name="scan")
-
-
-# --------------------------- MAIN ---------------------------
-def _random_path(n=8) -> str:
-    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
-
-
+# ============================ MAIN ============================
 def main():
     cfg = Config.load()
 
-    # Сборка приложения: переносим инициализацию в post_init (оно async и вызовется PTB)
-    application = (
-        Application.builder()
-        .token(cfg.TELEGRAM_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    # Собираем приложение
+    application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
     application.bot_data["cfg"] = cfg
+    application.bot_data["state"] = State()
+
+    # Хэндлеры команд
+    application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("universe", cmd_universe))
+    application.add_handler(CommandHandler("status", cmd_status))
+
+    # (необязательный) логгер всех апдейтов — поможет понять, доходят ли апдейты
+    application.add_handler(MessageHandler(filters.ALL, lambda u, c: log.debug("update: %s", getattr(u, "to_dict", lambda: u)())))
+
+    # Глобальный обработчик ошибок
+    application.add_error_handler(err_handler)
+
+    # Планируем bootstrap сразу после старта (внутри уже будет рабочий loop)
+    application.job_queue.run_once(job_bootstrap, when=1, name="bootstrap")
 
     use_webhook = bool(cfg.PUBLIC_URL and cfg.PUBLIC_URL.startswith("https://"))
-    if not use_webhook:
-        # Для Render обязательно открыть порт, даже в polling
-        _start_health_server(cfg.PORT)
-
     if use_webhook:
-        # Сбросить старый вебхук (PTB внутри тоже разрулит, но на всякий пожарный)
-        try:
-            # В sync-контексте нельзя await: PTB сам вызовет это при запуске вебхука
-            pass
-        except Exception:
-            pass
         webhook_url = cfg.PUBLIC_URL.rstrip("/") + (cfg.WEBHOOK_PATH or _random_path())
-        log.info("Setting webhook to %s", webhook_url)
+        log.info("WEBHOOK mode: %s", webhook_url)
         application.run_webhook(
             listen="0.0.0.0",
             port=cfg.PORT,
@@ -702,8 +673,9 @@ def main():
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        log.info("Polling started (fallback)")
-        # PTB внутри сам снимет вебхук и запустит polling с собственным loop
+        # Открываем порт, чтобы Render считал сервис живым (и можно смотреть /healthz)
+        _start_health_server(cfg.PORT)
+        log.info("POLLING mode: starting long-polling …")
         application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
