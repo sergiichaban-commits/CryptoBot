@@ -21,6 +21,37 @@ from telegram.ext import (
     filters,
 )
 
+# ====================== OPTIONAL HARDCODED ENV DEFAULTS ======================
+# Эти значения используются ТОЛЬКО если переменные окружения не заданы на Render.
+# ⚠️ НЕ РЕКОМЕНДУЕТСЯ коммитить сюда реальный Telegram-токен.
+HARDCODED_ENV = {
+    # "TELEGRAM_BOT_TOKEN": "ВАШ_ТОКЕН_СЮДА_ЕСЛИ_СОЗНАТЕЛЬНО_ХОТИТЕ_ХРАНИТЬ_В_КОДЕ",  # ⚠️ рискованно
+
+    # Ваши whitelists по умолчанию
+    "ALLOWED_CHAT_IDS": "533232884,-1002870952333",
+    "TELEGRAM_CHAT_ID": "-1002870952333",
+
+    # Список символов (если нужно задать в коде)
+    # "SYMBOLS": "BTCUSDT,ETHUSDT,SOLUSDT",
+
+    # Параметры авто-подбора волатильных
+    "AUTO_VOL_ENABLED": "1",
+    "AUTO_VOL_TOP_N": "15",
+    "AUTO_VOL_SCAN_COUNT": "60",
+    "AUTO_VOL_UTC_HOUR": "0",
+    "AUTO_VOL_UTC_MIN": "10",
+    "MAX_SYMBOLS": "30",
+
+    # Интервалы задач
+    "SNAPSHOT_ENABLED": "1",
+    "PORT": "10000",
+
+    # Обычно Render сам проставляет RENDER_EXTERNAL_URL → PUBLIC_URL не нужен
+    # "PUBLIC_URL": "https://cryptobot-<slug>.onrender.com",
+}
+for k, v in HARDCODED_ENV.items():
+    os.environ.setdefault(k, str(v))
+
 # ====================== ENV & CONSTANTS ======================
 
 def parse_int_list(s: str | None) -> list[int]:
@@ -39,13 +70,13 @@ def parse_int_list(s: str | None) -> list[int]:
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("Set TELEGRAM_BOT_TOKEN")
+    raise SystemExit("Set TELEGRAM_BOT_TOKEN (в Render или раскомментируйте HARDCODED_ENV['TELEGRAM_BOT_TOKEN'])")
 
 allowed_from_env = parse_int_list(os.environ.get("ALLOWED_CHAT_IDS"))
 fallback_chat = parse_int_list(os.environ.get("TELEGRAM_CHAT_ID"))
 ALLOWED_CHAT_IDS: list[int] = allowed_from_env or fallback_chat
 if not ALLOWED_CHAT_IDS:
-    raise SystemExit("Set ALLOWED_CHAT_IDS or TELEGRAM_CHAT_ID")
+    raise SystemExit("Set ALLOWED_CHAT_IDS или TELEGRAM_CHAT_ID (в Render или HARDCODED_ENV)")
 
 RECIPIENTS: list[int] = fallback_chat or ALLOWED_CHAT_IDS
 
@@ -594,11 +625,10 @@ async def get_kline_daily_closes(session: aiohttp.ClientSession, symbol: str, li
     rows = (data.get("result") or {}).get("list") or []
     for row in rows:
         closes.append(float(row[4]))
-    closes.sort()  # Bybit может вернуть newest->oldest; для std нам нужен порядок — отсортим по времени
+    closes.sort()
     return closes
 
 def realized_vol_pct(closes: List[float]) -> float:
-    """std проц. доходностей за ~неделю (D-бары), без ежегодной шкалы — для ранжирования."""
     if len(closes) < 5:
         return float("nan")
     rets = []
@@ -631,7 +661,6 @@ async def pick_symbols_by_week_vol(top_n: int, scan_count: int) -> List[str]:
         return [sym for sym, _ in ranked[:max(1, top_n)]]
 
 async def job_autovol(context: ContextTypes.DEFAULT_TYPE, manual_topn: Optional[int] = None) -> Tuple[List[str], List[str]]:
-    """Считает топ волатильных и ДОБАВЛЯЕТ к текущему списку (уникально, с лимитом)."""
     topn = manual_topn if manual_topn is not None else AUTO_VOL_TOP_N
     added: List[str] = []
     before = await STATE.get_symbols()
@@ -643,19 +672,15 @@ async def job_autovol(context: ContextTypes.DEFAULT_TYPE, manual_topn: Optional[
         for sym in picked:
             if sym not in new:
                 new.append(sym)
-        # ужмём по MAX_SYMBOLS (оставим первые — текущие в приоритете)
         if len(new) > MAX_SYMBOLS:
             new = new[:MAX_SYMBOLS]
         await STATE.set_symbols(new)
-        # инициализируем историю для новых
         to_bootstrap = [s for s in new if s not in before]
         if to_bootstrap:
             await bootstrap_for_symbols(to_bootstrap)
         added = [s for s in new if s not in before]
         STATE.last_autovol_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
         STATE.last_autovol_added = added
-        # пересобрать WS подписку на ликвидации — в простом варианте достаточно перезапуска контейнера;
-        # здесь мягко предупредим (движок по ликвидациям продолжит работать по текущему списку до рестарта WS).
         try:
             await context.application.bot.send_message(
                 chat_id=RECIPIENTS[0],
@@ -805,7 +830,6 @@ def build_application() -> Application:
     jq.run_repeating(job_engine, interval=ENGINE_INTERVAL_SEC, first=20)
 
     if AUTO_VOL_ENABLED:
-        # ежедневный пересчёт в заданное UTC-время
         jq.run_daily(
             callback=lambda ctx: job_autovol(ctx),
             time=dtime(hour=AUTO_VOL_UTC_HOUR, minute=AUTO_VOL_UTC_MIN, tzinfo=timezone.utc),
