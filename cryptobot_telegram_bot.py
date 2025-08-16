@@ -1,11 +1,11 @@
 """
-CryptoBot — Bybit 1m Candles Test (Render-ready, JobQueue, robust env parsing)
+CryptoBot — Bybit 1m Candles Test (Render-ready, JobQueue + fallback)
 - Secure: whitelist chat_ids (env: ALLOWED_CHAT_IDS)
 - Recipients from TELEGRAM_CHAT_ID filtered by whitelist
-- Health-check every 60 minutes (JobQueue)
+- Health-check every 60 minutes
 - Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
 - Sends a compact candle summary every 5 minutes (on confirmed candle)
-- Render: run as Background Worker with Start Command: `python cryptobot_telegram_bot.py`
+- Render: Background Worker | Build: pip install -r requirements.txt | Start: python cryptobot_telegram_bot.py
 """
 
 import os
@@ -26,20 +26,15 @@ from telegram.ext import (
 
 # ---------------- Config / Security ----------------
 
-# По умолчанию whitelist включает тебя и твой канал ChaSerBot
-ALLOWED_DEFAULT: Set[int] = {533232884, -1002870952333}
-
-PING_INTERVAL_MIN = 60          # как часто слать "🟢 online"
-POST_EVERY_N_MIN = 5            # сводка свечей раз в N минут
+ALLOWED_DEFAULT: Set[int] = {533232884, -1002870952333}  # ты и канал ChaSerBot
+PING_INTERVAL_MIN = 60
+POST_EVERY_N_MIN = 5
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
 
 
 def _parse_id_list(value: str) -> List[int]:
-    """
-    Устойчивый к лишним пробелам и кавычкам парсер списков chat_id.
-    Пример: " 533232884 , '-1002870952333' " -> [533232884, -1002870952333]
-    """
+    """Парсер chat_id, устойчивый к пробелам/кавычкам."""
     out: List[int] = []
     if not value:
         return out
@@ -98,14 +93,10 @@ async def ignore_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- Bybit WS consumer ----------------
 
 async def bybit_candles(application: Application):
-    """
-    Подписка на kline.1.<SYMBOL>.
-    Шлём краткую сводку раз в POST_EVERY_N_MIN минут на подтверждённой свече.
-    """
+    """Подписка на kline.1.<SYMBOL>, сводка раз в POST_EVERY_N_MIN минут на подтверждённой свече."""
     last_posted_min: Optional[int] = None
 
     async def send_summary(candle: dict):
-        # item keys: start, end, open, high, low, close, volume, turnover, confirm
         o = float(candle["open"]); h = float(candle["high"]); l = float(candle["low"]); c = float(candle["close"])
         v = float(candle["volume"])
         ts = int(candle["end"])  # ms
@@ -140,64 +131,61 @@ async def bybit_candles(application: Application):
                                 await send_summary(item)
         except Exception as e:
             print("[warn] WS reconnecting due to:", e)
-            await asyncio.sleep(3)  # backoff и переподключение
+            await asyncio.sleep(3)  # backoff
 
 
-# ---------------- Jobs (JobQueue) ----------------
+# ---------------- Health-check ----------------
 
-async def health_job(context: ContextTypes.DEFAULT_TYPE):
+async def health_loop(application: Application):
+    """Фолбэк-цикл пинга, если JobQueue недоступен."""
     if not RECIPIENTS:
         return
-    for cid in RECIPIENTS:
-        try:
-            await context.bot.send_message(chat_id=cid, text="🟢 online", disable_notification=True)
-        except Exception as e:
-            print(f"[warn] health-check -> {cid}: {e}")
-
-async def start_ws_job(context: ContextTypes.DEFAULT_TYPE):
-    # Запускаем длинную фоновую корутину уже ПОСЛЕ старта приложения
-    context.application.create_task(bybit_candles(context.application))
+    while True:
+        for cid in RECIPIENTS:
+            try:
+                await application.bot.send_message(chat_id=cid, text="🟢 online", disable_notification=True)
+            except Exception as e:
+                print(f"[warn] health-check -> {cid}: {e}")
+        await asyncio.sleep(PING_INTERVAL_MIN * 60)
 
 
 # ---------------- App lifecycle ----------------
 
 async def post_init(application: Application):
-    # Если получателей нет — логируем и пытаемся уведомить fallback (не роняем сервис)
+    # Если получателей нет — логируем и не падаем
     if not RECIPIENTS:
         print("[error] RECIPIENTS is empty. Check TELEGRAM_CHAT_ID and ALLOWED_CHAT_IDS env vars.")
-        fallback = [x for x in ALLOWED_DEFAULT if x in ALLOWED_CHAT_IDS]
-        for cid in fallback:
-            try:
-                await application.bot.send_message(
-                    chat_id=cid,
-                    text="❗ Нет валидного TELEGRAM_CHAT_ID на Render. Проверь переменные окружения."
-                )
-            except Exception as e:
-                print(f"[warn] cannot notify fallback {cid}: {e}")
-        # даже без получателей планируем запуск WS — он не будет spam'ить, т.к. RECIPIENTS пуст
-        application.job_queue.run_once(start_ws_job, when=timedelta(seconds=2), name="start_ws")
-        application.job_queue.run_repeating(health_job, interval=timedelta(minutes=PING_INTERVAL_MIN),
-                                            first=timedelta(minutes=1), name="health")
-        return
 
-    # Нормальный путь: уведомление о старте и планирование задач
+    # Стартовое сообщение (если есть кому слать)
     for cid in RECIPIENTS:
         try:
             await application.bot.send_message(chat_id=cid, text=f"✅ Render: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
 
-    application.job_queue.run_repeating(
-        health_job,
-        interval=timedelta(minutes=PING_INTERVAL_MIN),
-        first=timedelta(minutes=1),
-        name="health"
-    )
-    application.job_queue.run_once(
-        start_ws_job,
-        when=timedelta(seconds=2),
-        name="start_ws"
-    )
+    # Если JobQueue есть (установлен extra 'job-queue') — используем его
+    if getattr(application, "job_queue", None) is not None:
+        try:
+            application.job_queue.run_repeating(
+                lambda ctx: ctx.application.create_task(health_loop(ctx.application)),
+                interval=timedelta(minutes=PING_INTERVAL_MIN),
+                first=timedelta(seconds=2),
+                name="health-wrapper",
+            )
+            application.job_queue.run_once(
+                lambda ctx: ctx.application.create_task(bybit_candles(ctx.application)),
+                when=timedelta(seconds=2),
+                name="start-ws",
+            )
+            print("[info] JobQueue is enabled.")
+            return
+        except Exception as e:
+            print(f"[warn] JobQueue scheduling failed, falling back: {e}")
+
+    # Фолбэк без JobQueue: запускаем корутины напрямую (без PTB warning)
+    print("[info] JobQueue not available -> fallback to background tasks.")
+    asyncio.create_task(health_loop(application))
+    asyncio.create_task(bybit_candles(application))
 
 
 def main():
