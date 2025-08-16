@@ -24,7 +24,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    ChannelPostHandler,
     CallbackQueryHandler,  # на будущее
     filters,
 )
@@ -396,25 +395,17 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def on_any_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ловим любые Message-команды (для диагностики)."""
-    msg = update.message
+    """Ловим любые командные сообщения (Message и channel_post через effective_message)."""
+    msg = update.effective_message
     if not msg:
         return
     if msg.text and msg.text.startswith("/"):
-        logger.info("[msg] command %r from chat=%s user=%s", msg.text, msg.chat_id, msg.from_user.id if msg.from_user else None)
-
-async def on_any_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ловим команды в каналах/supergroup channel_post."""
-    post = update.channel_post
-    if not post:
-        return
-    if post.text and post.text.startswith("/"):
-        from_id = post.sender_chat.id if post.sender_chat else None
-        logger.info("[channel_post] command %r in chat=%s sender_chat=%s", post.text, post.chat_id, from_id)
+        who = (msg.from_user.id if msg.from_user else None)
+        logger.info("[cmd] %r in chat=%s user=%s type=%s",
+                    msg.text, msg.chat_id, who, update.effective_chat.type if update.effective_chat else None)
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     logger.exception("Handler error:", exc_info=ctx.error)
-    # постараемся коротко уведомить владельца
     try:
         cfg: Cfg = ctx.application.bot_data.get("cfg")
         if cfg and cfg.primary_recipients:
@@ -487,9 +478,8 @@ def build_app(cfg: Cfg) -> Application:
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
 
-    # Диагностика входящих команд через Message и через channel_post
+    # Диагностика входящих команд (и в чатах, и в каналах)
     app.add_handler(MessageHandler(filters.COMMAND, on_any_message), group=1)
-    app.add_handler(ChannelPostHandler(filters.ALL, on_any_channel_post), group=1)
 
     return app
 
