@@ -1,790 +1,748 @@
 # cryptobot_telegram_bot.py
-# Telegram webhook bot on Render + signals engine (Bybit v5)
-# Strategy: Intraday SMC-lite + Volume + OI + Liquidations
-# Filters: RR>=2.0, Profit>=1%, Probability>69.9; only fresh signals; sorted by probability
-#
-# ENV (Render -> Environment):
-#   TELEGRAM_BOT_TOKEN   (required)
-#   TELEGRAM_CHAT_ID     (required) channel/chat id to receive alerts (e.g. -1002870952333)
-#   ALLOWED_CHAT_IDS     (required) CSV including TELEGRAM_CHAT_ID and your user id
-#   RENDER_EXTERNAL_URL  (Render sets) OR PUBLIC_URL
-#   PORT                 (Render sets)
-#   (opt) WEBHOOK_PATH            default /wh-<token8>
-#   (opt) HEALTH_INTERVAL_SEC     default 1200 (20 min)
-#   (opt) HEALTH_FIRST_SEC        default 60
-#   (opt) STARTUP_PING_SEC        default 10
-#   (opt) SELF_PING_ENABLED       "1"/"0" default "1"
-#   (opt) SELF_PING_INTERVAL_SEC  default 780 (~13 min)
-#   (opt) SELF_PING_PATH          default "/"
-#   (opt) SIGNAL_COOLDOWN_SEC     default 600
-#   (opt) SIGNAL_TTL_MIN          default 12
-#   (opt) UNIVERSE_TOP_N          default 15
-#   (opt) BYBIT_SYMBOLS_CANDIDATES CSV override candidate universe (else default list)
-#   (opt) PROB_MIN                default 69.9  (strictly greater-than)
-#   (opt) PROFIT_MIN_PCT          default 1.0   (TP1 expected gain threshold, in %)
-#
-# Requirements:
-#   python-telegram-bot[job-queue,webhooks]==21.6
-#   aiohttp websockets pandas numpy pytz httpx
+# -*- coding: utf-8 -*-
 
-from __future__ import annotations
+import os
+import asyncio
+import json
+import math
+import random
+import time
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Set, Optional, Tuple, Deque
+from collections import deque, defaultdict
 
-import os, asyncio, json, math, time, logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Set
-from datetime import datetime, timedelta, timezone
-
-import numpy as np
-import pandas as pd
-import pytz
 import aiohttp
-import websockets
 import httpx
 
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ------------ logging ------------
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(levelname)s %(message)s")
-log = logging.getLogger("cryptobot")
+# =========================
+# Конфигурация из ENV
+# =========================
 
-# ------------ helpers/env ------------
-def parse_int_list(csv: str) -> List[int]:
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except:
+        return default
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None else default
+    except:
+        return default
+
+def _parse_id_list(s: Optional[str]) -> List[int]:
+    if not s:
+        return []
     out = []
-    for part in (csv or "").split(","):
-        s = part.strip()
-        if not s:
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
             continue
         try:
-            out.append(int(s))
-        except ValueError:
-            pass
+            out.append(int(part))
+        except:
+            # поддержка вида -10012345 (как строка)
+            if part.startswith("-") and part[1:].isdigit():
+                out.append(int(part))
     return out
 
-def getenv_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-def getenv_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-def fmt_age(ts_ms: int) -> str:
-    if not ts_ms:
-        return "n/a"
-    age = max(0, int(time.time() - ts_ms/1000))
-    m, s = divmod(age, 60)
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN is required.")
-
-primary_chat_raw = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-ALLOWED_CHAT_IDS: Set[int] = set(parse_int_list(os.environ.get("ALLOWED_CHAT_IDS", "")))
-PRIMARY_RECIPIENTS: List[int] = []
-if primary_chat_raw:
-    try:
-        cid = int(primary_chat_raw)
-        if cid in ALLOWED_CHAT_IDS:
-            PRIMARY_RECIPIENTS.append(cid)
-    except ValueError:
-        pass
-
-PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
-PORT = getenv_int("PORT", 10000)
-token_prefix = BOT_TOKEN.split(":")[0] if ":" in BOT_TOKEN else BOT_TOKEN[:8]
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/wh-{token_prefix[:8]}")
-WEBHOOK_URL = (PUBLIC_URL.rstrip("/") + WEBHOOK_PATH) if PUBLIC_URL else ""
-
-HEALTH_INTERVAL_SEC = getenv_int("HEALTH_INTERVAL_SEC", 1200)
-HEALTH_FIRST_SEC    = getenv_int("HEALTH_FIRST_SEC", 60)
-STARTUP_PING_SEC    = getenv_int("STARTUP_PING_SEC", 10)
-
-SELF_PING_ENABLED        = os.environ.get("SELF_PING_ENABLED", "1").lower() not in {"0","false","no"}
-SELF_PING_INTERVAL_SEC   = getenv_int("SELF_PING_INTERVAL_SEC", 780)
-SELF_PING_URL            = (PUBLIC_URL.rstrip("/") + os.environ.get("SELF_PING_PATH", "/")) if PUBLIC_URL else ""
-
-SIGNAL_COOLDOWN_SEC      = getenv_int("SIGNAL_COOLDOWN_SEC", 600)
-SIGNAL_TTL_MIN           = getenv_int("SIGNAL_TTL_MIN", 12)
-UNIVERSE_TOP_N           = getenv_int("UNIVERSE_TOP_N", 15)
-PROB_MIN                 = getenv_float("PROB_MIN", 69.9)        # strict >
-PROFIT_MIN_PCT           = getenv_float("PROFIT_MIN_PCT", 1.0)   # >= this percent
-
-log.info("[cfg] ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_CHAT_IDS))
-log.info("[cfg] PRIMARY_RECIPIENTS=%s", PRIMARY_RECIPIENTS)
-log.info("[cfg] PUBLIC_URL='%s' PORT=%s WEBHOOK_PATH='%s'", PUBLIC_URL, PORT, WEBHOOK_PATH)
-log.info("[cfg] HEALTH=%ss FIRST=%ss STARTUP=%s SELF_PING=%s/%ss", HEALTH_INTERVAL_SEC, HEALTH_FIRST_SEC, STARTUP_PING_SEC, bool(SELF_PING_ENABLED), SELF_PING_INTERVAL_SEC)
-log.info("[cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_TOP_N=%s PROB_MIN>%s PROFIT_MIN_PCT>=%s%%",
-         SIGNAL_COOLDOWN_SEC, SIGNAL_TTL_MIN, UNIVERSE_TOP_N, PROB_MIN, PROFIT_MIN_PCT)
-
-# ------------ Bybit constants ------------
-BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_REST_BASE = "https://api.bybit.com"
-
-# ------------ Data structures ------------
-class Ring:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.buf: List[Any] = []
-    def append(self, x: Any):
-        if len(self.buf) >= self.capacity:
-            self.buf.pop(0)
-        self.buf.append(x)
-    def last(self, n: int) -> List[Any]:
-        return self.buf[-n:]
-    def __len__(self):
-        return len(self.buf)
-
 @dataclass
-class Candle:
-    t: int; o: float; h: float; l: float; c: float; v: float; turn: float; confirm: bool
+class Config:
+    token: str
+    recipients: List[int]
+    allowed_chat_ids: List[int]
+    port: int
+    public_url: str
+    webhook_path: str
 
-@dataclass
-class SymbolState:
-    candles: Ring = field(default_factory=lambda: Ring(1200))    # ~20h of 1m
-    vwap_num: float = 0.0
-    vwap_den: float = 0.0
-    vwap: float = float('nan')
-    last_daily_reset: Optional[datetime] = None
-    oi_series: Ring = field(default_factory=lambda: Ring(1200))  # (ts, oi)
-    liq_5m_buckets: Ring = field(default_factory=lambda: Ring(7*24*12))
-    current_liq_bucket_start: Optional[int] = None
-    current_liq_bucket_notional: float = 0.0
-    last_alert_ts: int = 0
+    # режимы/ротация
+    universe_mode: str = os.getenv("UNIVERSE_MODE", "all").lower()  # all|topn
+    ws_symbols_max: int = _env_int("WS_SYMBOLS_MAX", 60)
+    universe_rotate_min: int = _env_int("UNIVERSE_ROTATE_MIN", 5)
+    universe_top_n: int = _env_int("UNIVERSE_TOP_N", 15)
 
-# ------------ math/indicators ------------
-def atr(series: List[Candle], period: int = 14) -> float:
-    if len(series) < period + 1:
-        return float('nan')
-    trs = []
-    for i in range(-period, 0):
-        c0 = series[i-1]; c1 = series[i]
-        tr = max(c1.h - c1.l, abs(c1.h - c0.c), abs(c1.l - c0.c))
-        trs.append(tr)
-    return float(sum(trs) / period)
+    # health & keepalive
+    health_interval_sec: int = _env_int("HEALTH_INTERVAL_SEC", 1200)  # 20m
+    first_health_sec: int = _env_int("FIRST_HEALTH_SEC", 60)
+    startup_notice_sec: int = _env_int("STARTUP_NOTICE_SEC", 10)
+    self_ping_enabled: bool = _env_bool("SELF_PING_ENABLED", True)
+    self_ping_interval_sec: int = _env_int("SELF_PING_INTERVAL_SEC", 780)  # 13m
 
-def sma(vals: List[float], period: int) -> float:
-    if len(vals) < period:
-        return float('nan')
-    return float(sum(vals[-period:]) / period)
+    # фильтры сигналов
+    prob_min: float = _env_float("PROB_MIN", 69.9)
+    rr_min: float = _env_float("RR_MIN", 2.0)
+    profit_min_pct: float = _env_float("PROFIT_MIN_PCT", 1.0)
+    signal_cooldown_sec: int = _env_int("SIGNAL_COOLDOWN_SEC", 600)  # не спамить чаще 10м
+    signal_ttl_min: int = _env_int("SIGNAL_TTL_MIN", 12)
 
-def percentile(values: List[float], p: float) -> float:
-    if not values:
-        return float('nan')
-    return float(np.percentile(np.array(values), p*100))
+    # параметры триггеров (можно править через ENV)
+    vol_mult: float = _env_float("VOL_MULT", 2.0)
+    vol_sma_period: int = _env_int("VOL_SMA_PERIOD", 20)
+    body_atr_mult: float = _env_float("BODY_ATR_MULT", 0.6)
+    atr_period: int = _env_int("ATR_PERIOD", 14)
 
-def detect_recent_fvg(candles: List[Candle]) -> Optional[str]:
-    if len(candles) < 3:
-        return None
-    c0, c1, c2 = candles[-3], candles[-2], candles[-1]
-    if c2.l > c0.h:
-        return "bull"
-    if c2.h < c0.l:
-        return "bear"
-    return None
+def load_config() -> Config:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-def detect_sweep(candles: List[Candle], lookback: int) -> Optional[str]:
-    if len(candles) < lookback + 2:
-        return None
-    last = candles[-1]
-    lows = [c.l for c in candles[-(lookback+1):-1]]
-    highs = [c.h for c in candles[-(lookback+1):-1]]
-    took_low  = last.l < min(lows) and last.c > last.o  # down sweep + bull close
-    took_high = last.h > max(highs) and last.c < last.o # up sweep + bear close
-    if took_low:  return "down"
-    if took_high: return "up"
-    return None
+    # получатель по умолчанию — TELEGRAM_CHAT_ID
+    chat_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    recipients = []
+    if chat_raw:
+        try:
+            recipients.append(int(chat_raw))
+        except:
+            pass
 
-def update_vwap(state: SymbolState, candle: Candle):
-    typical = (candle.h + candle.l + candle.c) / 3.0
-    state.vwap_num += typical * candle.v
-    state.vwap_den += candle.v
-    if state.vwap_den > 0:
-        state.vwap = state.vwap_num / state.vwap_den
+    allowed = _parse_id_list(os.getenv("ALLOWED_CHAT_IDS"))
+    # чтобы /ping работал хотя бы у владельца канала
+    for rid in recipients:
+        if rid not in allowed:
+            allowed.append(rid)
 
-def maybe_reset_daily(state: SymbolState, candle_time_ms: int):
-    t = datetime.fromtimestamp(candle_time_ms/1000, tz=timezone.utc)
-    if state.last_daily_reset is None:
-        state.last_daily_reset = t.replace(hour=0, minute=0, second=0, microsecond=0)
-        return
-    if t.date() != state.last_daily_reset.date():
-        state.vwap_num = 0.0; state.vwap_den = 0.0; state.vwap = float('nan')
-        state.last_daily_reset = t.replace(hour=0, minute=0, second=0, microsecond=0)
+    port = _env_int("PORT", 10000)
+    public_url = os.getenv("PUBLIC_URL", "").strip()
+    if not public_url:
+        # Render обычно подставляет RENDER_EXTERNAL_URL, но мы позволим указать PUBLIC_URL
+        public_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not public_url:
+        raise RuntimeError("PUBLIC_URL/RENDER_EXTERNAL_URL is required (https://<your-service>.onrender.com)")
 
-# ------------ Bybit client ------------
+    # Уникальный путь вебхука
+    rnd = random.randint(10_000_000, 99_999_999)
+    webhook_path = os.getenv("WEBHOOK_PATH", f"/wh-{rnd}").strip()
+
+    cfg = Config(
+        token=token,
+        recipients=recipients,
+        allowed_chat_ids=allowed,
+        port=port,
+        public_url=public_url,
+        webhook_path=webhook_path,
+    )
+    logging.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", allowed)
+    logging.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", recipients)
+    logging.info("INFO [cfg] PUBLIC_URL='%s' PORT=%d WEBHOOK_PATH='%s'", public_url, port, webhook_path)
+    logging.info("INFO [cfg] HEALTH=%ds FIRST=%ds STARTUP=%ds SELF_PING=%s/%ds",
+                 cfg.health_interval_sec, cfg.first_health_sec, cfg.startup_notice_sec,
+                 "True" if cfg.self_ping_enabled else "False", cfg.self_ping_interval_sec)
+    logging.info("INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s "
+                 "UNIVERSE_TOP_N=%d WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+                 cfg.signal_cooldown_sec, cfg.signal_ttl_min, cfg.universe_mode,
+                 cfg.universe_top_n, cfg.ws_symbols_max, cfg.universe_rotate_min,
+                 cfg.prob_min, cfg.profit_min_pct, cfg.rr_min)
+    logging.info("INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
+                 cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period)
+    return cfg
+
+# =========================
+# Bybit API Клиент
+# =========================
+
+BYBIT_REST = "https://api.bybit.com"
+BYBIT_WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
+
 class BybitClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 2) -> List[Dict[str, Any]]:
-        # Bybit v5 param name is 'intervalTime' (not 'interval')
-        params = {"category":"linear","symbol":symbol,"intervalTime":interval,"limit":str(limit)}
-        url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
-        async with self.session.get(url, params=params, timeout=10) as r:
-            r.raise_for_status()
-            data = await r.json()
-            if data.get("retCode") != 0:
-                raise RuntimeError(f"Bybit OI error: {data}")
-            return data["result"]["list"]
-
-    async def get_kline(self, symbol: str, interval: str = "1", limit: int = 400) -> List[Candle]:
-        params = {"category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)}
-        url = f"{BYBIT_REST_BASE}/v5/market/kline"
-        async with self.session.get(url, params=params, timeout=10) as r:
-            r.raise_for_status()
-            data = await r.json()
-            if data.get("retCode") != 0:
-                raise RuntimeError(f"Bybit kline error: {data}")
-            out: List[Candle] = []
-            for row in data["result"]["list"]:
-                t = int(row[0]); o,h,l,c = map(float, row[1:5]); v = float(row[5]); turn = float(row[6])
-                out.append(Candle(t,o,h,l,c,v,turn,True))
-            out.sort(key=lambda x: x.t)
-            return out
-
-# ------------ Signal model ------------
-@dataclass
-class Signal:
-    symbol: str
-    side: str  # LONG or SHORT
-    price_now: float
-    entry_from: float
-    entry_to: float
-    sl: float
-    tp1: float
-    tp2: float
-    rr_tp1: float
-    profit_pct_tp1: float
-    probability: float
-    reasons: List[str]
-    ttl_min: int
-
-# ------------ Engine ------------
-class Engine:
-    def __init__(self, bot: Bot, chat_ids: List[int], session: aiohttp.ClientSession):
-        self.bot = bot
-        self.chat_ids = chat_ids
-        self.session = session
-        self.client = BybitClient(session)
-        self.state: Dict[str, SymbolState] = {}
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.symbols: List[str] = []
-
-        # thresholds
-        self.oi_delta_pct_5m = 2.0
-        self.oi_delta_pct_15m = 3.0
-        self.volume_sma_mult = 2.0
-        self.body_atr_mult   = 0.6
-        self.body_atr_strong = 0.8
-        self.liq_percentile  = 0.95
-        self.vwap_dev_pct    = 0.5
-        self.btc_sync_div    = 0.4
-        self.cooldown_ms     = SIGNAL_COOLDOWN_SEC * 1000
-
-        self.sweep_lookback  = 30
-        self.fvg_lookback    = 20
-
-    async def discover_universe(self) -> List[str]:
-        default_candidates = [
-            "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","TONUSDT","HBARUSDT",
-            "ARBUSDT","OPUSDT","RNDRUSDT","AVAXUSDT","NEARUSDT","ATOMUSDT","APTUSDT","SUIUSDT","PEPEUSDT",
-            "WIFUSDT","ENAUSDT","FETUSDT","JUPUSDT","TAOUSDT","PYTHUSDT","SEIUSDT"
-        ]
-        raw = os.getenv("BYBIT_SYMBOLS_CANDIDATES","").strip()
-        candidates = [s.strip().upper() for s in raw.split(",") if s.strip()] or default_candidates
-        log.info("[universe] candidates=%d", len(candidates))
-
-        vols: List[Tuple[str,float]] = []
-        for sym in candidates:
+    async def _get(self, path: str, params: Dict[str, str]) -> Dict:
+        url = BYBIT_REST + path
+        for _ in range(3):
             try:
-                kl = await self.client.get_kline(sym, interval="60", limit=200)  # 1h, ~7d
-                if len(kl) < 50: 
-                    continue
-                closes = np.array([c.c for c in kl], dtype=float)
-                rets = np.diff(np.log(closes))
-                vol = float(np.std(rets[-168:]) * math.sqrt(24))  # dailyized approx
-                vols.append((sym, vol))
+                async with self.session.get(url, params=params, timeout=15) as resp:
+                    data = await resp.json()
+                    return data
             except Exception:
-                continue
-        vols.sort(key=lambda x: x[1], reverse=True)
-        top = [s for s,_ in vols[:UNIVERSE_TOP_N]] or candidates[:UNIVERSE_TOP_N]
-        log.info("[universe] selected=%s", top)
-        return top
+                await asyncio.sleep(0.5)
+        raise RuntimeError(f"Bybit GET failed: {path} {params}")
 
-    async def bootstrap(self):
-        self.symbols = await self.discover_universe()
-        self.state = {s: SymbolState() for s in self.symbols}
+    async def get_instruments_linear_usdt(self) -> List[str]:
+        # Получаем все линейные деривативы и фильтруем по USDT + Trading
+        res = await self._get("/v5/market/instruments-info", {
+            "category": "linear",
+            "status": "Trading"
+        })
+        if res.get("retCode") != 0:
+            raise RuntimeError(f"instruments-info error: {res}")
+        out = []
+        for it in res["result"]["list"]:
+            if it.get("quoteCoin") == "USDT":
+                # Некоторые могут быть опциональными типами, проверим contractType
+                if str(it.get("contractType", "")).lower().startswith("linear"):
+                    out.append(it["symbol"])
+        return sorted(out)
 
-        # seed candles & vwap
-        for sym in self.symbols:
-            kl = await self.client.get_kline(sym, interval="1", limit=400)
-            st = self.state[sym]
-            for c in kl:
-                st.candles.append(c)
-                maybe_reset_daily(st, c.t)
-                update_vwap(st, c)
-        # seed OI 5m series
-        for sym in self.symbols:
-            try:
-                oi5 = await self.client.get_open_interest(sym, interval="5min", limit=4)
-            except Exception as e:
-                log.warning("[seed OI] %s: %r", sym, e)
-                continue
-            st = self.state[sym]
-            for row in reversed(oi5):
-                ts = int(row["timestamp"]); oi = float(row["openInterest"])
-                st.oi_series.append((ts, oi))
+    async def get_tickers_linear(self) -> Dict[str, Dict]:
+        # 24h оборот/изменение — для ранжирования
+        res = await self._get("/v5/market/tickers", {"category": "linear"})
+        if res.get("retCode") != 0:
+            raise RuntimeError(f"tickers error: {res}")
+        out = {}
+        for it in res["result"]["list"]:
+            sym = it["symbol"]
+            out[sym] = it
+        return out
 
-    async def ws_connect(self):
-        self.ws = await websockets.connect(BYBIT_WS_PUBLIC_LINEAR, ping_interval=25, ping_timeout=20)
-        args = []
-        for sym in self.symbols:
-            args.append(f"kline.1.{sym}")
-            args.append(f"liquidation.{sym}")
-        sub = {"op":"subscribe","args": args}
-        await self.ws.send(json.dumps(sub))
-        log.info("[ws] subscribed %d topics for %d symbols", len(args), len(self.symbols))
+    async def get_open_interest(self, symbol: str, interval="5min", limit=4) -> Optional[float]:
+        # Вернем последнее OI (в контрактах). Используем разницу для тренда.
+        res = await self._get("/v5/market/open-interest", {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": str(limit)
+        })
+        if res.get("retCode") != 0:
+            raise RuntimeError(f"open-interest error: {res}")
+        lst = res["result"].get("list", [])
+        if not lst:
+            return None
+        # Формат: [{ "openInterest": "12345", "timestamp": "..."} ...]
+        try:
+            last = float(lst[-1]["openInterest"])
+        except Exception:
+            return None
+        return last
 
-    async def run_ws(self):
-        assert self.ws is not None
-        async for msg in self.ws:
-            try:
-                data = json.loads(msg)
-            except Exception:
-                continue
-            if "topic" not in data:
-                continue
-            topic: str = data["topic"]
-            if topic.startswith("kline."):
-                await self.on_kline(data)
-            elif topic.startswith("liquidation."):
-                await self.on_liq(data)
+# =========================
+# Вспомогательные функции TA
+# =========================
 
-    async def on_kline(self, data: Dict[str, Any]):
-        topic = data["topic"]
-        _, _, symbol = topic.split(".")
-        st = self.state.get(symbol)
-        if not st:
+def atr_from_bars(bars: Deque[Tuple[float, float, float, float]], period: int) -> Optional[float]:
+    """ bars: deque of (o,h,l,c), последний — свежий """
+    if len(bars) < period + 1:
+        return None
+    trs = []
+    prev_close = bars[-period-1][3]
+    for i in range(len(bars) - period, len(bars)):
+        o,h,l,c = bars[i]
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    if not trs:
+        return None
+    return sum(trs) / len(trs)
+
+def sma(seq: Deque[float], period: int) -> Optional[float]:
+    if len(seq) < period:
+        return None
+    return sum(list(seq)[-period:]) / period
+
+def pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+# =========================
+# Торговый движок (скрининг + сигналы)
+# =========================
+
+class TradeEngine:
+    def __init__(self, cfg: Config, bybit: BybitClient, bot_send_callable):
+        self.cfg = cfg
+        self.bybit = bybit
+        self.bot_send = bot_send_callable
+
+        # Вселенная
+        self.all_symbols: List[str] = []
+        self.rotation_order: List[str] = []
+        self.active_symbols: Set[str] = set()
+        self.rot_idx: int = 0
+
+        # Маркеты
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+
+        # Данные по символам
+        self.bars: Dict[str, Deque[Tuple[float,float,float,float]]] = defaultdict(lambda: deque(maxlen=300))  # (o,h,l,c)
+        self.vols: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=300))
+        self.last_price: Dict[str, float] = {}
+        self.last_oi: Dict[str, float] = {}
+        self.liq_5m: Dict[str, float] = defaultdict(float)  # простая агрегация ликвидаций (USD) последних ~5м
+        self.liq_decay: Dict[str, float] = defaultdict(float)
+
+        # Антиспам
+        self.last_signal_ts: Dict[str, float] = {}
+
+        # Статистика
+        self.ws_topics_count: int = 0
+
+        # Флаг живости WS
+        self._ws_lock = asyncio.Lock()
+
+    # -------- Вселенная / Ротация --------
+
+    async def bootstrap_universe(self):
+        # 1) Все линейные USDT-перпы
+        all_syms = await self.bybit.get_instruments_linear_usdt()
+        self.all_symbols = all_syms
+
+        # 2) Ранжирование по 24h turnover
+        tickers = await self.bybit.get_tickers_linear()
+        ranked = sorted(
+            [s for s in all_syms if s in tickers],
+            key=lambda s: float(tickers[s].get("turnover24h", "0") or "0"),
+            reverse=True
+        )
+        # сохраняем порядок
+        self.rotation_order = ranked if ranked else all_syms[:]
+        if self.cfg.universe_mode == "topn":
+            # без ротации — фиксированный набор top N
+            self.active_symbols = set(self.rotation_order[:self.cfg.universe_top_n])
+        else:
+            # режим all — активный батч №0
+            self._apply_rotation_batch(0)
+        logging.info("INFO [universe] total=%d active=%d mode=%s",
+                     len(self.rotation_order), len(self.active_symbols), self.cfg.universe_mode)
+
+    def _apply_rotation_batch(self, batch_index: int):
+        if not self.rotation_order:
+            self.active_symbols = set()
             return
-        for item in data.get("data", []):
-            c = Candle(
-                t=int(item.get("start")),
-                o=float(item.get("open")),
-                h=float(item.get("high")),
-                l=float(item.get("low")),
-                c=float(item.get("close")),
-                v=float(item.get("volume")),
-                turn=float(item.get("turnover", 0) or 0.0),
-                confirm=bool(item.get("confirm", False))
-            )
-            # update/append
-            if st.candles and not st.candles.buf[-1].confirm:
-                st.candles.buf[-1] = c
-            else:
-                st.candles.append(c)
-            maybe_reset_daily(st, c.t)
-            if c.confirm:
-                update_vwap(st, c)
-                await self.evaluate_symbol(symbol)
+        n = self.cfg.ws_symbols_max
+        chunks = math.ceil(len(self.rotation_order) / n)
+        idx = batch_index % max(chunks, 1)
+        start = idx * n
+        end = min(len(self.rotation_order), start + n)
+        batch = self.rotation_order[start:end]
+        self.active_symbols = set(batch)
+        self.rot_idx = idx
 
-    async def on_liq(self, data: Dict[str, Any]):
-        _, symbol = data["topic"].split(".")
-        st = self.state.get(symbol)
-        if not st: return
-        now_bucket = int(datetime.now(timezone.utc).timestamp() // 300) * 300
-        if st.current_liq_bucket_start is None:
-            st.current_liq_bucket_start = now_bucket
-        if now_bucket != st.current_liq_bucket_start:
-            st.liq_5m_buckets.append(st.current_liq_bucket_notional)
-            st.current_liq_bucket_notional = 0.0
-            st.current_liq_bucket_start = now_bucket
-        for it in data.get("data", []):
-            try:
-                qty = float(it.get("execQty", 0)); price = float(it.get("execPrice", 0))
-                st.current_liq_bucket_notional += qty * price
-            except Exception:
-                continue
+    async def rotate_batch(self):
+        if self.cfg.universe_mode != "all":
+            return  # в topn не крутим
+        next_idx = self.rot_idx + 1
+        self._apply_rotation_batch(next_idx)
+        # перестроить подписки WS
+        await self._ws_resubscribe()
+        logging.info("INFO [rotate] idx=%d active=%d", self.rot_idx, len(self.active_symbols))
 
-    async def poll_oi(self):
-        while True:
+    # -------- WS управление --------
+
+    def _topics_for(self, symbols: Set[str]) -> List[str]:
+        topics = []
+        for s in symbols:
+            topics.append(f"kline.1.{s}")
+            topics.append(f"liquidation.{s}")
+        return topics
+
+    async def ensure_ws(self):
+        async with self._ws_lock:
+            if self.ws and not self.ws.closed:
+                return
+            # новое соединение
+            self.ws = await self.bybit.session.ws_connect(BYBIT_WS_LINEAR, heartbeat=20, timeout=20)
+            await self._ws_resubscribe(first=True)
+            asyncio.create_task(self._ws_reader())
+
+    async def _ws_resubscribe(self, first: bool=False):
+        async with self._ws_lock:
+            if not self.ws or self.ws.closed:
+                return
+            # отписка от всего, если не первый раз
+            if not first:
+                try:
+                    await self.ws.send_json({"op": "unsubscribe", "args": ["*"]})
+                except Exception:
+                    pass
+            topics = self._topics_for(self.active_symbols)
+            # подписываемся порциями, чтобы не упираться в лимит на пакет
+            batch = 20
+            sent = 0
+            for i in range(0, len(topics), batch):
+                args = topics[i:i+batch]
+                await self.ws.send_json({"op": "subscribe", "args": args})
+                sent += len(args)
+                await asyncio.sleep(0.05)
+            self.ws_topics_count = sent
+            logging.info("INFO [ws] subscribed %d topics for %d symbols", sent, len(self.active_symbols))
+
+    async def _ws_reader(self):
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._ws_handle_text(msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+        except Exception as e:
+            logging.warning("WARN [ws] reader error: %s", e)
+        finally:
             try:
-                for sym in self.symbols:
-                    oi5 = await self.client.get_open_interest(sym, interval="5min", limit=1)
-                    if oi5:
-                        row = oi5[0]
-                        ts = int(row["timestamp"]); oi = float(row["openInterest"])
-                        st = self.state[sym]
-                        st.oi_series.append((ts, oi))
+                await self.ws.close()
             except Exception:
                 pass
-            await asyncio.sleep(60)
+            self.ws = None
+            logging.warning("WARN [ws] closed; will reconnect on next tick")
 
-    # ---- helpers ----
-    def _oi_change_pct(self, st: SymbolState, minutes: int) -> Optional[float]:
-        if len(st.oi_series) < 2:
-            return None
-        now_ts = st.oi_series.buf[-1][0]
-        cutoff = now_ts - minutes*60*1000
-        recent = [x for x in st.oi_series.buf if x[0] >= cutoff]
-        if len(recent) < 2:
-            return None
-        first, last = recent[0][1], recent[-1][1]
-        if first == 0: return None
-        return (last - first) / first * 100.0
-
-    def _volume_sma20(self, st: SymbolState) -> Optional[float]:
-        vols = [c.v for c in st.candles.buf]
-        return sma(vols, 20)
-
-    def _atr14(self, st: SymbolState) -> Optional[float]:
-        return atr(st.candles.buf, 14)
-
-    def _liq_5m_percentile(self, st: SymbolState, p: float) -> Optional[float]:
-        vals = list(st.liq_5m_buckets.buf)
-        if len(vals) < 50:
-            return None
-        return percentile(vals, p)
-
-    def _nearest_swings(self, st: SymbolState, window: int = 20) -> Tuple[Optional[float], Optional[float]]:
-        if len(st.candles) < window:
-            return (None, None)
-        highs = [c.h for c in st.candles.last(window)]
-        lows  = [c.l for c in st.candles.last(window)]
-        return (max(highs), min(lows))
-
-    def _probability(self, strong_impulse: bool, fvg: Optional[str], vwap_dev_ok: bool, oi_hint: Optional[str], side: str) -> float:
-        p = 70.0
-        if strong_impulse: p += 6.0
-        if fvg:            p += 5.0
-        if vwap_dev_ok:    p += 4.0
-        if (oi_hint == 'long' and side=='LONG') or (oi_hint=='short' and side=='SHORT'):
-            p += 3.0
-        return float(max(60.0, min(95.0, p)))
-
-    async def evaluate_symbol(self, symbol: str):
-        st = self.state[symbol]
-        if len(st.candles) < 40:
+    async def _ws_handle_text(self, data: str):
+        try:
+            js = json.loads(data)
+        except Exception:
             return
-        last = st.candles.buf[-1]
-        if not last.confirm:
+        # ответы на подписку/пинг — игнор
+        if "topic" not in js:
             return
+        topic = js["topic"]
+        if topic.startswith("kline.1."):
+            sym = topic.split(".")[-1]
+            await self._on_kline(sym, js)
+        elif topic.startswith("liquidation."):
+            sym = topic.split(".")[-1]
+            await self._on_liq(sym, js)
 
-        body = abs(last.c - last.o)
-        atr14 = self._atr14(st)
-        vol_sma20 = self._volume_sma20(st)
-        oi_5 = self._oi_change_pct(st, 5)
-        oi_15 = self._oi_change_pct(st, 15)
-        liq_p95 = self._liq_5m_percentile(st, self.liq_percentile)
-        liq_now = st.current_liq_bucket_notional
-
-        if any(math.isnan(x) for x in [atr14 or float('nan'), vol_sma20 or float('nan')]):
+    async def _on_kline(self, sym: str, js: Dict):
+        """
+        Bybit v5 kline payload sample:
+        {
+          "topic":"kline.1.BTCUSDT",
+          "data":[{"start":..., "open":"...", "high":"...", "low":"...", "close":"...", "volume":"...","confirm":true, ...}],
+          "ts":... }
+        """
+        arr = js.get("data") or []
+        if not arr:
             return
-
-        impulse = (body >= self.body_atr_mult * atr14) and (last.v >= self.volume_sma_mult * vol_sma20)
-        strong_impulse = (body >= self.body_atr_strong * atr14)
-        oi_trigger = False
-        oi_side_hint = None
-        if oi_5 is not None and abs(oi_5) >= self.oi_delta_pct_5m:
-            oi_trigger = True
-            oi_side_hint = 'short' if oi_5 > 0 else 'long'
-        elif oi_15 is not None and abs(oi_15) >= self.oi_delta_pct_15m:
-            oi_trigger = True
-            oi_side_hint = 'short' if oi_15 > 0 else 'long'
-
-        liq_trigger = False
-        if liq_p95 is not None and liq_now >= liq_p95:
-            liq_trigger = True
-
-        sweep = detect_sweep(st.candles.buf, self.sweep_lookback)
-        fvg = detect_recent_fvg(st.candles.buf[-self.fvg_lookback:])
-        vwap = st.vwap
-        vwap_dev_ok = False
-        if vwap and vwap > 0:
-            dev_pct = abs(last.c - vwap) / vwap * 100
-            vwap_dev_ok = (dev_pct >= self.vwap_dev_pct)
-
-        # BTC sync veto (light)
-        btc_ok = True
-        if symbol != "BTCUSDT" and "BTCUSDT" in self.state and len(self.state["BTCUSDT"].candles) >= 4:
-            b = self.state["BTCUSDT"].candles
-            btc_ret_3m = (b.buf[-1].c - b.buf[-4].c) / b.buf[-4].c * 100
-            if sweep == 'up' and btc_ret_3m > self.btc_sync_div:
-                btc_ok = False
-            if sweep == 'down' and btc_ret_3m < -self.btc_sync_div:
-                btc_ok = False
-
-        if not (impulse and oi_trigger and liq_trigger and btc_ok and sweep in ('up','down')):
+        k = arr[-1]
+        try:
+            o = float(k["open"]); h = float(k["high"]); l = float(k["low"])
+            c = float(k["close"]); v = float(k["volume"])
+        except Exception:
             return
+        self.bars[sym].append((o,h,l,c))
+        self.vols[sym].append(v)
+        self.last_price[sym] = c
 
-        # cooldown
-        now_ts = now_ms()
-        if now_ts - st.last_alert_ts < self.cooldown_ms:
+        # экспоненциальное «затухание» агрегата ликвидаций (очищаем старыe через время)
+        self.liq_5m[sym] *= 0.96
+
+        # попытка анализа только по закрытому бару
+        if k.get("confirm"):
+            await self._maybe_signal(sym)
+
+    async def _on_liq(self, sym: str, js: Dict):
+        """
+        Bybit v5 liquidation sample:
+        {
+          "topic":"liquidation.BTCUSDT",
+          "data":[{"updatedTime":"...", "symbol":"BTCUSDT","side":"Buy"|"Sell",
+                   "price":"...", "qty":"...", "value":"..."}], "ts":... }
+        """
+        arr = js.get("data") or []
+        if not arr:
+            return
+        for it in arr:
+            try:
+                val = float(it.get("value") or "0")  # в USDT
+                side = str(it.get("side", ""))
+            except Exception:
+                continue
+            # грубо: суммируем ликвидации, знак используем как прокси-направление импульса
+            sgn = -1.0 if side == "Buy" else 1.0  # long liq обычно на падении → возможный отскок вверх
+            self.liq_5m[sym] += sgn * val
+
+    # -------- OI polling --------
+
+    async def poll_oi_once(self):
+        if not self.active_symbols:
+            return
+        # ограничим нагрузку: не больше 40 запросов подряд
+        symbols = list(self.active_symbols)
+        batch = 40
+        for i in range(0, len(symbols), batch):
+            chunk = symbols[i:i+batch]
+            tasks = [self.bybit.get_open_interest(s, interval="5min", limit=4) for s in chunk]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for s, r in zip(chunk, results):
+                if isinstance(r, Exception) or r is None:
+                    continue
+                self.last_oi[s] = r
+            await asyncio.sleep(0.2)
+
+    # -------- Аналитика / Сигналы --------
+
+    def _cooldown_ok(self, sym: str) -> bool:
+        ts = self.last_signal_ts.get(sym, 0)
+        return (time.time() - ts) >= self.cfg.signal_cooldown_sec
+
+    async def _maybe_signal(self, sym: str):
+        # необходимые данные
+        bars = self.bars[sym]
+        vols = self.vols[sym]
+        price = self.last_price.get(sym)
+        if price is None:
             return
 
-        side = 'LONG' if sweep == 'down' else 'SHORT'
-        entry_from = min(last.o, last.c)
-        entry_to   = max(last.o, last.c)
-        price_now  = last.c
+        # ATR и телобары
+        atr = atr_from_bars(bars, self.cfg.atr_period)
+        if atr is None or atr <= 0:
+            return
+        o,h,l,c = bars[-1]
+        body = abs(c - o)
 
-        if side == 'LONG':
-            sl = last.l
-            sw_hi, sw_lo = self._nearest_swings(st, window=20)
-            tp1 = sw_hi if sw_hi and sw_hi > last.c else last.c + (entry_to - sl)
-            tp2 = tp1 + (tp1 - entry_to)
-            move_to_tp1 = tp1 - ((entry_from + entry_to)/2)
-            move_to_sl  = ((entry_from + entry_to)/2) - sl
+        # Volume spike
+        v_sma = sma(vols, self.cfg.vol_sma_period)
+        vol_ok = (v_sma is not None) and (vols[-1] >= self.cfg.vol_mult * v_sma)
+
+        # Momentum по телу к ATR
+        mom_ok = (body >= self.cfg.body_atr_mult * atr)
+        mom_dir = 1 if c > o else -1
+
+        # OI дельта (грубая оценка; просто сравним с предыдущим сохранённым)
+        oi_now = self.last_oi.get(sym)
+        oi_prev = None  # ищем второй срез в прошлом deque? упростим — используем последнее запомненное при прошлых обходах
+        # Для эвристики возьмём «наклон» по цене: если цена ↑ и OI ↑ → лонг; цена ↑ и OI ↓ → вынос шортов и возможный разворот.
+        oi_signal = 0.0
+        if oi_now is not None:
+            # сохраним в цикле poll_oi_once; тут только направленная эвристика от последнего известного
+            oi_prev = oi_now  # нет истории — дадим нейтраль
+            # оставим neutral, чтобы не шуметь без истории
+
+        # Ликвидации (накопленные): положительные => в сумме «Sell» (short liq) преобладали → импульс вверх; отрицательные — вниз
+        liq_bias = 0.0
+        L = self.liq_5m.get(sym, 0.0)
+        if abs(L) > 0:
+            liq_bias = 1.0 if L > 0 else -1.0
+
+        # Итоговый скоринг
+        score = 0.0
+        if vol_ok:
+            score += 20.0
+        if mom_ok:
+            score += 25.0 * mom_dir  # направление движения телом
+
+        # Добавим вклад ликвидаций как импульс
+        score += 10.0 * liq_bias
+
+        # слабый вклад OI (нейтральный без истории)
+        # (оставлено как 0.0)
+
+        # небольшая нормализация и ограничение
+        score = max(-100.0, min(100.0, score))
+
+        # Вероятность (эмпирическое сопоставление)
+        probability = 50.0 + score * 0.4  # [-100..100] → [10..90]
+        probability = max(1.0, min(99.0, probability))
+
+        # Направление
+        direction = "long" if score >= 0 else "short"
+
+        # Генерация торгового плана
+        # Риск — 0.5*ATR; стоп — по ту сторону бара; тейк — из условия RR >= rr_min
+        risk_abs = 0.5 * atr
+        if risk_abs <= 0:
+            return
+
+        entry = price
+        if direction == "long":
+            sl = entry - max(risk_abs, 0.3 * atr)
+            tp = entry + max(self.cfg.rr_min * (entry - sl), atr)  # чтобы RR >= rr_min
         else:
-            sl = last.h
-            sw_hi, sw_lo = self._nearest_swings(st, window=20)
-            tp1 = sw_lo if sw_lo and sw_lo < last.c else last.c - (sl - entry_from)
-            tp2 = tp1 - (entry_to - tp1)
-            move_to_tp1 = ((entry_from + entry_to)/2) - tp1
-            move_to_sl  = sl - ((entry_from + entry_to)/2)
+            sl = entry + max(risk_abs, 0.3 * atr)
+            tp = entry - max(self.cfg.rr_min * (sl - entry), atr)
 
-        rr_tp1 = (move_to_tp1 / max(1e-9, move_to_sl)) if move_to_tp1>0 and move_to_sl>0 else 0.0
-        profit_pct_tp1 = (abs(tp1 - ((entry_from+entry_to)/2)) / price_now) * 100.0
+        # Проверим RR и прибыль в %
+        rr = abs((tp - entry) / (entry - sl)) if (entry != sl) else 0.0
+        profit_pct = abs(pct(tp, entry))
 
-        # filters
-        if rr_tp1 < 2.0:
+        if probability <= self.cfg.prob_min:
             return
-        if profit_pct_tp1 < PROFIT_MIN_PCT:
+        if rr < self.cfg.rr_min:
             return
-
-        probability = self._probability(strong_impulse, fvg, vwap_dev_ok, oi_side_hint, side)
-        if not (probability > PROB_MIN):
+        if profit_pct < self.cfg.profit_min_pct:
+            return
+        if not self._cooldown_ok(sym):
             return
 
-        reasons = [
-            f"импульс {body/atr14:.2f}×ATR",
-            f"объём {last.v/max(1e-9, (vol_sma20 or 1)):.2f}×SMA20",
-            f"ΔOI {'5' if oi_5 is not None else '15'}м {oi_5 if oi_5 is not None else oi_15:.2f}%",
-            "ликвидации ≥ P95",
-            "съём ликвидности вниз" if side=='LONG' else "съём ликвидности вверх"
-        ]
-        if fvg == 'bull': reasons.append("bull FVG")
-        if fvg == 'bear': reasons.append("bear FVG")
-        if vwap_dev_ok:   reasons.append("отклонение от VWAP")
-
-        sig = Signal(
-            symbol=symbol, side=side, price_now=price_now,
-            entry_from=entry_from, entry_to=entry_to, sl=sl, tp1=tp1, tp2=tp2,
-            rr_tp1=rr_tp1, profit_pct_tp1=profit_pct_tp1,
-            probability=probability, reasons=reasons, ttl_min=SIGNAL_TTL_MIN
+        # готовим текст
+        arrow = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+        sign = "+" if (tp - entry) * (1 if direction == "long" else -1) > 0 else ""
+        msg = (
+            f"{arrow} <b>{sym}</b>\n"
+            f"Цена: <code>{entry:.6g}</code>\n"
+            f"Вход: <code>{entry:.6g}</code>\n"
+            f"Тейк: <code>{tp:.6g}</code> ({sign}{profit_pct:.2f}%)\n"
+            f"Стоп: <code>{sl:.6g}</code> ({pct(sl, entry):.2f}%)\n"
+            f"R/R: <b>{rr:.2f}</b>\n"
+            f"Вероятность: <b>{probability:.1f}%</b>\n"
         )
 
-        st.last_alert_ts = now_ts
-        await self.send_signal_batch([sig])
+        # отправим
+        await self.bot_send(msg)
+        self.last_signal_ts[sym] = time.time()
 
-    # ---- telegram output ----
-    @staticmethod
-    def _fmt_price(x: float) -> str:
-        if x >= 100: return f"{x:.2f}"
-        if x >= 1:   return f"{x:.4f}"
-        return f"{x:.6f}"
+    # -------- Публичные задачи (JobQueue) --------
 
-    async def send_signal_batch(self, sigs: List[Signal]):
-        if not sigs: return
-        sigs = sorted(sigs, key=lambda s: (-s.probability, s.symbol))
+    async def job_start_ws(self, ctx: ContextTypes.DEFAULT_TYPE):
+        await self.ensure_ws()
 
-        lines = ["*⚡ Сигналы (интрадей)*"]
-        for s in sigs:
-            entry = f"{self._fmt_price(s.entry_from)}–{self._fmt_price(s.entry_to)}"
-            rr = f"{s.rr_tp1:.2f}"
-            tp1p = f"+{s.profit_pct_tp1:.2f}%"
-            mid = (s.entry_from + s.entry_to)/2
-            sl_pct = (abs(mid - s.sl)/mid) * 100.0
-            slp = f"-{sl_pct:.2f}%"
-            block = (
-                f"*{s.symbol}* | {s.side}\n"
-                f"Цена: {self._fmt_price(s.price_now)}\n"
-                f"Вход: {entry}\n"
-                f"SL: {self._fmt_price(s.sl)} ({slp})\n"
-                f"TP1: {self._fmt_price(s.tp1)} ({tp1p})  •  TP2: {self._fmt_price(s.tp2)}\n"
-                f"R/R: {rr}  •  Вероятность: {s.probability:.0f}%  •  Валиден: ~{s.ttl_min} мин\n"
-                f"_Причины:_ {', '.join(s.reasons)}"
-            )
-            lines.append(block)
-        text = "\n\n".join(lines)
+    async def job_rotate(self, ctx: ContextTypes.DEFAULT_TYPE):
+        await self.rotate_batch()
 
-        for chat_id in self.chat_ids:
-            try:
-                await self.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except Exception as e:
-                log.warning("send_signal -> %s: %s", chat_id, repr(e))
+    async def job_poll_oi(self, ctx: ContextTypes.DEFAULT_TYPE):
+        await self.poll_oi_once()
 
-# ------------ health & self-ping ------------
-async def health_loop(bot: Bot, recipients: List[int]):
-    await asyncio.sleep(HEALTH_FIRST_SEC)
-    while True:
-        for chat_id in recipients:
-            try:
-                await bot.send_message(chat_id=chat_id, text="🟢 online")
-            except Exception as e:
-                log.warning("[warn] health-check -> %s: %s", chat_id, repr(e))
-        await asyncio.sleep(HEALTH_INTERVAL_SEC)
+# =========================
+# Утилиты: Telegram и сервисные задачи
+# =========================
 
-async def self_ping_loop():
-    if not (SELF_PING_ENABLED and SELF_PING_URL):
-        return
-    await asyncio.sleep(STARTUP_PING_SEC)
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            try:
-                await client.get(SELF_PING_URL)
-            except Exception:
-                pass
-            await asyncio.sleep(SELF_PING_INTERVAL_SEC)
+async def send_to_recipients(application: Application, recipients: List[int], text: str):
+    for chat_id in recipients:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except httpx.ReadError:
+            logging.warning("WARN send->%s: httpx.ReadError", chat_id)
+        except Exception as e:
+            logging.warning("WARN send->%s: %s", chat_id, e)
 
-# ------------ Telegram handlers ------------
-def allowed(update: Update) -> bool:
-    chat_id = update.effective_chat.id if update and update.effective_chat else None
-    return chat_id in ALLOWED_CHAT_IDS
+# health/check
+async def health_job(app: Application, recipients: List[int]):
+    await send_to_recipients(app, recipients, "🟢 online")
+
+# self-ping для бесплатного Render
+async def self_ping_job(url: str):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=10) as r:
+                _ = await r.text()
+    except Exception:
+        pass
+
+# =========================
+# Команды бота
+# =========================
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    await update.effective_message.reply_text("pong")
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    engine = context.application.bot_data.get("engine")
-    n = len(engine.symbols) if engine else 0
-    await update.effective_message.reply_text(
-        f"🤖 OK. Юниверс={n} пар. Фильтры: RR≥2.0, Profit≥{PROFIT_MIN_PCT:.1f}%, Вероятность>{PROB_MIN:.1f}%.",
-    )
+    chat_id = update.effective_chat.id
+    cfg: Config = context.application.user_data.get("cfg")
+    if chat_id not in cfg.allowed_chat_ids:
+        return
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    await update.effective_message.reply_text(f"pong — {now}")
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    engine = context.application.bot_data.get("engine")
-    if not engine:
-        await update.effective_message.reply_text("engine: not ready")
+    chat_id = update.effective_chat.id
+    cfg: Config = context.application.user_data.get("cfg")
+    if chat_id not in cfg.allowed_chat_ids:
         return
-    await update.effective_message.reply_text("Отслеживаю: " + ", ".join(engine.symbols))
-
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    engine: Engine = context.application.bot_data.get("engine")
-    if not engine:
-        await update.effective_message.reply_text("engine: not ready")
-        return
-    syms: List[str]
-    if context.args:
-        syms = [context.args[0].upper()]
-    else:
-        syms = engine.symbols[:5]
-    lines = []
-    for sym in syms:
-        st: SymbolState = engine.state.get(sym)
-        if not st or not st.candles.buf:
-            lines.append(f"*{sym}*: нет данных")
-            continue
-        last = st.candles.buf[-1]
-        atr14 = engine._atr14(st) or float('nan')
-        vol_sma20 = engine._volume_sma20(st)
-        vol_mul = (last.v / vol_sma20) if (vol_sma20 and vol_sma20>0) else float('nan')
-        oi5 = engine._oi_change_pct(st,5)
-        oi15 = engine._oi_change_pct(st,15)
-        liq_p95 = engine._liq_5m_percentile(st, engine.liq_percentile)
-        liq_now = st.current_liq_bucket_notional
-        ts_iso = datetime.utcfromtimestamp(last.t/1000).strftime("%H:%M:%S")
-        vwap = st.vwap if st.vwap==st.vwap else None
-        lines.append(
-            f"*{sym}*  t={ts_iso}Z  age={fmt_age(last.t)}  c={engine._fmt_price(last.c)}\n"
-            f"ATR14={atr14:.4f}  Vol/SMA20={vol_mul:.2f}  VWAP={engine._fmt_price(vwap) if vwap else 'nan'}\n"
-            f"ΔOI5m={(oi5 if oi5 is not None else float('nan')):.2f}%  ΔOI15m={(oi15 if oi15 is not None else float('nan')):.2f}%\n"
-            f"LiqNow={liq_now:.0f}  P95={ (liq_p95 if liq_p95 is not None else float('nan')):.0f}"
-        )
-    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="Markdown")
-
-async def cmd_force_eval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    engine: Engine = context.application.bot_data.get("engine")
-    if not engine:
-        await update.effective_message.reply_text("engine: not ready")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("usage: /force_eval SYMBOL")
-        return
-    sym = context.args[0].upper()
-    if sym not in engine.symbols:
-        await update.effective_message.reply_text(f"{sym} не в юниверсе. /universe для списка.")
-        return
-    await engine.evaluate_symbol(sym)
-    await update.effective_message.reply_text(f"Переоценил {sym}. Если сетап не прошёл фильтры, алерта не будет.")
-
-# ------------ main (webhook mode for Render) ------------
-def main():
-    if not PRIMARY_RECIPIENTS:
-        raise SystemExit("PRIMARY_RECIPIENTS empty — ensure TELEGRAM_CHAT_ID is included into ALLOWED_CHAT_IDS.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("universe", cmd_universe))
-    app.add_handler(CommandHandler("diag", cmd_diag))
-    app.add_handler(CommandHandler("force_eval", cmd_force_eval))
-
-    bot = app.bot
-    session_holder: Dict[str, aiohttp.ClientSession] = {}
-
-    async def post_init(application: Application):
-        # startup notif
-        for cid in PRIMARY_RECIPIENTS:
-            try:
-                await bot.send_message(cid, f"✅ Render Web Service: бот запущен. Universe=auto-top-{UNIVERSE_TOP_N}, PROB>{PROB_MIN:.1f}% • Profit≥{PROFIT_MIN_PCT:.1f}%")
-            except Exception as e:
-                log.warning("startup msg -> %s: %s", cid, repr(e))
-
-        # launch engine & loops
-        session = aiohttp.ClientSession()
-        session_holder["session"] = session
-        engine = Engine(bot, PRIMARY_RECIPIENTS, session)
-        await engine.bootstrap()
-        await engine.ws_connect()
-
-        # make engine available to handlers
-        application.bot_data["engine"] = engine
-
-        application.create_task(engine.run_ws())
-        application.create_task(engine.poll_oi())
-        application.create_task(health_loop(bot, PRIMARY_RECIPIENTS))
-        application.create_task(self_ping_loop())
-
-    async def post_shutdown(application: Application):
-        # graceful session close
-        sess = session_holder.get("session")
-        if sess:
-            try:
-                await sess.close()
-            except Exception:
-                pass
-
-    app.post_init = post_init
-    app.post_shutdown = post_shutdown
-
-    if not (PUBLIC_URL and WEBHOOK_URL):
-        raise SystemExit("PUBLIC_URL/RENDER_EXTERNAL_URL is required for webhook mode on Render.")
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH.lstrip("/"),
-        webhook_url=WEBHOOK_URL,
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,  # безопаснее для Render-контейнеров
+    eng: TradeEngine = context.application.user_data.get("engine")
+    total = len(eng.rotation_order)
+    active = len(eng.active_symbols)
+    idx = eng.rot_idx
+    await update.effective_message.reply_text(
+        f"Вселенная: total={total}, active={active}, batch#{idx}, ws_topics={eng.ws_topics_count}"
     )
 
-if __name__ == "__main__":
+# =========================
+# MAIN
+# =========================
+
+async def post_init(app: Application):
+    # Установим вебхук
+    cfg: Config = app.user_data["cfg"]
+
+    # Сначала почистим
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(0.1)
+    await app.bot.set_webhook(url=cfg.public_url.rstrip("/") + cfg.webhook_path)
+    logging.info("INFO webhook set: %s", cfg.public_url.rstrip("/") + cfg.webhook_path)
+
+    # Сообщение о запуске
+    await send_to_recipients(app, cfg.recipients, f"✅ Render Web Service: бот запущен. Mode={cfg.universe_mode}, rotation={cfg.universe_rotate_min}m, WS={cfg.ws_symbols_max}")
+
+def build_application(cfg: Config) -> Application:
+    application = ApplicationBuilder().token(cfg.token).post_init(post_init).build()
+    application.user_data["cfg"] = cfg
+
+    # Команды
+    application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("universe", cmd_universe))
+
+    return application
+
+async def main_async():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
+    cfg = load_config()
+
+    app = build_application(cfg)
+
+    # HTTP session для Bybit
+    aio_sess = aiohttp.ClientSession()
+    bybit = BybitClient(aio_sess)
+
+    # отправитель в канал
+    async def bot_send(msg: str):
+        await send_to_recipients(app, cfg.recipients, msg)
+
+    # Движок
+    engine = TradeEngine(cfg, bybit, bot_send)
+    app.user_data["engine"] = engine
+
+    # Bootstrap вселенной до старта вебхука
     try:
-        main()
-    except KeyboardInterrupt:
-        pass
+        await engine.bootstrap_universe()
+    except Exception as e:
+        logging.exception("bootstrap_universe failed: %s", e)
+        # все равно продолжим, но активных символов может не быть
+
+    # Планировщик задач
+    jq = app.job_queue
+
+    # WS запуск — сразу после старта приложения
+    jq.run_once(engine.job_start_ws, when=1)
+
+    # Ротация (только для all)
+    if cfg.universe_mode == "all":
+        jq.run_repeating(engine.job_rotate, first=cfg.universe_rotate_min * 60, interval=cfg.universe_rotate_min * 60)
+
+    # OI poll
+    jq.run_repeating(engine.job_poll_oi, first=10, interval=60)
+
+    # health ping в канал
+    jq.run_repeating(lambda c: health_job(app, cfg.recipients), first=cfg.first_health_sec, interval=cfg.health_interval_sec)
+
+    # self-ping
+    if cfg.self_ping_enabled and cfg.public_url:
+        jq.run_repeating(lambda c: self_ping_job(cfg.public_url), first=30, interval=cfg.self_ping_interval_sec)
+
+    # Запускаем webhook-сервер PTB (tornado)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=cfg.port,
+        url_path=cfg.webhook_path,
+        stop_signals=None,  # безопаснее для контейнеров
+        allowed_updates=Update.ALL_TYPES
+    )
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except RuntimeError as e:
+        # Подстраховка от "event loop already running" на некоторых платформах —
+        # в PTB run_webhook закрывает цикл сам; если вдруг он уже активен, fallback.
+        logging.warning("RuntimeError(main_async): %s — fallback to direct call", e)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main_async())
+
+if __name__ == "__main__":
+    main()
