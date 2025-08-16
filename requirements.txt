@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==21.6
+python-telegram-bot[webhooks,job-queue]==21.6
 aiohttp
 websockets
 pandas
