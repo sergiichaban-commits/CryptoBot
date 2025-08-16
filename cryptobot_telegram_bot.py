@@ -2,51 +2,40 @@
 # -*- coding: utf-8 -*-
 
 """
-CryptoBot Telegram Bot — Render-friendly launcher with webhook/polling fallback.
+CheCryptoSignalsBot — устойчивый запуск на Render:
+- Webhook если PUBLIC_URL=https, иначе polling + tiny HTTP server на PORT (для порт-скана Render).
+- Надёжная загрузка вселенной Bybit (USDT perpetual), авто-ретраи до успешной и ежеминутные догрузки.
+- Команды: /ping, /status, /universe, /reload.
+- Health-пинг "online" в чат каждые HEALTH_SEC; self-ping на PUBLIC_URL, чтобы не «засыпал» free-инстанс.
 
-Основные фичи:
-- Правильная работа с PTB 21.6: пост-инициализация задач через post_init.
-- Webhook при наличии корректного HTTPS PUBLIC_URL, иначе — polling.
-- В polling-режиме поднимает мини-HTTP сервер на PORT, чтобы Render видел открытый порт.
-- Вселенная Bybit (USDT perpetual, category=linear), ротация активного поднабора.
-- Health-пинг в чат раз в HEALTH_SEC и self-ping на PUBLIC_URL для предотвращения idle sleep.
-- Команды /ping, /status, /universe + фильтрация по ALLOWED_CHAT_IDS.
-
-ENV (на Render):
-- TELEGRAM_BOT_TOKEN (обяз.)
-- ALLOWED_CHAT_IDS (через запятую, например: "-1002870952333,533232884")
-- TELEGRAM_CHAT_ID (основной получатель, один ID)
-- PUBLIC_URL (опционально, https://... для webhook)
-- PORT (по умолчанию 10000)
-- BYBIT_SYMBOL (необяз., если хотите привязать один символ — не используется в «вселенной»)
-- Прочие числовые настройки можно менять в блоке Config.from_env()
-
-Зависимости (requirements.txt уже включает):
-python-telegram-bot[job-queue,webhooks]==21.6
-aiohttp
-httpx~=0.27
-pandas, numpy, pytz (для дальнейшего анализа)
+ENV:
+  TELEGRAM_BOT_TOKEN (обяз.)
+  ALLOWED_CHAT_IDS="-100...,533..."  (список разрешённых чатов)
+  TELEGRAM_CHAT_ID                   (основной получатель; можно один из ALLOWED)
+  PUBLIC_URL="https://..."           (для webhook; если пусто/не https — будет polling)
+  PORT=10000
+  SELF_PING_ENABLED=true|false
+  SELF_PING_SEC=780
+  HEALTH_SEC=1200
+  ...и др. см. Config.from_env()
 """
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import random
 import signal
 import string
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import httpx
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -56,15 +45,12 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- ЛОГГЕР ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+# ========== ЛОГИ ==========
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ---------- УТИЛИТЫ ----------
+# ========== УТИЛИТЫ ==========
 def parse_ids(csv: str) -> List[int]:
     out = []
     for raw in csv.split(","):
@@ -80,21 +66,20 @@ def parse_ids(csv: str) -> List[int]:
 
 def gen_webhook_path(prefix: str = "/wh-") -> str:
     rng = random.Random(os.environ.get("WEBHOOK_SEED", str(time.time())))
-    digits = "".join(rng.choice(string.digits) for _ in range(8))
-    return f"{prefix}{digits}"
+    return f"{prefix}{''.join(rng.choice(string.digits) for _ in range(8))}"
 
 
 def is_https_url(url: Optional[str]) -> bool:
     if not url:
         return False
     try:
-        pu = urlparse(url.strip())
-        return pu.scheme == "https" and bool(pu.netloc)
+        u = urlparse(url.strip())
+        return u.scheme == "https" and bool(u.netloc)
     except Exception:
         return False
 
 
-# ---------- КОНФИГ ----------
+# ========== КОНФИГ ==========
 @dataclass(frozen=True)
 class Config:
     token: str
@@ -104,26 +89,26 @@ class Config:
     port: int
     webhook_path: str
 
-    # Скрининг/сигналы
+    # фильтры сигналов (оставлены как в ваших настройках)
     prob_min: float = 69.9
     profit_min_pct: float = 1.0
     rr_min: float = 2.0
-    signal_cooldown_sec: int = 600  # защита от дублирования
+    signal_cooldown_sec: int = 600
 
-    # Здоровье/самопинг
-    health_sec: int = 1200          # каждые 20 минут
+    # пинги / запуск
+    health_sec: int = 1200
     health_first_sec: int = 60
     startup_delay_sec: int = 10
-    self_ping_sec: int = 780        # 13 минут
+    self_ping_sec: int = 780
     self_ping_enabled: bool = True
 
-    # Вселенная и ротация
-    universe_mode: str = "all"      # all — все USDT perpetual
-    universe_top_n: int = 15        # если будете резать «топ n» — задел
-    ws_symbols_max: int = 60        # лимит «топиков»; условно 2 топика/символ => 30 символов
-    rotate_min: int = 5             # каждые N минут пересбор активного набора
+    # вселенная + ротация
+    universe_mode: str = "all"
+    universe_top_n: int = 15
+    ws_symbols_max: int = 60
+    rotate_min: int = 5
 
-    # Триггеры объёма/ATR (плейсхолдеры)
+    # плейсхолдеры под индикаторы
     vol_mult: float = 2.0
     vol_sma_period: int = 20
     body_atr_mult: float = 0.6
@@ -136,22 +121,20 @@ class Config:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
         allowed = parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "").strip())
-        primary_raw = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         primary = []
-        if primary_raw:
+        cid_raw = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        if cid_raw:
             with contextlib.suppress(Exception):
-                pid = int(primary_raw)
-                if pid in allowed or not allowed:
-                    primary.append(pid)
+                cid = int(cid_raw)
+                if not allowed or cid in allowed:
+                    primary = [cid]
         if not primary and allowed:
-            # если не задан основной — возьмём первый из белого списка
             primary = [allowed[0]]
 
         public_url = os.environ.get("PUBLIC_URL", "").strip()
         port = int(os.environ.get("PORT", "10000"))
         wh_path = os.environ.get("WEBHOOK_PATH", "").strip() or gen_webhook_path()
 
-        # тюнинги
         prob_min = float(os.environ.get("PROB_MIN", "69.9"))
         profit_min_pct = float(os.environ.get("PROFIT_MIN_PCT", "1.0"))
         rr_min = float(os.environ.get("RR_MIN", "2.0"))
@@ -198,21 +181,14 @@ class Config:
             body_atr_mult=body_atr_mult,
             atr_period=atr_period,
         )
-        # Логируем ключевые параметры
-        logger.info(
-            "INFO [cfg] ALLOWED_CHAT_IDS=%s",
-            cfg.allowed_chat_ids,
-        )
+
+        logger.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.allowed_chat_ids)
         logger.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.primary_recipients)
-        logger.info(
-            "INFO [cfg] PUBLIC_URL=%r PORT=%d WEBHOOK_PATH=%r",
-            cfg.public_url, cfg.port, cfg.webhook_path
-        )
+        logger.info("INFO [cfg] PUBLIC_URL=%r PORT=%d WEBHOOK_PATH=%r", cfg.public_url, cfg.port, cfg.webhook_path)
         logger.info(
             "INFO [cfg] HEALTH=%ss FIRST=%ss STARTUP=%ss SELF_PING=%s/%ss",
             cfg.health_sec, cfg.health_first_sec, cfg.startup_delay_sec,
-            "True" if cfg.self_ping_enabled else "False",
-            cfg.self_ping_sec
+            "True" if cfg.self_ping_enabled else "False", cfg.self_ping_sec
         )
         logger.info(
             "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s "
@@ -222,14 +198,13 @@ class Config:
             cfg.ws_symbols_max, cfg.rotate_min, cfg.prob_min, cfg.profit_min_pct, cfg.rr_min
         )
         logger.info(
-            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, "
-            "BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
+            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
             cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period
         )
         return cfg
 
 
-# ---------- BYBIT КЛИЕНТ ----------
+# ========== BYBIT API ==========
 class BybitClient:
     BASE = "https://api.bybit.com"
 
@@ -240,10 +215,8 @@ class BybitClient:
         await self.http.aclose()
 
     async def get_linear_instruments(self) -> List[str]:
-        """
-        Возвращает список символов USDT perpetual (category=linear), которые торгуются.
-        """
-        out = []
+        """USDT perpetual (category=linear, status=Trading)."""
+        out: List[str] = []
         cursor = None
         while True:
             params = {"category": "linear"}
@@ -255,45 +228,31 @@ class BybitClient:
             if data.get("retCode") != 0:
                 raise RuntimeError(f"Bybit instruments error: {data}")
             result = data.get("result", {})
-            for item in result.get("list", []):
+            for item in result.get("list", []) or []:
                 if item.get("status") == "Trading" and item.get("quoteCoin") == "USDT":
                     out.append(item["symbol"])
-            cursor = result.get("nextPageCursor") or None
+            cursor = (result.get("nextPageCursor") or "").strip() or None
             if not cursor:
                 break
         return out
 
     async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 4) -> Optional[float]:
-        """
-        Возвращает последнее значение OI (USD) для symbol.
-        """
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": str(limit),
-        }
+        params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
         r = await self.http.get("/v5/market/open-interest", params=params)
         r.raise_for_status()
         data = r.json()
         if data.get("retCode") != 0:
-            # Не считаем фатально — просто None
-            logger.debug("Bybit OI non-zero retCode for %s: %s", symbol, data)
             return None
         lst = data.get("result", {}).get("list") or []
         if not lst:
             return None
-        # формат: [timestamp, openInterest, ...]
         try:
-            # берём последнее
-            last = lst[-1]
-            oi = float(last[1])
-            return oi
+            return float(lst[-1][1])
         except Exception:
             return None
 
 
-# ---------- ВСЕЛЕННАЯ/ДВИЖОК ----------
+# ========== ДВИЖОК ==========
 @dataclass
 class UniverseState:
     total: int = 0
@@ -311,91 +270,112 @@ class Engine:
         self.client = BybitClient()
         self.state = UniverseState()
         self._last_health_ts = 0.0
-        self._cooldown_until: dict[str, float] = {}
+        self._boot_lock = asyncio.Lock()
 
-    async def bootstrap(self):
-        # Получаем весь список USDT perpetual
-        syms = await self.client.get_linear_instruments()
-        random.shuffle(syms)
-        self.state.symbols_all = syms
-        self.state.total = len(syms)
+    async def bootstrap(self, send_notice: bool = False):
+        """Надёжная загрузка вселенной c ретраями."""
+        async with self._boot_lock:
+            # если уже загружено — просто обновим активный срез
+            if self.state.total > 0 and self.state.symbols_all:
+                self._rebuild_active_slice()
+                return
 
-        # Сформируем активный срез исходя из лимита топиков
-        per_symbol_topics = 2  # publicTrade + tickers (пример)
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, 6):  # до 5 попыток
+                try:
+                    syms = await self.client.get_linear_instruments()
+                    if syms:
+                        random.shuffle(syms)
+                        self.state.symbols_all = syms
+                        self.state.total = len(syms)
+                        self._rebuild_active_slice()
+                        logger.info("INFO [universe] total=%d active=%d mode=%s",
+                                    self.state.total, self.state.active, self.cfg.universe_mode)
+                        if send_notice and self.cfg.primary_recipients:
+                            with contextlib.suppress(Exception):
+                                await self.app.bot.send_message(
+                                    chat_id=self.cfg.primary_recipients[0],
+                                    text=f"Вселенная загружена: {self.state.total} инструментов ✅",
+                                )
+                        return
+                    else:
+                        last_exc = RuntimeError("Empty instruments list")
+                except Exception as e:
+                    last_exc = e
+                    logger.warning("bootstrap attempt %d failed: %s", attempt, e)
+                await asyncio.sleep(2 * attempt)
+
+            # если сюда дошли — неудача
+            logger.error("bootstrap failed after retries: %s", last_exc)
+            if send_notice and self.cfg.primary_recipients:
+                with contextlib.suppress(Exception):
+                    await self.app.bot.send_message(
+                        chat_id=self.cfg.primary_recipients[0],
+                        text="Не удалось загрузить вселенную (попробую позже) ⚠️",
+                    )
+
+    def _rebuild_active_slice(self):
+        per_symbol_topics = 2  # trades + tickers (условно)
         max_symbols = max(1, self.cfg.ws_symbols_max // per_symbol_topics)
-        self.state.symbols_active = syms[:max_symbols]
+        self.state.batch_index = 0
+        self.state.symbols_active = self.state.symbols_all[:max_symbols]
         self.state.active = len(self.state.symbols_active)
         self.state.ws_topics = self.state.active * per_symbol_topics
 
-        logger.info(
-            "INFO [universe] total=%d active=%d mode=%s",
-            self.state.total, self.state.active, self.cfg.universe_mode
-        )
+    async def ensure_bootstrap(self, *_):
+        """Ежеминутная попытка, пока вселенная не будет загружена."""
+        if self.state.total == 0:
+            await self.bootstrap(send_notice=False)
 
     async def rotate(self, *_):
-        """Ротация активного поднабора."""
         if not self.state.symbols_all:
             return
         per_symbol_topics = 2
         max_symbols = max(1, self.cfg.ws_symbols_max // per_symbol_topics)
-        # двигаем окно
         start = (self.state.batch_index * max_symbols) % max(1, self.state.total)
         self.state.batch_index += 1
-        # циклическая выборка
-        sl = (self.state.symbols_all + self.state.symbols_all)[start: start + max_symbols]
+        sl = (self.state.symbols_all + self.state.symbols_all)[start:start + max_symbols]
         self.state.symbols_active = sl
         self.state.active = len(sl)
         self.state.ws_topics = self.state.active * per_symbol_topics
-        logger.debug("rotate -> active=%d batch#%d", self.state.active, self.state.batch_index)
 
     async def poll_oi(self, *_):
-        """Простая выборочная проверка OI по активным символам (для демонстрации/прогрева)."""
         if not self.state.symbols_active:
             return
         sample = random.sample(self.state.symbols_active, k=min(5, len(self.state.symbols_active)))
-        results = []
         for sym in sample:
             with contextlib.suppress(Exception):
-                oi = await self.client.get_open_interest(sym)
-                if oi is not None:
-                    results.append((sym, oi))
-        if results:
-            logger.debug("OI sample: %s", results[:3])
+                await self.client.get_open_interest(sym)  # прогрев
 
     async def send_health(self, *_):
-        """Проверочное сообщение 'online' раз в HEALTH_SEC, чтобы не засыпал free-инстанс."""
         now = time.time()
-        if now - self._last_health_ts < self.cfg.health_sec:
+        if now - getattr(self, "_last_health_ts", 0.0) < self.cfg.health_sec:
             return
         self._last_health_ts = now
-        txt = "online"
         for chat_id in self.cfg.primary_recipients:
             with contextlib.suppress(Exception):
-                await self.app.bot.send_message(chat_id=chat_id, text=txt)
+                await self.app.bot.send_message(chat_id=chat_id, text="online")
 
     async def self_ping(self, *_):
-        """Пингуем свой PUBLIC_URL, если есть — для поддержания активности Render."""
         if not self.cfg.self_ping_enabled or not is_https_url(self.cfg.public_url):
             return
-        url = self.cfg.public_url.rstrip("/")
         try:
             async with httpx.AsyncClient(timeout=10.0) as cli:
-                await cli.get(url)
+                await cli.get(self.cfg.public_url.rstrip("/"))
         except Exception:
             pass
 
-    def build_status_text(self) -> str:
+    def status_text(self) -> str:
         st = self.state
-        lines = [
-            f"Вселенная: total={st.total}, active={st.active}, batch#{st.batch_index}, ws_topics={st.ws_topics}"
-        ]
-        return "\n".join(lines)
+        if st.total == 0:
+            return "Вселенная пока не загружена (жду Bybit API/повторяю попытки)…"
+        return f"Вселенная: total={st.total}, active={st.active}, batch#{st.batch_index}, ws_topics={st.ws_topics}"
 
     async def close(self):
         await self.client.close()
 
 
-# ---------- МИНИ HTTP СЕРВЕР (для polling) ----------
+# ========== МИНИ HTTP СЕРВЕР ==========
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/healthz"):
@@ -407,8 +387,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, fmt, *args):
-        # приглушим шум
+    def log_message(self, *_):
         return
 
 
@@ -425,17 +404,15 @@ def start_tiny_http_server_thread(port: int):
     logger.info("tiny HTTP server started on 0.0.0.0:%d", port)
 
 
-# ---------- ФИЛЬТР ДОСТУПА ----------
+# ========== ДОСТУП ==========
 def is_allowed(cfg: Config, update: Update) -> bool:
     if not cfg.allowed_chat_ids:
         return True
-    chat_id = None
-    if update.effective_chat:
-        chat_id = update.effective_chat.id
+    chat_id = update.effective_chat.id if update.effective_chat else None
     return chat_id in cfg.allowed_chat_ids
 
 
-# ---------- ХЕНДЛЕРЫ КОМАНД ----------
+# ========== КОМАНДЫ ==========
 async def cmd_ping(update: Update, context: CallbackContext):
     cfg: Config = context.application.bot_data["cfg"]
     if not is_allowed(cfg, update):
@@ -448,7 +425,7 @@ async def cmd_status(update: Update, context: CallbackContext):
     if not is_allowed(cfg, update):
         return
     engine: Engine = context.application.bot_data["engine"]
-    await update.effective_message.reply_text(engine.build_status_text())
+    await update.effective_message.reply_text(engine.status_text())
 
 
 async def cmd_universe(update: Update, context: CallbackContext):
@@ -456,47 +433,44 @@ async def cmd_universe(update: Update, context: CallbackContext):
     if not is_allowed(cfg, update):
         return
     engine: Engine = context.application.bot_data["engine"]
-    st = engine.state
-    text = engine.build_status_text()
-    if st.symbols_active:
-        sample = ", ".join(st.symbols_active[:15])
-        text += f"\nАктивные (пример): {sample}" + (" ..." if len(st.symbols_active) > 15 else "")
-    await update.effective_message.reply_text(text)
+    txt = engine.status_text()
+    if engine.state.total > 0 and engine.state.symbols_active:
+        sample = ", ".join(engine.state.symbols_active[:15])
+        if sample:
+            txt += f"\nАктивные (пример): {sample}" + (" ..." if len(engine.state.symbols_active) > 15 else "")
+    await update.effective_message.reply_text(txt)
 
 
-# ---------- post_init / post_shutdown ----------
+async def cmd_reload(update: Update, context: CallbackContext):
+    cfg: Config = context.application.bot_data["cfg"]
+    if not is_allowed(cfg, update):
+        return
+    engine: Engine = context.application.bot_data["engine"]
+    await update.effective_message.reply_text("Перезагружаю вселенную…")
+    await engine.bootstrap(send_notice=False)
+    await update.effective_message.reply_text(engine.status_text())
+
+
+# ========== post_init / post_shutdown ==========
 async def post_init(app: Application):
     cfg: Config = app.bot_data["cfg"]
     engine: Engine = app.bot_data["engine"]
 
-    # Bootstrap данных (вселенная и пр.)
-    try:
-        await engine.bootstrap()
-    except Exception as e:
-        logger.exception("bootstrap failed: %s", e)
-        # не останавливаем приложение — продолжим, команды будут отвечать
+    # первая попытка загрузки + ретраи внутри
+    await engine.bootstrap(send_notice=True)
 
-    # Планировщик задач
     jq = app.job_queue
-    jq.run_once(lambda *_: logger.info("Scheduler started"), when=0)
-
-    # Ротация каждые N минут
+    # если не получилось — подстраховка каждую минуту до успеха
+    jq.run_repeating(engine.ensure_bootstrap, interval=60, first=60)
+    # ротация
     jq.run_repeating(engine.rotate, interval=cfg.rotate_min * 60, first=cfg.startup_delay_sec)
-    # OI выборка
+    # OI прогрев
     jq.run_repeating(engine.poll_oi, interval=60, first=cfg.startup_delay_sec + 5)
-    # Health -> чат
+    # health в чат
     jq.run_repeating(engine.send_health, interval=cfg.health_sec, first=cfg.health_first_sec)
-    # Self-ping -> PUBLIC_URL
+    # self-ping
     if cfg.self_ping_enabled and is_https_url(cfg.public_url):
         jq.run_repeating(engine.self_ping, interval=cfg.self_ping_sec, first=cfg.health_first_sec)
-
-    # Приветственное сообщение один раз (не спамим)
-    if cfg.primary_recipients:
-        with contextlib.suppress(Exception):
-            await app.bot.send_message(
-                chat_id=cfg.primary_recipients[0],
-                text="Bot started ✅",
-            )
 
 
 async def post_shutdown(app: Application):
@@ -506,85 +480,76 @@ async def post_shutdown(app: Application):
             await engine.close()
 
 
-# ---------- СБОРОЧКА ПРИЛОЖЕНИЯ ----------
+# ========== СБОРКА ПРИЛОЖЕНИЯ ==========
 def build_application(cfg: Config) -> Application:
-    application = (
+    app = (
         ApplicationBuilder()
         .token(cfg.token)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+    app.bot_data["cfg"] = cfg
+    app.bot_data["engine"] = Engine(cfg, app)
 
-    # Ботовые данные
-    application.bot_data["cfg"] = cfg
-    application.bot_data["engine"] = Engine(cfg, application)
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("universe", cmd_universe))
+    app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_ping))  # fallback на неизвестные команды
 
-    # Команды
-    application.add_handler(CommandHandler("ping", cmd_ping))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("universe", cmd_universe))
-
-    # Игнор всего остального (по желанию)
-    application.add_handler(MessageHandler(filters.COMMAND, cmd_ping))  # на неизвестные команды — pong
-
-    return application
+    return app
 
 
-# ---------- MAIN ----------
+# ========== MAIN ==========
 def main():
     cfg = Config.from_env()
-    application = build_application(cfg)
+    app = build_application(cfg)
 
-    # Решение: webhook если PUBLIC_URL валидный https, иначе polling.
-    webhook_ok = is_https_url(cfg.public_url)
-    if webhook_ok:
+    if is_https_url(cfg.public_url):
         webhook_url = f"{cfg.public_url.rstrip('/')}{cfg.webhook_path}"
-        # Перед запуском попробуем снести старый вебхук (без паники в случае ошибки)
+
         async def _pre_del():
             with contextlib.suppress(Exception):
-                await application.bot.delete_webhook(drop_pending_updates=True)
-        asyncio.run(_pre_del())
+                await app.bot.delete_webhook(drop_pending_updates=True)
 
-        # run_webhook сам держит цикл; stop_signals=None — безопаснее для Render
+        asyncio.run(_pre_del())
         logger.info("Starting in WEBHOOK mode @ %s", webhook_url)
-        application.run_webhook(
+        app.run_webhook(
             listen="0.0.0.0",
             port=cfg.port,
             url_path=cfg.webhook_path,
             webhook_url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
             stop_signals=None,
+            allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # POLLING + tiny HTTP на PORT (для Render port scan)
         logger.info("PUBLIC_URL not https/empty — starting in POLLING mode")
         start_tiny_http_server_thread(cfg.port)
 
-        async def _run_polling():
+        async def _run():
             with contextlib.suppress(Exception):
-                await application.bot.delete_webhook(drop_pending_updates=True)
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                await app.bot.delete_webhook(drop_pending_updates=True)
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
             logger.info("Polling started (fallback)")
-            # держим процесс живым
             while True:
                 await asyncio.sleep(3600)
 
         try:
-            asyncio.run(_run_polling())
+            asyncio.run(_run())
         except KeyboardInterrupt:
             pass
         finally:
-            # Аккуратная остановка
             async def _shutdown():
                 with contextlib.suppress(Exception):
-                    await application.updater.stop()
+                    await app.updater.stop()
                 with contextlib.suppress(Exception):
-                    await application.stop()
+                    await app.stop()
                 with contextlib.suppress(Exception):
-                    await application.shutdown()
+                    await app.shutdown()
+
             with contextlib.suppress(Exception):
                 asyncio.run(_shutdown())
 
