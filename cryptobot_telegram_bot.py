@@ -2,80 +2,101 @@
 # -*- coding: utf-8 -*-
 
 """
-CryptoSignals Telegram Bot (Render friendly)
-- PTB 21.6
-- Webhook if PUBLIC_URL is https, иначе fallback на polling + tiny HTTP для Render
-- Ротация вселенной (все USDT perpetual на Bybit, category=linear)
-- Заготовки под OI и WS тикеры (минимально необходимые, без минутных отчётов)
-- Фильтры сигналов оставлены (порог прибыли, RR, вероятность), но сами сигналы не генерятся
-  до вашей дальнейшей логики анализа — сейчас бот стабилен и управляем командами.
+CryptoBot Telegram Bot — Render-friendly launcher with webhook/polling fallback.
+
+Основные фичи:
+- Правильная работа с PTB 21.6: пост-инициализация задач через post_init.
+- Webhook при наличии корректного HTTPS PUBLIC_URL, иначе — polling.
+- В polling-режиме поднимает мини-HTTP сервер на PORT, чтобы Render видел открытый порт.
+- Вселенная Bybit (USDT perpetual, category=linear), ротация активного поднабора.
+- Health-пинг в чат раз в HEALTH_SEC и self-ping на PUBLIC_URL для предотвращения idle sleep.
+- Команды /ping, /status, /universe + фильтрация по ALLOWED_CHAT_IDS.
+
+ENV (на Render):
+- TELEGRAM_BOT_TOKEN (обяз.)
+- ALLOWED_CHAT_IDS (через запятую, например: "-1002870952333,533232884")
+- TELEGRAM_CHAT_ID (основной получатель, один ID)
+- PUBLIC_URL (опционально, https://... для webhook)
+- PORT (по умолчанию 10000)
+- BYBIT_SYMBOL (необяз., если хотите привязать один символ — не используется в «вселенной»)
+- Прочие числовые настройки можно менять в блоке Config.from_env()
+
+Зависимости (requirements.txt уже включает):
+python-telegram-bot[job-queue,webhooks]==21.6
+aiohttp
+httpx~=0.27
+pandas, numpy, pytz (для дальнейшего анализа)
 """
 
-from __future__ import annotations
-
 import asyncio
+import contextlib
 import json
 import logging
-import math
 import os
 import random
 import signal
 import string
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
-import aiohttp
-from aiohttp import web
-from websockets.client import connect as ws_connect
-from websockets.exceptions import ConnectionClosed
-
+import httpx
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
+    CallbackContext,
     CommandHandler,
-    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# ------------------------- ЛОГИРОВАНИЕ -------------------------
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ---------- ЛОГГЕР ----------
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ------------------------- КОНФИГ -------------------------
 
-def _parse_ids(value: str) -> List[int]:
-    if not value:
-        return []
-    try:
-        arr = json.loads(value)
-        if isinstance(arr, list):
-            return [int(x) for x in arr]
-    except json.JSONDecodeError:
-        pass
-    # comma/space separated
+# ---------- УТИЛИТЫ ----------
+def parse_ids(csv: str) -> List[int]:
     out = []
-    for part in value.replace(";", ",").replace(" ", ",").split(","):
-        part = part.strip()
-        if not part:
+    for raw in csv.split(","):
+        raw = raw.strip()
+        if not raw:
             continue
         try:
-            out.append(int(part))
+            out.append(int(raw))
         except ValueError:
-            continue
+            logger.warning("Bad chat id in ALLOWED_CHAT_IDS: %r", raw)
     return out
 
 
-def _rand_path() -> str:
-    return "".join(random.choices(string.digits, k=8))
+def gen_webhook_path(prefix: str = "/wh-") -> str:
+    rng = random.Random(os.environ.get("WEBHOOK_SEED", str(time.time())))
+    digits = "".join(rng.choice(string.digits) for _ in range(8))
+    return f"{prefix}{digits}"
 
 
+def is_https_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    try:
+        pu = urlparse(url.strip())
+        return pu.scheme == "https" and bool(pu.netloc)
+    except Exception:
+        return False
+
+
+# ---------- КОНФИГ ----------
 @dataclass(frozen=True)
-class Cfg:
+class Config:
     token: str
     allowed_chat_ids: List[int]
     primary_recipients: List[int]
@@ -83,532 +104,489 @@ class Cfg:
     port: int
     webhook_path: str
 
-    # сервисные интервалы / поведение Render
-    health_sec: int = 20 * 60        # каждые 20 минут "online"
-    first_health_sec: int = 60       # первая проверка
-    startup_delay_sec: int = 10      # перед стартом
-    self_ping: bool = True
-    self_ping_sec: int = 13 * 60     # self-ping каждые ~13 минут
-
-    # маркет-скан
-    signal_cooldown_sec: int = 10 * 60
-    signal_ttl_min: int = 12
-
-    # вселенная
-    universe_mode: str = "all"       # all / topN (оставили только all)
-    universe_top_n: int = 15
-    ws_symbols_max: int = 60
-    rotate_min: int = 5
-
-    # фильтры сигналов
+    # Скрининг/сигналы
     prob_min: float = 69.9
     profit_min_pct: float = 1.0
     rr_min: float = 2.0
+    signal_cooldown_sec: int = 600  # защита от дублирования
 
-    # параметры простого volume-триггера (на будущее)
+    # Здоровье/самопинг
+    health_sec: int = 1200          # каждые 20 минут
+    health_first_sec: int = 60
+    startup_delay_sec: int = 10
+    self_ping_sec: int = 780        # 13 минут
+    self_ping_enabled: bool = True
+
+    # Вселенная и ротация
+    universe_mode: str = "all"      # all — все USDT perpetual
+    universe_top_n: int = 15        # если будете резать «топ n» — задел
+    ws_symbols_max: int = 60        # лимит «топиков»; условно 2 топика/символ => 30 символов
+    rotate_min: int = 5             # каждые N минут пересбор активного набора
+
+    # Триггеры объёма/ATR (плейсхолдеры)
     vol_mult: float = 2.0
     vol_sma_period: int = 20
     body_atr_mult: float = 0.6
     atr_period: int = 14
 
+    @staticmethod
+    def from_env() -> "Config":
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-def load_cfg() -> Cfg:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+        allowed = parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "").strip())
+        primary_raw = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        primary = []
+        if primary_raw:
+            with contextlib.suppress(Exception):
+                pid = int(primary_raw)
+                if pid in allowed or not allowed:
+                    primary.append(pid)
+        if not primary and allowed:
+            # если не задан основной — возьмём первый из белого списка
+            primary = [allowed[0]]
 
-    allowed = _parse_ids(os.getenv("ALLOWED_CHAT_IDS", ""))
-    primary_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    primary_id = []
-    if primary_raw:
-        try:
-            primary_id = [int(primary_raw)]
-        except ValueError:
-            primary_id = []
+        public_url = os.environ.get("PUBLIC_URL", "").strip()
+        port = int(os.environ.get("PORT", "10000"))
+        wh_path = os.environ.get("WEBHOOK_PATH", "").strip() or gen_webhook_path()
 
-    # PUBLIC_URL: RENDER_EXTERNAL_URL как fallback
-    public_url = os.getenv("PUBLIC_URL", "").strip()
-    if not public_url:
-        public_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        # тюнинги
+        prob_min = float(os.environ.get("PROB_MIN", "69.9"))
+        profit_min_pct = float(os.environ.get("PROFIT_MIN_PCT", "1.0"))
+        rr_min = float(os.environ.get("RR_MIN", "2.0"))
+        signal_cooldown_sec = int(os.environ.get("SIGNAL_COOLDOWN_SEC", "600"))
 
-    # порт: Render передаёт env PORT, используем его в приоритете
-    port = 0
-    for key in ("PORT", "HTTP_PORT"):
-        raw = os.getenv(key, "").strip()
-        if raw:
-            try:
-                port = int(raw)
-                break
-            except ValueError:
-                pass
-    if not port:
-        port = 10000
+        health_sec = int(os.environ.get("HEALTH_SEC", "1200"))
+        health_first_sec = int(os.environ.get("HEALTH_FIRST_SEC", "60"))
+        startup_delay_sec = int(os.environ.get("STARTUP_DELAY_SEC", "10"))
+        self_ping_sec = int(os.environ.get("SELF_PING_SEC", "780"))
+        self_ping_enabled = os.environ.get("SELF_PING_ENABLED", "true").lower() != "false"
 
-    # путь вебхука
-    wh_env = os.getenv("WEBHOOK_PATH", "").strip()
-    webhook_path = wh_env if wh_env.startswith("/") else f"/wh-{_rand_path()}"
+        universe_mode = os.environ.get("UNIVERSE_MODE", "all")
+        universe_top_n = int(os.environ.get("UNIVERSE_TOP_N", "15"))
+        ws_symbols_max = int(os.environ.get("WS_SYMBOLS_MAX", "60"))
+        rotate_min = int(os.environ.get("ROTATE_MIN", "5"))
 
-    # пороги
-    profit_min_pct = float(os.getenv("PROFIT_MIN_PCT", "1.0"))
-    rr_min = float(os.getenv("RR_MIN", "2.0"))
-    prob_min = float(os.getenv("PROB_MIN", "69.9"))
+        vol_mult = float(os.environ.get("VOL_MULT", "2.0"))
+        vol_sma_period = int(os.environ.get("VOL_SMA_PERIOD", "20"))
+        body_atr_mult = float(os.environ.get("BODY_ATR_MULT", "0.6"))
+        atr_period = int(os.environ.get("ATR_PERIOD", "14"))
 
-    rotate_min = int(os.getenv("ROTATE_MIN", "5"))
-    ws_symbols_max = int(os.getenv("WS_SYMBOLS_MAX", "60"))
-
-    cfg = Cfg(
-        token=token,
-        allowed_chat_ids=allowed,
-        primary_recipients=[x for x in primary_id if x in allowed] or [x for x in allowed if x < 0] or allowed[:1],
-        public_url=public_url,
-        port=port,
-        webhook_path=webhook_path,
-        profit_min_pct=profit_min_pct,
-        rr_min=rr_min,
-        prob_min=prob_min,
-        rotate_min=rotate_min,
-        ws_symbols_max=ws_symbols_max,
-    )
-
-    logger.info(
-        "INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.allowed_chat_ids
-    )
-    logger.info(
-        "INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.primary_recipients
-    )
-    logger.info(
-        "INFO [cfg] PUBLIC_URL='%s' PORT=%d WEBHOOK_PATH='%s'",
-        cfg.public_url, cfg.port, cfg.webhook_path
-    )
-    logger.info(
-        "INFO [cfg] HEALTH=%ss FIRST=%ss STARTUP=%ss SELF_PING=%s/%ss",
-        cfg.health_sec, cfg.first_health_sec, cfg.startup_delay_sec, cfg.self_ping, cfg.self_ping_sec
-    )
-    logger.info(
-        "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s UNIVERSE_TOP_N=%d WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
-        cfg.signal_cooldown_sec, cfg.signal_ttl_min, cfg.universe_mode, cfg.universe_top_n,
-        cfg.ws_symbols_max, cfg.rotate_min, cfg.prob_min, cfg.profit_min_pct, cfg.rr_min
-    )
-    logger.info(
-        "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
-        cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period
-    )
-    return cfg
-
-# ------------------------- BYBIT API -------------------------
-
-BYBIT_HTTP = "https://api.bybit.com"
-BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
+        cfg = Config(
+            token=token,
+            allowed_chat_ids=allowed,
+            primary_recipients=primary,
+            public_url=public_url,
+            port=port,
+            webhook_path=wh_path,
+            prob_min=prob_min,
+            profit_min_pct=profit_min_pct,
+            rr_min=rr_min,
+            signal_cooldown_sec=signal_cooldown_sec,
+            health_sec=health_sec,
+            health_first_sec=health_first_sec,
+            startup_delay_sec=startup_delay_sec,
+            self_ping_sec=self_ping_sec,
+            self_ping_enabled=self_ping_enabled,
+            universe_mode=universe_mode,
+            universe_top_n=universe_top_n,
+            ws_symbols_max=ws_symbols_max,
+            rotate_min=rotate_min,
+            vol_mult=vol_mult,
+            vol_sma_period=vol_sma_period,
+            body_atr_mult=body_atr_mult,
+            atr_period=atr_period,
+        )
+        # Логируем ключевые параметры
+        logger.info(
+            "INFO [cfg] ALLOWED_CHAT_IDS=%s",
+            cfg.allowed_chat_ids,
+        )
+        logger.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.primary_recipients)
+        logger.info(
+            "INFO [cfg] PUBLIC_URL=%r PORT=%d WEBHOOK_PATH=%r",
+            cfg.public_url, cfg.port, cfg.webhook_path
+        )
+        logger.info(
+            "INFO [cfg] HEALTH=%ss FIRST=%ss STARTUP=%ss SELF_PING=%s/%ss",
+            cfg.health_sec, cfg.health_first_sec, cfg.startup_delay_sec,
+            "True" if cfg.self_ping_enabled else "False",
+            cfg.self_ping_sec
+        )
+        logger.info(
+            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s "
+            "UNIVERSE_TOP_N=%d WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f "
+            "PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+            cfg.signal_cooldown_sec, 12, cfg.universe_mode, cfg.universe_top_n,
+            cfg.ws_symbols_max, cfg.rotate_min, cfg.prob_min, cfg.profit_min_pct, cfg.rr_min
+        )
+        logger.info(
+            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, "
+            "BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
+            cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period
+        )
+        return cfg
 
 
+# ---------- BYBIT КЛИЕНТ ----------
 class BybitClient:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
+    BASE = "https://api.bybit.com"
 
-    async def get_instruments_linear_usdt(self) -> List[str]:
+    def __init__(self):
+        self.http = httpx.AsyncClient(base_url=self.BASE, timeout=15.0)
+
+    async def close(self):
+        await self.http.aclose()
+
+    async def get_linear_instruments(self) -> List[str]:
         """
-        Все линейные (USDT perpetual) инструменты. Возвращает список символов, например ['BTCUSDT','ETHUSDT',...]
+        Возвращает список символов USDT perpetual (category=linear), которые торгуются.
         """
-        url = f"{BYBIT_HTTP}/v5/market/instruments-info?category=linear&limit=1000"
-        async with self.session.get(url, timeout=30) as resp:
-            data = await resp.json(content_type=None)
-        if str(data.get("retCode")) != "0":
-            logger.warning("Bybit instruments error: %s", data)
-            return []
-        lst = data.get("result", {}).get("list", []) or []
         out = []
-        for it in lst:
-            if it.get("quoteCoin") == "USDT" and it.get("status") == "Trading":
-                sym = it.get("symbol")
-                if sym:
-                    out.append(sym)
-        return sorted(out)
+        cursor = None
+        while True:
+            params = {"category": "linear"}
+            if cursor:
+                params["cursor"] = cursor
+            r = await self.http.get("/v5/market/instruments-info", params=params)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit instruments error: {data}")
+            result = data.get("result", {})
+            for item in result.get("list", []):
+                if item.get("status") == "Trading" and item.get("quoteCoin") == "USDT":
+                    out.append(item["symbol"])
+            cursor = result.get("nextPageCursor") or None
+            if not cursor:
+                break
+        return out
 
-    async def get_open_interest_last(self, symbol: str) -> Optional[float]:
+    async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 4) -> Optional[float]:
         """
-        Последнее значение OI (USD) 5-мин. Свелось к одному значению для справки.
+        Возвращает последнее значение OI (USD) для symbol.
         """
-        params = f"category=linear&symbol={symbol}&interval=5min&limit=1"
-        url = f"{BYBIT_HTTP}/v5/market/open-interest?{params}"
-        async with self.session.get(url, timeout=15) as resp:
-            data = await resp.json(content_type=None)
-        if str(data.get("retCode")) != "0":
-            logger.debug("Bybit OI error for %s: %s", symbol, data)
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": str(limit),
+        }
+        r = await self.http.get("/v5/market/open-interest", params=params)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("retCode") != 0:
+            # Не считаем фатально — просто None
+            logger.debug("Bybit OI non-zero retCode for %s: %s", symbol, data)
             return None
-        rows = data.get("result", {}).get("list", [])
-        if not rows:
+        lst = data.get("result", {}).get("list") or []
+        if not lst:
             return None
+        # формат: [timestamp, openInterest, ...]
         try:
-            # значение в USD
-            return float(rows[-1]["openInterest"])
+            # берём последнее
+            last = lst[-1]
+            oi = float(last[1])
+            return oi
         except Exception:
             return None
 
-# ------------------------- ДВИЖОК -------------------------
+
+# ---------- ВСЕЛЕННАЯ/ДВИЖОК ----------
+@dataclass
+class UniverseState:
+    total: int = 0
+    active: int = 0
+    batch_index: int = 0
+    ws_topics: int = 0
+    symbols_all: List[str] = field(default_factory=list)
+    symbols_active: List[str] = field(default_factory=list)
+
 
 class Engine:
-    def __init__(self, cfg: Cfg, bot):
+    def __init__(self, cfg: Config, app: Application):
         self.cfg = cfg
-        self.bot = bot
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.client: Optional[BybitClient] = None
+        self.app = app
+        self.client = BybitClient()
+        self.state = UniverseState()
+        self._last_health_ts = 0.0
+        self._cooldown_until: dict[str, float] = {}
 
-        self.universe_all: List[str] = []
-        self.active_symbols: List[str] = []
-        self.rotate_idx: int = 0
+    async def bootstrap(self):
+        # Получаем весь список USDT perpetual
+        syms = await self.client.get_linear_instruments()
+        random.shuffle(syms)
+        self.state.symbols_all = syms
+        self.state.total = len(syms)
 
-        self.ws_task: Optional[asyncio.Task] = None
-        self.ws_topics: int = 0
-        self.ws_should_run: bool = False
+        # Сформируем активный срез исходя из лимита топиков
+        per_symbol_topics = 2  # publicTrade + tickers (пример)
+        max_symbols = max(1, self.cfg.ws_symbols_max // per_symbol_topics)
+        self.state.symbols_active = syms[:max_symbols]
+        self.state.active = len(self.state.symbols_active)
+        self.state.ws_topics = self.state.active * per_symbol_topics
 
-        self.oi_cache: Dict[str, float] = {}
-        self._oi_rr: int = 0  # round-robin index
+        logger.info(
+            "INFO [universe] total=%d active=%d mode=%s",
+            self.state.total, self.state.active, self.cfg.universe_mode
+        )
 
-    async def bootstrap(self) -> None:
-        self.session = aiohttp.ClientSession()
-        self.client = BybitClient(self.session)
-
-        # Вселенная
-        all_syms = await self.client.get_instruments_linear_usdt()
-        self.universe_all = all_syms
-        # начальный активный батч
-        self._apply_rotation(reset=True)
-        logger.info("INFO [universe] total=%d active=%d mode=%s", len(self.universe_all), len(self.active_symbols), self.cfg.universe_mode)
-
-    async def close(self) -> None:
-        self.ws_should_run = False
-        if self.ws_task and not self.ws_task.done():
-            self.ws_task.cancel()
-        if self.session:
-            await self.session.close()
-
-    def _apply_rotation(self, reset: bool = False) -> None:
-        if reset:
-            self.rotate_idx = 0
-        n = len(self.universe_all)
-        if n == 0:
-            self.active_symbols = []
+    async def rotate(self, *_):
+        """Ротация активного поднабора."""
+        if not self.state.symbols_all:
             return
-        size = min(self.cfg.ws_symbols_max, n)
-        start = (self.rotate_idx * size) % n
-        batch = []
-        i = start
-        while len(batch) < size and i < start + n:
-            batch.append(self.universe_all[i % n])
-            i += 1
-        self.active_symbols = batch
+        per_symbol_topics = 2
+        max_symbols = max(1, self.cfg.ws_symbols_max // per_symbol_topics)
+        # двигаем окно
+        start = (self.state.batch_index * max_symbols) % max(1, self.state.total)
+        self.state.batch_index += 1
+        # циклическая выборка
+        sl = (self.state.symbols_all + self.state.symbols_all)[start: start + max_symbols]
+        self.state.symbols_active = sl
+        self.state.active = len(sl)
+        self.state.ws_topics = self.state.active * per_symbol_topics
+        logger.debug("rotate -> active=%d batch#%d", self.state.active, self.state.batch_index)
 
-    async def rotate(self) -> None:
-        if not self.universe_all:
+    async def poll_oi(self, *_):
+        """Простая выборочная проверка OI по активным символам (для демонстрации/прогрева)."""
+        if not self.state.symbols_active:
             return
-        self.rotate_idx += 1
-        self._apply_rotation()
-        logger.info("INFO [rotate] batch#%d active=%d", self.rotate_idx, len(self.active_symbols))
-        # Переподписка WS произойдёт при следующем цикле run_ws (просто перестроим список)
+        sample = random.sample(self.state.symbols_active, k=min(5, len(self.state.symbols_active)))
+        results = []
+        for sym in sample:
+            with contextlib.suppress(Exception):
+                oi = await self.client.get_open_interest(sym)
+                if oi is not None:
+                    results.append((sym, oi))
+        if results:
+            logger.debug("OI sample: %s", results[:3])
 
-    async def run_ws(self) -> None:
-        """
-        Лёгкая подписка на тикеры для активного набора (для живости).
-        """
-        self.ws_should_run = True
-        while self.ws_should_run:
-            try:
-                topics = [f"tickers.{s}" for s in self.active_symbols]
-                self.ws_topics = len(topics)
-                if not topics:
-                    await asyncio.sleep(5)
-                    continue
-                logger.info("INFO [ws] connecting, topics=%d", len(topics))
-                async with ws_connect(
-                    BYBIT_WS_PUBLIC_LINEAR,
-                    ping_interval=25,
-                    ping_timeout=20,
-                    close_timeout=10,
-                    max_queue=2048,
-                ) as ws:
-                    sub_msg = {"op": "subscribe", "args": topics}
-                    await ws.send(json.dumps(sub_msg))
-                    logger.info("INFO [ws] subscribed %d topics", len(topics))
-
-                    while self.ws_should_run:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=60)
-                        except asyncio.TimeoutError:
-                            # периодически слать ping
-                            try:
-                                await ws.ping()
-                            except Exception:
-                                break
-                            continue
-                        if not raw:
-                            continue
-                        # можно добавить парс/аккумуляцию последних цен при желании
-                        # msg = json.loads(raw)
-                        # ...
-            except ConnectionClosed:
-                logger.warning("WS closed, reconnecting soon ...")
-            except Exception as e:
-                logger.warning("WS error: %s", e)
-            await asyncio.sleep(3)
-
-    async def poll_oi_once(self) -> None:
-        """Опрашиваем OI по одному символу за тик, round-robin."""
-        if not self.client or not self.active_symbols:
+    async def send_health(self, *_):
+        """Проверочное сообщение 'online' раз в HEALTH_SEC, чтобы не засыпал free-инстанс."""
+        now = time.time()
+        if now - self._last_health_ts < self.cfg.health_sec:
             return
-        sym = self.active_symbols[self._oi_rr % len(self.active_symbols)]
-        self._oi_rr += 1
-        oi = await self.client.get_open_interest_last(sym)
-        if oi is not None:
-            self.oi_cache[sym] = oi
+        self._last_health_ts = now
+        txt = "online"
+        for chat_id in self.cfg.primary_recipients:
+            with contextlib.suppress(Exception):
+                await self.app.bot.send_message(chat_id=chat_id, text=txt)
 
-    # Заготовка под сигналы — здесь вставите свою SMC/OB/LIQ/ОI-логику.
-    # Сейчас — ничего не посылаем, чтобы не шуметь.
+    async def self_ping(self, *_):
+        """Пингуем свой PUBLIC_URL, если есть — для поддержания активности Render."""
+        if not self.cfg.self_ping_enabled or not is_https_url(self.cfg.public_url):
+            return
+        url = self.cfg.public_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as cli:
+                await cli.get(url)
+        except Exception:
+            pass
+
+    def build_status_text(self) -> str:
+        st = self.state
+        lines = [
+            f"Вселенная: total={st.total}, active={st.active}, batch#{st.batch_index}, ws_topics={st.ws_topics}"
+        ]
+        return "\n".join(lines)
+
+    async def close(self):
+        await self.client.close()
 
 
-# ------------------------- ТЕЛЕГРАМ ХЕНДЛЕРЫ -------------------------
+# ---------- МИНИ HTTP СЕРВЕР (для polling) ----------
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-def is_authorized(update: Update, cfg: Cfg) -> bool:
+    def log_message(self, fmt, *args):
+        # приглушим шум
+        return
+
+
+def start_tiny_http_server_thread(port: int):
+    def _run():
+        try:
+            httpd = HTTPServer(("0.0.0.0", port), _Handler)
+            httpd.serve_forever()
+        except Exception as e:
+            logger.error("tiny http server failed: %s", e)
+
+    t = threading.Thread(target=_run, name="tiny-http", daemon=True)
+    t.start()
+    logger.info("tiny HTTP server started on 0.0.0.0:%d", port)
+
+
+# ---------- ФИЛЬТР ДОСТУПА ----------
+def is_allowed(cfg: Config, update: Update) -> bool:
+    if not cfg.allowed_chat_ids:
+        return True
     chat_id = None
     if update.effective_chat:
         chat_id = update.effective_chat.id
-    elif update.effective_message:
-        chat_id = update.effective_message.chat_id
-    if chat_id is None:
-        return False
     return chat_id in cfg.allowed_chat_ids
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    if not is_authorized(update, cfg):
+# ---------- ХЕНДЛЕРЫ КОМАНД ----------
+async def cmd_ping(update: Update, context: CallbackContext):
+    cfg: Config = context.application.bot_data["cfg"]
+    if not is_allowed(cfg, update):
         return
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    await update.effective_message.reply_text(f"pong · {now}")
+    await update.effective_message.reply_text("pong")
 
 
-async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    if not is_authorized(update, cfg):
+async def cmd_status(update: Update, context: CallbackContext):
+    cfg: Config = context.application.bot_data["cfg"]
+    if not is_allowed(cfg, update):
         return
-    engine: Engine = context.bot_data["engine"]
-    total = len(engine.universe_all)
-    active = len(engine.active_symbols)
-    batch = engine.rotate_idx
-    ws_topics = engine.ws_topics
-    text = f"Вселенная: total={total}, active={active}, batch#{batch}, ws_topics={ws_topics}"
+    engine: Engine = context.application.bot_data["engine"]
+    await update.effective_message.reply_text(engine.build_status_text())
+
+
+async def cmd_universe(update: Update, context: CallbackContext):
+    cfg: Config = context.application.bot_data["cfg"]
+    if not is_allowed(cfg, update):
+        return
+    engine: Engine = context.application.bot_data["engine"]
+    st = engine.state
+    text = engine.build_status_text()
+    if st.symbols_active:
+        sample = ", ".join(st.symbols_active[:15])
+        text += f"\nАктивные (пример): {sample}" + (" ..." if len(st.symbols_active) > 15 else "")
     await update.effective_message.reply_text(text)
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    if not is_authorized(update, cfg):
-        return
-    engine: Engine = context.bot_data["engine"]
-    lines = [
-        "Статус:",
-        f"- universe total={len(engine.universe_all)} active={len(engine.active_symbols)} batch#{engine.rotate_idx}",
-        f"- ws_topics={engine.ws_topics}",
-        f"- filters: prob>{cfg.prob_min:.1f}% profit>={cfg.profit_min_pct:.1f}% RR>={cfg.rr_min:.2f}",
-    ]
-    await update.effective_message.reply_text("\n".join(lines))
+# ---------- post_init / post_shutdown ----------
+async def post_init(app: Application):
+    cfg: Config = app.bot_data["cfg"]
+    engine: Engine = app.bot_data["engine"]
 
-
-# ------------------------- ПЛАНИРОВЩИКИ -------------------------
-
-async def job_start_ws(context: ContextTypes.DEFAULT_TYPE) -> None:
-    engine: Engine = context.bot_data["engine"]
-    if engine.ws_task is None or engine.ws_task.done():
-        engine.ws_task = asyncio.create_task(engine.run_ws())
-
-
-async def job_rotate(context: ContextTypes.DEFAULT_TYPE) -> None:
-    engine: Engine = context.bot_data["engine"]
-    await engine.rotate()
-
-
-async def job_poll_oi(context: ContextTypes.DEFAULT_TYPE) -> None:
-    engine: Engine = context.bot_data["engine"]
-    await engine.poll_oi_once()
-
-
-async def job_health(context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
+    # Bootstrap данных (вселенная и пр.)
     try:
-        for chat_id in cfg.primary_recipients:
-            await context.bot.send_message(chat_id, "online")
+        await engine.bootstrap()
     except Exception as e:
-        logger.warning("health-check send error: %s", e)
+        logger.exception("bootstrap failed: %s", e)
+        # не останавливаем приложение — продолжим, команды будут отвечать
+
+    # Планировщик задач
+    jq = app.job_queue
+    jq.run_once(lambda *_: logger.info("Scheduler started"), when=0)
+
+    # Ротация каждые N минут
+    jq.run_repeating(engine.rotate, interval=cfg.rotate_min * 60, first=cfg.startup_delay_sec)
+    # OI выборка
+    jq.run_repeating(engine.poll_oi, interval=60, first=cfg.startup_delay_sec + 5)
+    # Health -> чат
+    jq.run_repeating(engine.send_health, interval=cfg.health_sec, first=cfg.health_first_sec)
+    # Self-ping -> PUBLIC_URL
+    if cfg.self_ping_enabled and is_https_url(cfg.public_url):
+        jq.run_repeating(engine.self_ping, interval=cfg.self_ping_sec, first=cfg.health_first_sec)
+
+    # Приветственное сообщение один раз (не спамим)
+    if cfg.primary_recipients:
+        with contextlib.suppress(Exception):
+            await app.bot.send_message(
+                chat_id=cfg.primary_recipients[0],
+                text="Bot started ✅",
+            )
 
 
-async def job_self_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    if not cfg.public_url:
-        return
-    url = cfg.public_url.rstrip("/")
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=10) as resp:
-                _ = await resp.text()
-    except Exception as e:
-        logger.debug("self-ping failed: %s", e)
+async def post_shutdown(app: Application):
+    engine: Engine = app.bot_data.get("engine")
+    if engine:
+        with contextlib.suppress(Exception):
+            await engine.close()
 
 
-# ------------------------- HTTP (для Render) -------------------------
-
-async def start_tiny_http_server(port: int) -> None:
-    """
-    Минимальный HTTP-сервер, чтобы Render увидел открытый порт,
-    когда мы в режиме polling (без вебхука).
-    """
-    async def index(_request):
-        return web.Response(text="OK")
-
-    app = web.Application()
-    app.router.add_get("/", index)
-    app.router.add_get("/health", index)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("HTTP tiny server started on 0.0.0.0:%d", port)
-
-
-# ------------------------- MAIN -------------------------
-
-def build_application(cfg: Cfg) -> Application:
+# ---------- СБОРОЧКА ПРИЛОЖЕНИЯ ----------
+def build_application(cfg: Config) -> Application:
     application = (
-        Application.builder()
+        ApplicationBuilder()
         .token(cfg.token)
-        .concurrent_updates(True)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
-    # Handlers
-    application.add_handler(CommandHandler("ping", cmd_ping))
-    application.add_handler(CommandHandler("universe", cmd_universe))
-    application.add_handler(CommandHandler("status", cmd_status))
-
-    # Доступ к cfg/engine через bot_data (user_data — mappingproxy)
+    # Ботовые данные
     application.bot_data["cfg"] = cfg
+    application.bot_data["engine"] = Engine(cfg, application)
+
+    # Команды
+    application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("universe", cmd_universe))
+
+    # Игнор всего остального (по желанию)
+    application.add_handler(MessageHandler(filters.COMMAND, cmd_ping))  # на неизвестные команды — pong
+
     return application
 
 
-async def bootstrap_scheduled_jobs(application: Application, cfg: Cfg, engine: Engine) -> None:
-    jq = application.job_queue
-    # WS стартуем сразу после запуска
-    jq.run_once(job_start_ws, when=1)
-    # Ротация набора
-    jq.run_repeating(job_rotate, interval=cfg.rotate_min * 60, first=cfg.rotate_min * 60)
-    # OI поллим скромно
-    jq.run_repeating(job_poll_oi, interval=30, first=5)
-    # Health
-    jq.run_repeating(job_health, interval=cfg.health_sec, first=cfg.first_health_sec)
-    # Self-ping (если есть PUBLIC_URL)
-    if cfg.self_ping and cfg.public_url:
-        jq.run_repeating(job_self_ping, interval=cfg.self_ping_sec, first=30)
-
-    logger.info("Scheduler started")
-
-
-async def main_async() -> None:
-    cfg = load_cfg()
-
-    # небольшая задержка старта контейнера
-    await asyncio.sleep(cfg.startup_delay_sec)
-
+# ---------- MAIN ----------
+def main():
+    cfg = Config.from_env()
     application = build_application(cfg)
-    bot = application.bot
 
-    # Engine
-    engine = Engine(cfg, bot)
-    application.bot_data["engine"] = engine
+    # Решение: webhook если PUBLIC_URL валидный https, иначе polling.
+    webhook_ok = is_https_url(cfg.public_url)
+    if webhook_ok:
+        webhook_url = f"{cfg.public_url.rstrip('/')}{cfg.webhook_path}"
+        # Перед запуском попробуем снести старый вебхук (без паники в случае ошибки)
+        async def _pre_del():
+            with contextlib.suppress(Exception):
+                await application.bot.delete_webhook(drop_pending_updates=True)
+        asyncio.run(_pre_del())
 
-    # Базовая проверка, приветствие и загрузка вселенной
-    try:
-        me = await bot.get_me()
-        for chat_id in cfg.primary_recipients:
-            await bot.send_message(chat_id, f"Бот запущен: @{me.username}")
-    except Exception:
-        # не критично для старта
-        pass
-
-    await engine.bootstrap()
-
-    # Старт приложения
-    await application.initialize()
-    await application.start()
-    await bootstrap_scheduled_jobs(application, cfg, engine)
-    logger.info("Application started")
-
-    # Ветка WEBHOOK (если PUBLIC_URL начинается с https)
-    if cfg.public_url and cfg.public_url.startswith("https://"):
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-        await application.updater.start_webhook(
+        # run_webhook сам держит цикл; stop_signals=None — безопаснее для Render
+        logger.info("Starting in WEBHOOK mode @ %s", webhook_url)
+        application.run_webhook(
             listen="0.0.0.0",
             port=cfg.port,
             url_path=cfg.webhook_path,
-            secret_token=None,
+            webhook_url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
+            stop_signals=None,
         )
-        try:
-            await bot.set_webhook(
-                url=f"{cfg.public_url.rstrip('/')}{cfg.webhook_path}",
-                allowed_updates=Update.ALL_TYPES,
-            )
-        except Exception as e:
-            logger.error("set_webhook failed: %s — fallback to polling", e)
-            await application.updater.stop()
-            # Fallback на polling
-            await start_tiny_http_server(cfg.port)
-            await bot.delete_webhook(drop_pending_updates=True)
+    else:
+        # POLLING + tiny HTTP на PORT (для Render port scan)
+        logger.info("PUBLIC_URL not https/empty — starting in POLLING mode")
+        start_tiny_http_server_thread(cfg.port)
+
+        async def _run_polling():
+            with contextlib.suppress(Exception):
+                await application.bot.delete_webhook(drop_pending_updates=True)
+            await application.initialize()
+            await application.start()
             await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
             logger.info("Polling started (fallback)")
-            # Держим процесс живым
-            await asyncio.Event().wait()
-        else:
-            logger.info("Webhook set: %s", f"{cfg.public_url.rstrip('/')}{cfg.webhook_path}")
-            # Держим процесс живым
-            await asyncio.Event().wait()
-    else:
-        # POLLING + tiny HTTP server для Render (порт-скан)
-        await start_tiny_http_server(cfg.port)
+            # держим процесс живым
+            while True:
+                await asyncio.sleep(3600)
+
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
+            asyncio.run(_run_polling())
+        except KeyboardInterrupt:
             pass
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.info("Polling started (fallback)")
-        # Держим процесс живым (замена отсутствующему wait_until_idle())
-        await asyncio.Event().wait()
-
-
-def main() -> None:
-    # Корректное завершение на SIGTERM/SIGINT
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, loop.stop)
-        except NotImplementedError:
-            # Windows/или окружения без signal
-            pass
-
-    try:
-        loop.run_until_complete(main_async())
-    finally:
-        # петля уже остановлена обработчиком сигналов/ошибками
-        pending = asyncio.all_tasks(loop=loop)
-        for task in pending:
-            task.cancel()
-        try:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except Exception:
-            pass
-        loop.close()
+        finally:
+            # Аккуратная остановка
+            async def _shutdown():
+                with contextlib.suppress(Exception):
+                    await application.updater.stop()
+                with contextlib.suppress(Exception):
+                    await application.stop()
+                with contextlib.suppress(Exception):
+                    await application.shutdown()
+            with contextlib.suppress(Exception):
+                asyncio.run(_shutdown())
 
 
 if __name__ == "__main__":
