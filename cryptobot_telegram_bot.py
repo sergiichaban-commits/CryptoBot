@@ -215,7 +215,8 @@ class BybitClient:
         self.session = session
 
     async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 2) -> List[Dict[str, Any]]:
-        params = {"category":"linear","symbol":symbol,"interval":interval,"limit":str(limit)}
+        # NOTE: Bybit v5 param name is 'intervalTime' (not 'interval')
+        params = {"category":"linear","symbol":symbol,"intervalTime":interval,"limit":str(limit)}
         url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
         async with self.session.get(url, params=params, timeout=10) as r:
             r.raise_for_status()
@@ -324,7 +325,11 @@ class Engine:
                 update_vwap(st, c)
         # seed OI 5m series
         for sym in self.symbols:
-            oi5 = await self.client.get_open_interest(sym, interval="5min", limit=4)
+            try:
+                oi5 = await self.client.get_open_interest(sym, interval="5min", limit=4)
+            except Exception as e:
+                log.warning("[seed OI] %s: %r", sym, e)
+                continue
             st = self.state[sym]
             for row in reversed(oi5):
                 ts = int(row["timestamp"]); oi = float(row["openInterest"])
@@ -656,6 +661,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
 
     bot = app.bot
+    session_holder: Dict[str, aiohttp.ClientSession] = {}
 
     async def post_init(application: Application):
         # startup notif
@@ -667,6 +673,7 @@ def main():
 
         # launch engine & loops
         session = aiohttp.ClientSession()
+        session_holder["session"] = session
         engine = Engine(bot, PRIMARY_RECIPIENTS, session)
         await engine.bootstrap()
         await engine.ws_connect()
@@ -676,9 +683,18 @@ def main():
         application.create_task(health_loop(bot, PRIMARY_RECIPIENTS))
         application.create_task(self_ping_loop())
 
-    app.post_init = post_init
+    async def post_shutdown(application: Application):
+        # graceful session close
+        sess = session_holder.get("session")
+        if sess:
+            try:
+                await sess.close()
+            except Exception:
+                pass
 
-    # Webhook setup — никаких manual asyncio.run / set_webhook, всё через run_webhook
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
+
     if not (PUBLIC_URL and WEBHOOK_URL):
         raise SystemExit("PUBLIC_URL/RENDER_EXTERNAL_URL is required for webhook mode on Render.")
 
