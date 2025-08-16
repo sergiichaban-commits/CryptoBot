@@ -540,7 +540,7 @@ class Engine:
         rr_tp1 = (move_to_tp1 / max(1e-9, move_to_sl)) if move_to_tp1>0 and move_to_sl>0 else 0.0
         profit_pct_tp1 = (abs(tp1 - ((entry_from+entry_to)/2)) / price_now) * 100.0
 
-        # filters (unchanged except probability)
+        # filters
         if rr_tp1 < 2.0:
             return
         if profit_pct_tp1 < 2.0:
@@ -678,28 +678,19 @@ def main():
 
     app.post_init = post_init
 
-    # Webhook setup
+    # Webhook setup — никаких manual asyncio.run / set_webhook, всё через run_webhook
     if not (PUBLIC_URL and WEBHOOK_URL):
         raise SystemExit("PUBLIC_URL/RENDER_EXTERNAL_URL is required for webhook mode on Render.")
 
-    async def run():
-        # ensure webhook is set fresh
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-        await app.bot.set_webhook(WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
-
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH.lstrip("/"),
-            webhook_url=WEBHOOK_URL,
-            allowed_updates=Update.ALL_TYPES,
-            stop_signals=None,  # safer for Render containers
-        )
-
-    asyncio.run(run())
+    # PTB сам создаёт/закрывает event loop внутри run_webhook()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        webhook_url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None,  # безопаснее для Render-контейнеров
+    )
 
 if __name__ == "__main__":
     try:
