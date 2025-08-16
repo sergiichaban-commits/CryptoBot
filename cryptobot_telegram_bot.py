@@ -1,20 +1,18 @@
 """
-CryptoBot — Bybit 1m Candles + Volume Spike Signal (Render FREE Web Service)
+CryptoBot — Bybit 1m Candles + Volume Spike (Render FREE, Webhook mode)
 - Безопасность: whitelist chat_ids (env: ALLOWED_CHAT_IDS), рассылка только TELEGRAM_CHAT_ID
 - Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
 - Сводка свечи раз в 5 минут (на закрытии 1м)
 - Health ping каждые 60 минут
 - Сигнал ⚡ Volume spike: Volume >= VOL_MULT × SMA(V, VOL_SMA_PERIOD) и |body| >= BODY_ATR_MULT × ATR(ATR_PERIOD)
-- Мини HTTP сервер на $PORT (/, /health) — чтобы Web Service на Render оставался "живым" на бесплатном тарифе
-- При старте: delete_webhook(drop_pending_updates=True), чтобы исключить конфликт polling/webhook и очистить висящие апдейты
+- Режим Telegram: WEBHOOK (никакого polling → нет конфликта getUpdates)
+- HTTP-сервер поднимает PTB внутри run_webhook на $PORT (Render happy)
 - Start Command (Render Web Service): python cryptobot_telegram_bot.py
 """
 
 import os
 import json
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from typing import List, Set, Optional
 from collections import deque
@@ -39,7 +37,18 @@ POST_EVERY_N_MIN = 5
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
 
-HTTP_PORT = int(os.environ.get("PORT", "8000"))  # Render присваивает $PORT для Web Service
+# Render: порт и внешний URL сервиса
+HTTP_PORT = int(os.environ.get("PORT", "8000"))
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+if not PUBLIC_URL:
+    # На всякий случай — не критично для отправки сигналов, но вебхук без URL не стартанёт
+    print("[warn] PUBLIC_URL/RENDER_EXTERNAL_URL is empty — set PUBLIC_URL in env if webhook fails.")
+
+# Секрет для пути вебхука (не токен, чтобы не светить его в URL)
+WEBHOOK_PATH_SECRET = os.environ.get("WEBHOOK_SECRET", "wh-" + os.environ.get("TELEGRAM_BOT_TOKEN", "")[:8])
+WEBHOOK_PATH = f"/{WEBHOOK_PATH_SECRET}"
+# Доп. секрет заголовка X-Telegram-Bot-Api-Secret-Token (опционально, повысит безопасность)
+WEBHOOK_HEADER_SECRET = os.environ.get("WEBHOOK_SECRET_TOKEN", None)
 
 def _parse_id_list(value: str) -> List[int]:
     """Парсер chat_id, устойчивый к пробелам/кавычкам."""
@@ -64,6 +73,8 @@ print(f"[info] TELEGRAM_CHAT_ID(raw) = {os.environ.get('TELEGRAM_CHAT_ID', '')!r
 print(f"[info] RECIPIENTS (whitelisted) = {RECIPIENTS}")
 print(f"[info] BYBIT_SYMBOL = {SYMBOL!r}")
 print(f"[info] HTTP_PORT = {HTTP_PORT}")
+print(f"[info] PUBLIC_URL = {PUBLIC_URL!r}")
+print(f"[info] WEBHOOK_PATH = {WEBHOOK_PATH!r}")
 print(f"[info] Volume trigger params: VOL_MULT={VOL_MULT}, VOL_SMA_PERIOD={VOL_SMA_PERIOD}, BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s")
 
 def utcnow() -> datetime:
@@ -75,14 +86,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id not in ALLOWED_CHAT_IDS:
         return
-    await update.message.reply_text("Бот онлайн ✅")
+    await update.message.reply_text("Бот онлайн ✅ (webhook)")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id not in ALLOWED_CHAT_IDS:
         return
     await update.message.reply_text(
-        "Статус: онлайн\n"
+        "Статус: онлайн (webhook)\n"
         f"Whitelist: {sorted(ALLOWED_CHAT_IDS)}\n"
         f"Recipients: {RECIPIENTS}\n"
         f"Symbol: {SYMBOL}\n"
@@ -231,46 +242,16 @@ async def health_loop(application: Application):
                 print(f"[warn] health-check -> {cid}: {e}")
         await asyncio.sleep(PING_INTERVAL_MIN * 60)
 
-# ---------------- Tiny HTTP server (no asyncio) ----------------
-
-class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health"):
-            body = b"OK"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_error(404)
-    def log_message(self, fmt, *args):
-        return  # тише лог
-
-def start_http_server():
-    srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _Handler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    print(f"[info] HTTP server listening on 0.0.0.0:{HTTP_PORT}")
-
-# ---------------- App lifecycle ----------------
+# ---------------- App lifecycle (Webhook) ----------------
 
 async def post_init(application: Application):
-    # 0) гарантируем режим polling: снимаем webhook и очищаем очередь апдейтов
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("[info] Webhook deleted, pending updates dropped.")
-    except Exception as e:
-        print(f"[warn] delete_webhook failed: {e}")
-
-    # 1) стартовое сообщение (если есть кому слать)
+    # Стартовое сообщение (если есть кому слать)
     for cid in RECIPIENTS:
         try:
-            await application.bot.send_message(chat_id=cid, text=f"✅ Render Web Service: бот запущен. Symbol={SYMBOL}")
+            await application.bot.send_message(chat_id=cid, text=f"✅ Render Webhook: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
-
-    # 2) фоновые задачи (без JobQueue)
+    # Фоновые задачи
     asyncio.create_task(health_loop(application))
     asyncio.create_task(bybit_candles(application))
 
@@ -278,16 +259,49 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
+    if not PUBLIC_URL:
+        print("[error] PUBLIC_URL not detected. Set env PUBLIC_URL to your Render URL (e.g. https://yourapp.onrender.com)")
+        # не выходим, но вебхук не поднимется — сообщения из чатов не нужны для сигналов
 
-    # 1) поднять HTTP-порт для Render (в отдельном потоке)
-    start_http_server()
-
-    # 2) Telegram bot (PTB сам управляет своим event loop)
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.ALL, ignore_all))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Гарантированно отключаем старый вебхук и чистим очередь перед установкой нового
+    # (run_webhook тоже умеет drop_pending_updates, но пусть будет явно)
+    try:
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
+        loop.close()
+        print("[info] Webhook deleted, pending updates dropped.")
+    except Exception as e:
+        print(f"[warn] delete_webhook failed: {e}")
+
+    if PUBLIC_URL:
+        webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+        print(f"[info] Setting webhook to: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=HTTP_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            secret_token=WEBHOOK_HEADER_SECRET,  # можно оставить None
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Фолбэк (на случай отсутствия PUBLIC_URL): не поднимаем вебхук.
+        # Сигналы Bybit и health будут работать, но команды /start /status — нет.
+        # Лучше задать PUBLIC_URL в окружении Render.
+        print("[warn] PUBLIC_URL is missing — webhook disabled. Signals still work.")
+        # Чтобы цикл не завершился:
+        try:
+            asyncio.get_event_loop().run_forever()
+        except KeyboardInterrupt:
+            pass
 
 if __name__ == "__main__":
     main()
