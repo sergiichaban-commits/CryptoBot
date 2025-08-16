@@ -17,7 +17,7 @@
 #   (opt) SELF_PING_INTERVAL_SEC  default 780 (~13 min)
 #   (opt) SELF_PING_PATH          default "/"
 #   (opt) SIGNAL_COOLDOWN_SEC     default 600
-#   (opt) SIGNAL_TTL_MIN          default 12  (signal validity window, mins)
+#   (opt) SIGNAL_TTL_MIN          default 12
 #   (opt) UNIVERSE_TOP_N          default 15
 #   (opt) BYBIT_SYMBOLS_CANDIDATES CSV override candidate universe (else default list)
 #   (opt) PROB_MIN                default 69.9  (strictly greater-than)
@@ -74,6 +74,15 @@ def getenv_float(name: str, default: float) -> float:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+def fmt_age(ts_ms: int) -> str:
+    if not ts_ms:
+        return "n/a"
+    age = max(0, int(time.time() - ts_ms/1000))
+    m, s = divmod(age, 60)
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -215,7 +224,7 @@ class BybitClient:
         self.session = session
 
     async def get_open_interest(self, symbol: str, interval: str = "5min", limit: int = 2) -> List[Dict[str, Any]]:
-        # NOTE: Bybit v5 param name is 'intervalTime' (not 'interval')
+        # Bybit v5 param name is 'intervalTime' (not 'interval')
         params = {"category":"linear","symbol":symbol,"intervalTime":interval,"limit":str(limit)}
         url = f"{BYBIT_REST_BASE}/v5/market/open-interest"
         async with self.session.get(url, params=params, timeout=10) as r:
@@ -283,7 +292,6 @@ class Engine:
         self.fvg_lookback    = 20
 
     async def discover_universe(self) -> List[str]:
-        # pick high-volatility coins over last 7d (1h candles) from candidates
         default_candidates = [
             "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","TONUSDT","HBARUSDT",
             "ARBUSDT","OPUSDT","RNDRUSDT","AVAXUSDT","NEARUSDT","ATOMUSDT","APTUSDT","SUIUSDT","PEPEUSDT",
@@ -296,8 +304,7 @@ class Engine:
         vols: List[Tuple[str,float]] = []
         for sym in candidates:
             try:
-                # 1h data for ~7 days → 7*24=168, take 200
-                kl = await self.client.get_kline(sym, interval="60", limit=200)
+                kl = await self.client.get_kline(sym, interval="60", limit=200)  # 1h, ~7d
                 if len(kl) < 50: 
                     continue
                 closes = np.array([c.c for c in kl], dtype=float)
@@ -343,6 +350,7 @@ class Engine:
             args.append(f"liquidation.{sym}")
         sub = {"op":"subscribe","args": args}
         await self.ws.send(json.dumps(sub))
+        log.info("[ws] subscribed %d topics for %d symbols", len(args), len(self.symbols))
 
     async def run_ws(self):
         assert self.ws is not None
@@ -451,9 +459,8 @@ class Engine:
         lows  = [c.l for c in st.candles.last(window)]
         return (max(highs), min(lows))
 
-    # ---- probability model (simple heuristic 60..95%) ----
     def _probability(self, strong_impulse: bool, fvg: Optional[str], vwap_dev_ok: bool, oi_hint: Optional[str], side: str) -> float:
-        p = 70.0  # base when all core triggers passed (impulse+ΔOI+liq)
+        p = 70.0
         if strong_impulse: p += 6.0
         if fvg:            p += 5.0
         if vwap_dev_ok:    p += 4.0
@@ -461,7 +468,6 @@ class Engine:
             p += 3.0
         return float(max(60.0, min(95.0, p)))
 
-    # ---- evaluation ----
     async def evaluate_symbol(self, symbol: str):
         st = self.state[symbol]
         if len(st.candles) < 40:
@@ -509,9 +515,9 @@ class Engine:
         if symbol != "BTCUSDT" and "BTCUSDT" in self.state and len(self.state["BTCUSDT"].candles) >= 4:
             b = self.state["BTCUSDT"].candles
             btc_ret_3m = (b.buf[-1].c - b.buf[-4].c) / b.buf[-4].c * 100
-            if sweep == 'up' and btc_ret_3m > self.btc_sync_div:   # avoid short against strong BTC up
+            if sweep == 'up' and btc_ret_3m > self.btc_sync_div:
                 btc_ok = False
-            if sweep == 'down' and btc_ret_3m < -self.btc_sync_div: # avoid long against strong BTC down
+            if sweep == 'down' and btc_ret_3m < -self.btc_sync_div:
                 btc_ok = False
 
         if not (impulse and oi_trigger and liq_trigger and btc_ok and sweep in ('up','down')):
@@ -585,7 +591,6 @@ class Engine:
 
     async def send_signal_batch(self, sigs: List[Signal]):
         if not sigs: return
-        # sort by probability desc
         sigs = sorted(sigs, key=lambda s: (-s.probability, s.symbol))
 
         lines = ["*⚡ Сигналы (интрадей)*"]
@@ -593,7 +598,6 @@ class Engine:
             entry = f"{self._fmt_price(s.entry_from)}–{self._fmt_price(s.entry_to)}"
             rr = f"{s.rr_tp1:.2f}"
             tp1p = f"+{s.profit_pct_tp1:.2f}%"
-            # SL/TP deltas vs mid-entry
             mid = (s.entry_from + s.entry_to)/2
             sl_pct = (abs(mid - s.sl)/mid) * 100.0
             slp = f"-{sl_pct:.2f}%"
@@ -649,7 +653,70 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    await update.effective_message.reply_text("🤖 OK. Фильтры: RR≥2.0, Profit≥2%, Вероятность>"+f"{PROB_MIN:.1f}%")
+    engine = context.application.bot_data.get("engine")
+    n = len(engine.symbols) if engine else 0
+    await update.effective_message.reply_text(
+        f"🤖 OK. Юниверс={n} пар. Фильтры: RR≥2.0, Profit≥2%, Вероятность>{PROB_MIN:.1f}%.",
+    )
+
+async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    engine = context.application.bot_data.get("engine")
+    if not engine:
+        await update.effective_message.reply_text("engine: not ready")
+        return
+    await update.effective_message.reply_text("Отслеживаю: " + ", ".join(engine.symbols))
+
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    engine: Engine = context.application.bot_data.get("engine")
+    if not engine:
+        await update.effective_message.reply_text("engine: not ready")
+        return
+    syms: List[str]
+    if context.args:
+        syms = [context.args[0].upper()]
+    else:
+        syms = engine.symbols[:5]
+    lines = []
+    for sym in syms:
+        st: SymbolState = engine.state.get(sym)
+        if not st or not st.candles.buf:
+            lines.append(f"*{sym}*: нет данных")
+            continue
+        last = st.candles.buf[-1]
+        atr14 = engine._atr14(st) or float('nan')
+        vol_sma20 = engine._volume_sma20(st)
+        vol_mul = (last.v / vol_sma20) if (vol_sma20 and vol_sma20>0) else float('nan')
+        oi5 = engine._oi_change_pct(st,5)
+        oi15 = engine._oi_change_pct(st,15)
+        liq_p95 = engine._liq_5m_percentile(st, engine.liq_percentile)
+        liq_now = st.current_liq_bucket_notional
+        ts_iso = datetime.utcfromtimestamp(last.t/1000).strftime("%H:%M:%S")
+        vwap = st.vwap if st.vwap==st.vwap else None
+        lines.append(
+            f"*{sym}*  t={ts_iso}Z  age={fmt_age(last.t)}  c={engine._fmt_price(last.c)}\n"
+            f"ATR14={atr14:.4f}  Vol/SMA20={vol_mul:.2f}  VWAP={engine._fmt_price(vwap) if vwap else 'nan'}\n"
+            f"ΔOI5m={(oi5 if oi5 is not None else float('nan')):.2f}%  ΔOI15m={(oi15 if oi15 is not None else float('nan')):.2f}%\n"
+            f"LiqNow={liq_now:.0f}  P95={ (liq_p95 if liq_p95 is not None else float('nan')):.0f}"
+        )
+    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+async def cmd_force_eval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    engine: Engine = context.application.bot_data.get("engine")
+    if not engine:
+        await update.effective_message.reply_text("engine: not ready")
+        return
+    if not context.args:
+        await update.effective_message.reply_text("usage: /force_eval SYMBOL")
+        return
+    sym = context.args[0].upper()
+    if sym not in engine.symbols:
+        await update.effective_message.reply_text(f"{sym} не в юниверсе. /universe для списка.")
+        return
+    await engine.evaluate_symbol(sym)
+    await update.effective_message.reply_text(f"Переоценил {sym}. Если сетап не прошёл фильтры, алерта не будет.")
 
 # ------------ main (webhook mode for Render) ------------
 def main():
@@ -659,6 +726,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("universe", cmd_universe))
+    app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("force_eval", cmd_force_eval))
 
     bot = app.bot
     session_holder: Dict[str, aiohttp.ClientSession] = {}
@@ -677,6 +747,9 @@ def main():
         engine = Engine(bot, PRIMARY_RECIPIENTS, session)
         await engine.bootstrap()
         await engine.ws_connect()
+
+        # make engine available to handlers
+        application.bot_data["engine"] = engine
 
         application.create_task(engine.run_ws())
         application.create_task(engine.poll_oi())
@@ -698,7 +771,6 @@ def main():
     if not (PUBLIC_URL and WEBHOOK_URL):
         raise SystemExit("PUBLIC_URL/RENDER_EXTERNAL_URL is required for webhook mode on Render.")
 
-    # PTB сам создаёт/закрывает event loop внутри run_webhook()
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
