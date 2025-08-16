@@ -1,7 +1,7 @@
 # cryptobot_telegram_bot.py
 # Telegram webhook bot on Render + signals engine (Bybit v5)
 # Strategy: Intraday SMC-lite + Volume + OI + Liquidations
-# Filters: RR>=2.0, Profit>=2%, Probability>69.9; only fresh signals; sorted by probability
+# Filters: RR>=2.0, Profit>=1%, Probability>69.9; only fresh signals; sorted by probability
 #
 # ENV (Render -> Environment):
 #   TELEGRAM_BOT_TOKEN   (required)
@@ -21,6 +21,7 @@
 #   (opt) UNIVERSE_TOP_N          default 15
 #   (opt) BYBIT_SYMBOLS_CANDIDATES CSV override candidate universe (else default list)
 #   (opt) PROB_MIN                default 69.9  (strictly greater-than)
+#   (opt) PROFIT_MIN_PCT          default 1.0   (TP1 expected gain threshold, in %)
 #
 # Requirements:
 #   python-telegram-bot[job-queue,webhooks]==21.6
@@ -116,13 +117,15 @@ SELF_PING_URL            = (PUBLIC_URL.rstrip("/") + os.environ.get("SELF_PING_P
 SIGNAL_COOLDOWN_SEC      = getenv_int("SIGNAL_COOLDOWN_SEC", 600)
 SIGNAL_TTL_MIN           = getenv_int("SIGNAL_TTL_MIN", 12)
 UNIVERSE_TOP_N           = getenv_int("UNIVERSE_TOP_N", 15)
-PROB_MIN                 = getenv_float("PROB_MIN", 69.9)  # strict >
+PROB_MIN                 = getenv_float("PROB_MIN", 69.9)        # strict >
+PROFIT_MIN_PCT           = getenv_float("PROFIT_MIN_PCT", 1.0)   # >= this percent
 
 log.info("[cfg] ALLOWED_CHAT_IDS=%s", sorted(ALLOWED_CHAT_IDS))
 log.info("[cfg] PRIMARY_RECIPIENTS=%s", PRIMARY_RECIPIENTS)
 log.info("[cfg] PUBLIC_URL='%s' PORT=%s WEBHOOK_PATH='%s'", PUBLIC_URL, PORT, WEBHOOK_PATH)
 log.info("[cfg] HEALTH=%ss FIRST=%ss STARTUP=%s SELF_PING=%s/%ss", HEALTH_INTERVAL_SEC, HEALTH_FIRST_SEC, STARTUP_PING_SEC, bool(SELF_PING_ENABLED), SELF_PING_INTERVAL_SEC)
-log.info("[cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_TOP_N=%s PROB_MIN>%s", SIGNAL_COOLDOWN_SEC, SIGNAL_TTL_MIN, UNIVERSE_TOP_N, PROB_MIN)
+log.info("[cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_TOP_N=%s PROB_MIN>%s PROFIT_MIN_PCT>=%s%%",
+         SIGNAL_COOLDOWN_SEC, SIGNAL_TTL_MIN, UNIVERSE_TOP_N, PROB_MIN, PROFIT_MIN_PCT)
 
 # ------------ Bybit constants ------------
 BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
@@ -554,7 +557,7 @@ class Engine:
         # filters
         if rr_tp1 < 2.0:
             return
-        if profit_pct_tp1 < 2.0:
+        if profit_pct_tp1 < PROFIT_MIN_PCT:
             return
 
         probability = self._probability(strong_impulse, fvg, vwap_dev_ok, oi_side_hint, side)
@@ -656,7 +659,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = context.application.bot_data.get("engine")
     n = len(engine.symbols) if engine else 0
     await update.effective_message.reply_text(
-        f"🤖 OK. Юниверс={n} пар. Фильтры: RR≥2.0, Profit≥2%, Вероятность>{PROB_MIN:.1f}%.",
+        f"🤖 OK. Юниверс={n} пар. Фильтры: RR≥2.0, Profit≥{PROFIT_MIN_PCT:.1f}%, Вероятность>{PROB_MIN:.1f}%.",
     )
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -737,7 +740,7 @@ def main():
         # startup notif
         for cid in PRIMARY_RECIPIENTS:
             try:
-                await bot.send_message(cid, f"✅ Render Web Service: бот запущен. Universe=auto-top-{UNIVERSE_TOP_N}, PROB>{PROB_MIN:.1f}%")
+                await bot.send_message(cid, f"✅ Render Web Service: бот запущен. Universe=auto-top-{UNIVERSE_TOP_N}, PROB>{PROB_MIN:.1f}% • Profit≥{PROFIT_MIN_PCT:.1f}%")
             except Exception as e:
                 log.warning("startup msg -> %s: %s", cid, repr(e))
 
