@@ -25,29 +25,30 @@ from telegram.ext import (
 # Эти значения используются ТОЛЬКО если переменные окружения не заданы на Render.
 # ⚠️ НЕ РЕКОМЕНДУЕТСЯ коммитить сюда реальный Telegram-токен.
 HARDCODED_ENV = {
-    # "TELEGRAM_BOT_TOKEN": "ВАШ_ТОКЕН_СЮДА_ЕСЛИ_СОЗНАТЕЛЬНО_ХОТИТЕ_ХРАНИТЬ_В_КОДЕ",  # ⚠️ рискованно
-
-    # Ваши whitelists по умолчанию
+    # "TELEGRAM_BOT_TOKEN": "ВАШ_ТОКЕН_ЕСЛИ_ОСОЗНАННО_ХРАНИТЕ_В_КОДЕ",  # ⚠️ рискованно
     "ALLOWED_CHAT_IDS": "533232884,-1002870952333",
     "TELEGRAM_CHAT_ID": "-1002870952333",
 
-    # Список символов (если нужно задать в коде)
+    # Опционально: вручную зафиксированный список (ENV SYMBOLS имеет приоритет)
     # "SYMBOLS": "BTCUSDT,ETHUSDT,SOLUSDT",
 
-    # Параметры авто-подбора волатильных
+    # Авто-подбор по волатильности
     "AUTO_VOL_ENABLED": "1",
     "AUTO_VOL_TOP_N": "15",
-    "AUTO_VOL_SCAN_COUNT": "60",
+    "AUTO_VOL_SCAN_COUNT": "80",
     "AUTO_VOL_UTC_HOUR": "0",
     "AUTO_VOL_UTC_MIN": "10",
     "MAX_SYMBOLS": "30",
 
-    # Интервалы задач
-    "SNAPSHOT_ENABLED": "1",
-    "PORT": "10000",
+    # Интервалы задач (сек)
+    "HEALTH_INTERVAL_SEC": "3600",
+    "ENGINE_INTERVAL_SEC": "60",
 
-    # Обычно Render сам проставляет RENDER_EXTERNAL_URL → PUBLIC_URL не нужен
-    # "PUBLIC_URL": "https://cryptobot-<slug>.onrender.com",
+    # Минутные отчёты отключены
+    "SNAPSHOT_ENABLED": "0",
+
+    # HTTP порт
+    "PORT": "10000",
 }
 for k, v in HARDCODED_ENV.items():
     os.environ.setdefault(k, str(v))
@@ -80,7 +81,6 @@ if not ALLOWED_CHAT_IDS:
 
 RECIPIENTS: list[int] = fallback_chat or ALLOWED_CHAT_IDS
 
-# мультисимвол через ENV, иначе — fallback
 ENV_SYMBOLS = [s.strip().upper() for s in (os.environ.get("SYMBOLS") or "").split(",") if s.strip()]
 BYBIT_SYMBOL_FALLBACK = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").upper()
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "bot_config.json")
@@ -90,7 +90,7 @@ HTTP_PORT = int(os.environ.get("PORT", "10000"))
 tok_left = BOT_TOKEN.split(":")[0] if ":" in BOT_TOKEN else BOT_TOKEN
 WEBHOOK_PATH = f"/wh-{tok_left[-8:]}"
 
-# Параметры триггеров (можешь настраивать через ENV):
+# Пороговые параметры анализа
 VOL_MULT = float(os.environ.get("VOL_MULT", "2.0"))
 VOL_SMA_PERIOD = int(os.environ.get("VOL_SMA_PERIOD", "20"))
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
@@ -102,20 +102,20 @@ LIQ_PCTL = float(os.environ.get("LIQ_PCTL", "95"))
 VWAP_DEV_PCT = float(os.environ.get("VWAP_DEV_PCT", "0.5"))
 BTC_SYNC_MAX_DIV = float(os.environ.get("BTC_SYNC_MAX_DIV", "0.4"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "240"))
-SNAPSHOT_ENABLED = (os.environ.get("SNAPSHOT_ENABLED", "1") != "0")
+RECENCY_MAX_SEC = int(os.environ.get("RECENCY_MAX_SEC", "120"))  # бар должен быть не старше 2 минут
 
-# Авто-подбор по волатильности
+# Авто-подбор
 AUTO_VOL_ENABLED = (os.environ.get("AUTO_VOL_ENABLED", "1") != "0")
 AUTO_VOL_TOP_N = int(os.environ.get("AUTO_VOL_TOP_N", "15"))
-AUTO_VOL_SCAN_COUNT = int(os.environ.get("AUTO_VOL_SCAN_COUNT", "60"))
+AUTO_VOL_SCAN_COUNT = int(os.environ.get("AUTO_VOL_SCAN_COUNT", "80"))
 AUTO_VOL_UTC_HOUR = int(os.environ.get("AUTO_VOL_UTC_HOUR", "0"))
 AUTO_VOL_UTC_MIN = int(os.environ.get("AUTO_VOL_UTC_MIN", "10"))
 MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", "30"))
 
-# частоты задач
-HEALTH_INTERVAL_SEC = 60 * 60
-SNAPSHOT_INTERVAL_SEC = 60
-ENGINE_INTERVAL_SEC = 60
+# Частоты задач
+HEALTH_INTERVAL_SEC = int(os.environ.get("HEALTH_INTERVAL_SEC", "3600"))
+ENGINE_INTERVAL_SEC = int(os.environ.get("ENGINE_INTERVAL_SEC", "60"))
+SNAPSHOT_ENABLED = (os.environ.get("SNAPSHOT_ENABLED", "0") != "0")
 
 print(f"[info] ALLOWED_CHAT_IDS = {sorted(ALLOWED_CHAT_IDS)}")
 print(f"[info] TELEGRAM_CHAT_ID(raw) = '{os.environ.get('TELEGRAM_CHAT_ID', '')}'")
@@ -125,8 +125,9 @@ if PUBLIC_URL:
     print(f"[info] PUBLIC_URL = '{PUBLIC_URL}'")
 print(f"[info] WEBHOOK_PATH = '{WEBHOOK_PATH}'")
 print(f"[info] Volume trigger params: VOL_MULT={VOL_MULT}, VOL_SMA_PERIOD={VOL_SMA_PERIOD}, "
-      f"BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s")
-print(f"[info] AutoVol: enabled={AUTO_VOL_ENABLED}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, time={AUTO_VOL_UTC_HOUR:02d}:{AUTO_VOL_UTC_MIN:02d}Z, max={MAX_SYMBOLS}")
+      f"BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s, RECENCY={RECENCY_MAX_SEC}s")
+print(f"[info] AutoVol: enabled={AUTO_VOL_ENABLED}, topN={AUTO_VOL_TOP_N}, "
+      f"scan={AUTO_VOL_SCAN_COUNT}, time={AUTO_VOL_UTC_HOUR:02d}:{AUTO_VOL_UTC_MIN:02d}Z, max={MAX_SYMBOLS}")
 
 # ====================== STATE & MODELS ======================
 
@@ -155,15 +156,13 @@ class SymState:
     liq_bucket_start: Optional[int] = None
     liq_bucket_notional: float = 0.0
     last_alert_ms: int = 0
+    last_alert_key: Optional[str] = None  # для анти-дублей
 
 class GlobalState:
     def __init__(self):
         self._lock = asyncio.Lock()
         self.symbols: List[str] = []
         self.syms: Dict[str, SymState] = {}
-        self.ws_task: Optional[asyncio.Task] = None
-        self.last_autovol_at: Optional[str] = None
-        self.last_autovol_added: List[str] = []
 
     async def load_symbols(self):
         symbols = list(ENV_SYMBOLS)
@@ -226,20 +225,36 @@ async def validate_symbols_linear(symbols: List[str]) -> tuple[List[str], List[s
                 bad.append(sym)
     return ok, bad
 
-async def get_kline_1m(symbol: str, limit: int = 200) -> List[Candle]:
+async def get_kline(symbol: str, interval: str, limit: int = 200) -> List[Candle]:
     async with aiohttp.ClientSession() as s:
         data = await bybit_get(s, "/v5/market/kline", {
-            "category": "linear", "symbol": symbol, "interval": "1", "limit": str(limit)
+            "category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)
         })
     out: List[Candle] = []
     if not data or data.get("retCode") != 0:
         return out
     rows = (data.get("result") or {}).get("list") or []
     for row in rows:
-        t = int(row[0]); o, h, l, c = map(float, row[1:5]); v = float(row[5])
+        t = int(row[0]); o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
         out.append(Candle(t, o, h, l, c, v, True))
     out.sort(key=lambda x: x.t)
     return out
+
+async def get_kline_1m(symbol: str, limit: int = 200) -> List[Candle]:
+    return await get_kline(symbol, "1", limit)
+
+async def get_kline_daily_closes(session: aiohttp.ClientSession, symbol: str, limit: int = 8) -> List[float]:
+    data = await bybit_get(session, "/v5/market/kline", {
+        "category": "linear", "symbol": symbol, "interval": "D", "limit": str(limit)
+    })
+    closes: List[float] = []
+    if not data or data.get("retCode") != 0:
+        return closes
+    rows = (data.get("result") or {}).get("list") or []
+    for row in rows:
+        closes.append(float(row[4]))
+    closes.sort()
+    return closes
 
 async def get_oi_snapshots(symbol: str, interval: str = "5min", limit: int = 4) -> List[Tuple[int, float]]:
     async with aiohttp.ClientSession() as s:
@@ -255,14 +270,14 @@ async def get_oi_snapshots(symbol: str, interval: str = "5min", limit: int = 4) 
         out.append((ts, oi))
     return out
 
+# ====================== INDИКАТОРЫ / SMC ======================
+
 def fmt_price(x: float) -> str:
     if x >= 100:
         return f"{x:.2f}"
     if x >= 1:
         return f"{x:.4f}"
     return f"{x:.6f}"
-
-# ====================== INDICATORS ======================
 
 def atr(candles: List[Candle], period: int = 14) -> float:
     if len(candles) < period + 1:
@@ -303,10 +318,8 @@ def detect_sweep(candles: List[Candle], lookback: int = 30) -> Optional[str]:
     lows  = [c.l for c in candles[-(lookback+1):-1]]
     down = last.l < min(lows) and last.c > last.o
     up   = last.h > max(highs) and last.c < last.o
-    if down:
-        return "down"
-    if up:
-        return "up"
+    if down: return "down"
+    if up:   return "up"
     return None
 
 def maybe_reset_vwap(st: SymState, t_ms: int):
@@ -321,22 +334,69 @@ def update_vwap(st: SymState, c: Candle):
     if st.vwap_den > 0:
         st.vwap = st.vwap_num / st.vwap_den
 
+def bos_bias(candles: List[Candle], lb: int = 30) -> Optional[str]:
+    """Простой BOS: пробой max/min последних lb баров телом/закрытием."""
+    if len(candles) < lb + 1:
+        return None
+    prev_high = max(c.h for c in candles[-(lb+1):-1])
+    prev_low  = min(c.l for c in candles[-(lb+1):-1])
+    last = candles[-1]
+    if last.c > prev_high:
+        return "up"
+    if last.c < prev_low:
+        return "down"
+    return None
+
+def premium_discount(candles: List[Candle], lb: int = 50) -> Optional[str]:
+    """Цена относительно mid диапазона lb баров: premium(>mid) / discount(<mid)."""
+    if len(candles) < lb:
+        return None
+    window = candles[-lb:]
+    hi = max(c.h for c in window)
+    lo = min(c.l for c in window)
+    if hi <= lo:
+        return None
+    mid = (hi + lo) / 2.0
+    px = window[-1].c
+    return "premium" if px > mid else "discount"
+
+# === Калибровка confidence -> вероятность (%)
+def conf_to_prob_pct(conf: int) -> float:
+    """
+    Преобразует целочисленную уверенность [0..100] в «вероятность (оценку)» в процентах.
+    Линейная сжатая шкала вокруг 50:
+      50 -> ~55%, 60 -> ~62%, 70 -> ~69%, 80 -> ~76%, 90 -> ~83%, 100 -> ~90%
+    Сделано, чтобы не обещать экстремальные проценты без статистической калибровки.
+    """
+    p = 0.55 + (conf - 50) * 0.007  # шаг ~0.7% за 1 пункт confidence сверх 50
+    p = max(0.45, min(0.90, p))     # ограничим разумными рамками
+    return round(p * 100.0, 1)
+
 # ====================== ENGINE ======================
 
 @dataclass
 class Signal:
     symbol: str
     side: str   # LONG/SHORT
-    entry_from: float
-    entry_to: float
+    price: float
+    entry: float
     sl: float
-    tp1: float
-    rr_tp1: float
+    tp: float
+    pct_tp: float
+    pct_sl: float
     confidence: int
+    rr_ratio: float
     notes: List[str]
+    prob_pct: float  # << новая метрика: «вероятность (оценка)» в %
 
-def rr(a: float, b: float) -> float:
-    return float(a / max(1e-9, b))
+def rr_ratio_calc(side: str, entry: float, tp: float, sl: float) -> float:
+    if side == "LONG":
+        reward = max(1e-9, tp - entry)
+        risk = max(1e-9, entry - sl)
+    else:
+        reward = max(1e-9, entry - tp)
+        risk = max(1e-9, sl - entry)
+    return float(reward / risk)
 
 async def bootstrap_history():
     syms = await STATE.get_symbols()
@@ -396,8 +456,22 @@ async def ws_liq_loop():
                 except Exception:
                     continue
 
+def _oi_change_pct(series: List[Tuple[int, float]], minutes: int) -> Optional[float]:
+    if len(series) < 2:
+        return None
+    now_ts = series[-1][0]
+    cutoff = now_ts - minutes*60*1000
+    recent = [x for x in series if x[0] >= cutoff]
+    if len(recent) < 2:
+        return None
+    a, b = recent[0][1], recent[-1][1]
+    if a == 0:
+        return None
+    return (b - a) / a * 100.0
+
 async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     st = await STATE.get_symstate(symbol)
+    # Обновим последний бар, VWAP, OI
     recent = await get_kline_1m(symbol, limit=2)
     if recent:
         last = recent[-1]
@@ -407,7 +481,12 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
             st.candles.extend(recent if not st.candles else [last])
             st.candles = st.candles[-240:]
         maybe_reset_vwap(st, last.t); update_vwap(st, last)
-    if len(st.candles) < max(ATR_PERIOD+1, VOL_SMA_PERIOD):
+    if len(st.candles) < max(ATR_PERIOD+1, VOL_SMA_PERIOD, 60):
+        return None
+
+    # Актуальность бара
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if now_ms - st.candles[-1].t > RECENCY_MAX_SEC * 1000:
         return None
 
     oi_last = await get_oi_snapshots(symbol, "5min", 1)
@@ -421,21 +500,19 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     if math.isnan(atr14) or math.isnan(vol_sma) or vol_sma == 0:
         return None
 
-    def oi_change_pct(minutes: int) -> Optional[float]:
-        if len(st.oi_series) < 2:
-            return None
-        now_ts = st.oi_series[-1][0]
-        cutoff = now_ts - minutes*60*1000
-        recent = [x for x in st.oi_series if x[0] >= cutoff]
-        if len(recent) < 2:
-            return None
-        a, b = recent[0][1], recent[-1][1]
-        if a == 0:
-            return None
-        return (b - a) / a * 100.0
+    # --- Индикаторы/фичи ---
+    fvg = detect_recent_fvg(st.candles[-20:])
+    sweep = detect_sweep(st.candles, 30)
+    bos  = bos_bias(st.candles, 30)
+    pd   = premium_discount(st.candles, 50)
+    vwap_dev_ok = True
+    vwap_dev_pct = float("nan")
+    if st.vwap and st.vwap > 0:
+        vwap_dev_pct = abs(c.c - st.vwap) / st.vwap * 100.0
+        vwap_dev_ok = (vwap_dev_pct >= VWAP_DEV_PCT)
 
-    oi5 = oi_change_pct(5)
-    oi15 = oi_change_pct(15)
+    oi5  = _oi_change_pct(st.oi_series, 5)
+    oi15 = _oi_change_pct(st.oi_series, 15)
     oi_trigger = False
     oi_hint: Optional[str] = None
     if oi5 is not None and abs(oi5) >= OI_DELTA_PCT_5M:
@@ -450,14 +527,7 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
     impulse = (body >= BODY_ATR_MULT * atr14) and (c.v >= VOL_MULT * vol_sma)
     strong_impulse = (body >= BODY_ATR_STRONG * atr14)
 
-    sweep = detect_sweep(st.candles, 30)
-    fvg = detect_recent_fvg(st.candles[-20:])
-
-    vwap_ok = True
-    if st.vwap and st.vwap > 0:
-        dev_pct = abs(c.c - st.vwap) / st.vwap * 100.0
-        vwap_ok = (dev_pct >= VWAP_DEV_PCT)
-
+    # BTC sync
     btc_ok = True
     if symbol != "BTCUSDT":
         bstate = await STATE.get_symstate("BTCUSDT")
@@ -468,86 +538,158 @@ async def evaluate_symbol(symbol: str) -> Optional[Signal]:
             if sweep == "down" and br < -BTC_SYNC_MAX_DIV:
                 btc_ok = False
 
+    # --- SMC bias & комбинированный скор ---
     side: Optional[str] = None
     reasons: List[str] = []
 
-    if impulse and oi_trigger and liq_trigger and vwap_ok and btc_ok:
-        if sweep == "down":
-            side = "LONG"
-            reasons += [
-                f"impulse {body/atr14:.2f}×ATR",
-                f"vol {c.v/vol_sma:.2f}×SMA{VOL_SMA_PERIOD}",
-                f"ΔOI {oi5:.2f}%" if oi5 is not None else f"ΔOI15 {oi15:.2f}%",
-                "liq≥P95", "down-sweep"
-            ]
-            if fvg == "bull": reasons.append("bull FVG")
-        elif sweep == "up":
-            side = "SHORT"
-            reasons += [
-                f"impulse {body/atr14:.2f}×ATR",
-                f"vol {c.v/vol_sma:.2f}×SMA{VOL_SMA_PERIOD}",
-                f"ΔOI {oi5:.2f}%" if oi5 is not None else f"ΔOI15 {oi15:.2f}%",
-                "liq≥P95", "up-sweep"
-            ]
-            if fvg == "bear": reasons.append("bear FVG")
+    smc_long = ((bos == "up") or (sweep == "down") or (fvg == "bull"))
+    smc_short = ((bos == "down") or (sweep == "up") or (fvg == "bear"))
 
-    if not side:
-        return None
+    # Премиум/Дискаунт фильтр
+    if pd == "discount":
+        smc_long = smc_long or True
+    if pd == "premium":
+        smc_short = smc_short or True
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    if now_ms - st.last_alert_ms < ALERT_COOLDOWN_SEC * 1000:
-        return None
-    st.last_alert_ms = now_ms
+    long_score = 0
+    short_score = 0
 
-    entry_from = min(c.o, c.c); entry_to = max(c.o, c.c)
-    if side == "LONG":
-        sl = c.l
-        hi = max([x.h for x in st.candles[-20:]], default=c.c)
-        tp1 = hi if hi > c.c else c.c + (entry_to - sl)
+    if smc_long: long_score += 1
+    if smc_short: short_score += 1
+
+    if impulse:
+        if c.c > c.o: long_score += 1
+        if c.c < c.o: short_score += 1
+    if strong_impulse:
+        if c.c > c.o: long_score += 1
+        if c.c < c.o: short_score += 1
+
+    if oi_trigger:
+        if oi_hint == "long": long_score += 1
+        if oi_hint == "short": short_score += 1
+
+    if liq_trigger:
+        if sweep == "down": long_score += 1
+        if sweep == "up": short_score += 1
+
+    if vwap_dev_ok:
+        if sweep == "down": long_score += 1
+        if sweep == "up": short_score += 1
+
+    if btc_ok:
+        if c.c >= c.o: long_score += 1
+        else: short_score += 1
+
+    if long_score >= max(2, short_score + 1):
+        side = "LONG"
+    elif short_score >= max(2, long_score + 1):
+        side = "SHORT"
     else:
-        sl = c.h
-        lo = min([x.l for x in st.candles[-20:]], default=c.c)
-        tp1 = lo if lo < c.c else c.c - (sl - entry_from)
+        return None  # слабый сетап
 
-    rr_tp1 = rr(abs(tp1 - entry_to), abs(entry_to - sl))
+    # --- Расчёт входа/SL/TP ---
+    entry = c.c
+    if side == "LONG":
+        swing_low = min(x.l for x in st.candles[-20:])
+        sl = min(c.l, swing_low) - 0.2 * atr14
+        tp1_struct = max(x.h for x in st.candles[-20:])
+        tp1_atr = entry + 1.6 * atr14
+        tp = max(tp1_struct, tp1_atr)
+    else:
+        swing_high = max(x.h for x in st.candles[-20:])
+        sl = max(c.h, swing_high) + 0.2 * atr14
+        tp1_struct = min(x.l for x in st.candles[-20:])
+        tp1_atr = entry - 1.6 * atr14
+        tp = min(tp1_struct, tp1_atr)
+
+    # sanity
+    if (side == "LONG" and (tp <= entry or sl >= entry)) or (side == "SHORT" and (tp >= entry or sl <= entry)):
+        return None
+
+    pct_tp = (tp - entry) / entry * 100.0
+    pct_sl = (sl - entry) / entry * 100.0
+    if side == "LONG" and pct_sl > 0: pct_sl = -abs(pct_sl)
+    if side == "SHORT" and pct_sl < 0: pct_sl = abs(pct_sl)
 
     conf = 50
-    if strong_impulse: conf += 10
-    if fvg: conf += 10
-    if vwap_ok: conf += 5
-    if (oi_hint == "long" and side == "LONG") or (oi_hint == "short" and side == "SHORT"):
-        conf += 5
+    conf += (long_score if side == "LONG" else short_score) * 5
+    if strong_impulse: conf += 5
+    if fvg: conf += 5
+    if vwap_dev_ok: conf += 3
     conf = max(0, min(100, conf))
+
+    # причины
+    if bos: reasons.append(f"BOS {bos}")
+    if sweep: reasons.append(f"sweep {sweep}")
+    if fvg: reasons.append(f"FVG {fvg}")
+    reasons.append(f"vol {c.v/max(1e-9, vol_sma):.2f}×")
+    oi5v = _oi_change_pct(st.oi_series, 5)
+    oi15v = _oi_change_pct(st.oi_series, 15)
+    if oi5v is not None: reasons.append(f"ΔOI5 {oi5v:.2f}%")
+    if oi15v is not None: reasons.append(f"ΔOI15 {oi15v:.2f}%")
+    if liq_trigger: reasons.append("liq≥P95")
+    if not math.isnan(vwap_dev_pct): reasons.append(f"|Px-VWAP| {vwap_dev_pct:.2f}%")
+
+    rr = rr_ratio_calc(side, entry, tp, sl)
+    prob_pct = conf_to_prob_pct(conf)
 
     return Signal(
         symbol=symbol, side=side,
-        entry_from=entry_from, entry_to=entry_to,
-        sl=sl, tp1=tp1, rr_tp1=rr_tp1,
-        confidence=int(round(conf)), notes=reasons,
+        price=c.c, entry=entry, sl=sl, tp=tp,
+        pct_tp=pct_tp, pct_sl=pct_sl,
+        confidence=int(round(conf)), rr_ratio=rr, notes=reasons,
+        prob_pct=prob_pct,
     )
+
+def _signal_key(sig: Signal) -> str:
+    # округляем для устойчивости
+    return f"{sig.symbol}:{sig.side}:{round(sig.entry, 6)}:{round(sig.sl, 6)}:{round(sig.tp, 6)}"
 
 async def send_signals(app: Application, sigs: List[Signal]):
     if not sigs:
         return
-    sigs.sort(key=lambda s: (-s.confidence, s.symbol))
-    lines = [
-        "*ChaSerBot — Intraday Setups*",
-        "Symbol | Side | Entry | SL | TP1 | RR | Conf | Notes",
-        "---|---|---|---|---|---|---|---"
-    ]
-    def fp(x: float) -> str: return fmt_price(x)
+
+    # Сортировка: самый вероятный (conf) → лучший RR → больший потенциал TP
+    sigs.sort(key=lambda s: (-s.confidence, -s.rr_ratio, -abs(s.pct_tp), s.symbol))
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    filtered: List[Signal] = []
     for s in sigs:
-        entry = f"{fp(s.entry_from)}–{fp(s.entry_to)}"
-        lines.append(
-            f"{s.symbol} | {s.side} | {entry} | {fp(s.sl)} | {fp(s.tp1)} | {s.rr_tp1:.2f} | {s.confidence} | {', '.join(s.notes)}"
-        )
-    text = "\n".join(lines)
-    for chat_id in RECIPIENTS:
-        if chat_id in ALLOWED_CHAT_IDS:
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-            except Exception:
-                pass
+        st = await STATE.get_symstate(s.symbol)
+        key = _signal_key(s)
+        allow_time = (now_ms - st.last_alert_ms) >= (ALERT_COOLDOWN_SEC * 1000)
+        changed = (st.last_alert_key != key)
+        if changed or allow_time:
+            filtered.append(s)
+            st.last_alert_key = key
+            st.last_alert_ms = now_ms
+
+    if not filtered:
+        return
+
+    def fp(x: float) -> str: return fmt_price(x)
+    for s in filtered:
+        lines = [
+            f"*{s.symbol}* | *{s.side}*",
+            f"Цена: {fp(s.price)}",
+            f"Вход: {fp(s.entry)}",
+        ]
+        if s.side == "LONG":
+            lines.append(f"TP: {fp(s.tp)} (+{s.pct_tp:.2f}%)")
+            lines.append(f"SL: {fp(s.sl)} ({s.pct_sl:.2f}%)")
+        else:
+            lines.append(f"TP: {fp(s.tp)} ({s.pct_tp:.2f}%)")
+            lines.append(f"SL: {fp(s.sl)} (+{abs(s.pct_sl):.2f}%)")
+        lines.append(f"Уверенность: {s.confidence}/100  |  Вероятность (оценка): {s.prob_pct:.1f}%  |  R/R: {s.rr_ratio:.2f}")
+        if s.notes:
+            lines.append("Основания: " + ", ".join(s.notes))
+        text = "\n".join(lines)
+        for chat_id in RECIPIENTS:
+            if chat_id in ALLOWED_CHAT_IDS:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                except Exception:
+                    pass
 
 # ====================== PERIODIC JOBS ======================
 
@@ -560,29 +702,6 @@ async def job_health(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-async def job_snapshots(context: ContextTypes.DEFAULT_TYPE):
-    if not SNAPSHOT_ENABLED:
-        return
-    app = context.application
-    syms = await STATE.get_symbols()
-    lines = []
-    for sym in syms:
-        kl = await get_kline_1m(sym, limit=1)
-        if not kl:
-            continue
-        c = kl[-1]
-        t_utc = datetime.fromtimestamp(c.t/1000, tz=timezone.utc).strftime("%H:%M UTC")
-        lines.append(f"{sym} 1m {t_utc} — O:{fmt_price(c.o)} H:{fmt_price(c.h)} L:{fmt_price(c.l)} C:{fmt_price(c.c)} V:{int(c.v)}")
-    if not lines:
-        return
-    msg = "\n".join(lines)
-    for chat_id in RECIPIENTS:
-        if chat_id in ALLOWED_CHAT_IDS:
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception:
-                pass
-
 async def job_engine(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     syms = await STATE.get_symbols()
@@ -591,18 +710,20 @@ async def job_engine(context: ContextTypes.DEFAULT_TYPE):
         sig = await evaluate_symbol(sym)
         if sig:
             sigs.append(sig)
-    if sigs:
-        await send_signals(app, sigs)
+    # если пусто — НИЧЕГО не отправляем
+    await send_signals(app, sigs)
 
 # ====================== AUTO-VOL PICKER ======================
 
-async def fetch_top_by_turnover(session: aiohttp.ClientSession, n: int) -> List[str]:
-    """Bybit tickers (linear), top-N by 24h turnover, USDT only."""
+async def bybit_get_tickers(session: aiohttp.ClientSession) -> List[dict]:
     data = await bybit_get(session, "/v5/market/tickers", {"category": "linear"})
-    out: List[Tuple[str, float]] = []
     if not data or data.get("retCode") != 0:
         return []
-    rows = (data.get("result") or {}).get("list") or []
+    return (data.get("result") or {}).get("list") or []
+
+async def fetch_top_by_turnover(session: aiohttp.ClientSession, n: int) -> List[str]:
+    rows = await bybit_get_tickers(session)
+    pool: List[Tuple[str, float]] = []
     for r in rows:
         sym = str(r.get("symbol", ""))
         if not sym.endswith("USDT"):
@@ -611,22 +732,9 @@ async def fetch_top_by_turnover(session: aiohttp.ClientSession, n: int) -> List[
             turn = float(r.get("turnover24h", 0.0))
         except Exception:
             turn = 0.0
-        out.append((sym, turn))
-    out.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in out[:max(1, n)]]
-
-async def get_kline_daily_closes(session: aiohttp.ClientSession, symbol: str, limit: int = 8) -> List[float]:
-    data = await bybit_get(session, "/v5/market/kline", {
-        "category": "linear", "symbol": symbol, "interval": "D", "limit": str(limit)
-    })
-    closes: List[float] = []
-    if not data or data.get("retCode") != 0:
-        return closes
-    rows = (data.get("result") or {}).get("list") or []
-    for row in rows:
-        closes.append(float(row[4]))
-    closes.sort()
-    return closes
+        pool.append((sym, turn))
+    pool.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in pool[:max(1, n)]]
 
 def realized_vol_pct(closes: List[float]) -> float:
     if len(closes) < 5:
@@ -654,7 +762,7 @@ async def pick_symbols_by_week_vol(top_n: int, scan_count: int) -> List[str]:
                 vol = realized_vol_pct(closes)
                 if not math.isnan(vol):
                     vols[sym] = vol
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.02)
 
         await asyncio.gather(*(worker(sym) for sym in pool))
         ranked = sorted(vols.items(), key=lambda kv: kv[1], reverse=True)
@@ -662,7 +770,6 @@ async def pick_symbols_by_week_vol(top_n: int, scan_count: int) -> List[str]:
 
 async def job_autovol(context: ContextTypes.DEFAULT_TYPE, manual_topn: Optional[int] = None) -> Tuple[List[str], List[str]]:
     topn = manual_topn if manual_topn is not None else AUTO_VOL_TOP_N
-    added: List[str] = []
     before = await STATE.get_symbols()
     try:
         picked = await pick_symbols_by_week_vol(topn, AUTO_VOL_SCAN_COUNT)
@@ -679,8 +786,7 @@ async def job_autovol(context: ContextTypes.DEFAULT_TYPE, manual_topn: Optional[
         if to_bootstrap:
             await bootstrap_for_symbols(to_bootstrap)
         added = [s for s in new if s not in before]
-        STATE.last_autovol_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-        STATE.last_autovol_added = added
+        # уведомление
         try:
             await context.application.bot.send_message(
                 chat_id=RECIPIENTS[0],
@@ -724,8 +830,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     syms = await STATE.get_symbols()
     auto_line = f"AutoVol: {'ON' if AUTO_VOL_ENABLED else 'OFF'}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, max={MAX_SYMBOLS}"
-    last_auto = f"Последний автосчёт: {STATE.last_autovol_at or '—'}; добавлено: {', '.join(STATE.last_autovol_added) or '—'}"
-    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}\n{last_auto}")
+    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
@@ -810,6 +915,9 @@ async def post_init(app: Application):
     await bootstrap_history()
     app.create_task(ws_liq_loop())
 
+    if AUTO_VOL_ENABLED:
+        app.job_queue.run_once(lambda ctx: job_autovol(ctx), when=10)
+
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -825,8 +933,6 @@ def build_application() -> Application:
 
     jq = app.job_queue
     jq.run_repeating(job_health, interval=HEALTH_INTERVAL_SEC, first=10)
-    if SNAPSHOT_ENABLED:
-        jq.run_repeating(job_snapshots, interval=SNAPSHOT_INTERVAL_SEC, first=15)
     jq.run_repeating(job_engine, interval=ENGINE_INTERVAL_SEC, first=20)
 
     if AUTO_VOL_ENABLED:
