@@ -64,12 +64,12 @@ class Config:
     self_ping_enabled: bool = True
 
     # Вселенная и ротация
-    universe_mode: str = "all"          # "all" — скан всех фьючерсных USDT
-    universe_top_n: int = 15            # исторический параметр (для "top"), не критично
-    ws_symbols_max: int = 60            # активное окно (сколько монет одновременно)
-    rotate_min: int = 5                 # ротация каждые 5 минут
+    universe_mode: str = "all"
+    universe_top_n: int = 15
+    ws_symbols_max: int = 60
+    rotate_min: int = 5
 
-    # Фильтры сигналов (оставлены без изменений)
+    # Фильтры сигналов
     prob_min: float = 69.9
     profit_min_pct: float = 1.0
     rr_min: float = 2.0
@@ -81,8 +81,8 @@ class Config:
     atr_period: int = 14
 
     # Сигнал-сервис
-    signal_cooldown_sec: int = 600      # антиспам
-    signal_ttl_min: int = 12            # актуальность сигналов
+    signal_cooldown_sec: int = 600
+    signal_ttl_min: int = 12
 
     @staticmethod
     def load() -> "Config":
@@ -90,42 +90,34 @@ class Config:
         allowed_raw = os.getenv("ALLOWED_CHAT_IDS", "")
         allowed = _parse_int_list(allowed_raw)
 
-        # TELEGRAM_CHAT_ID (основной получатель) — одиночное значение
         primary_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         primary: List[int] = []
         if primary_raw:
-            try:
+            with contextlib.suppress(Exception):
                 primary.append(int(primary_raw))
-            except Exception:
-                pass
 
         http_port = int(os.getenv("PORT", os.getenv("HTTP_PORT", "10000")))
         public_url = os.getenv("PUBLIC_URL", "").strip()
 
-        # интервалы
         health_interval_sec = int(os.getenv("HEALTH_INTERVAL_SEC", "1200"))
         health_first_sec = int(os.getenv("HEALTH_FIRST_SEC", "60"))
         self_ping_interval_sec = int(os.getenv("SELF_PING_INTERVAL_SEC", "780"))
         self_ping_enabled = os.getenv("SELF_PING_ENABLED", "true").lower() in ("1", "true", "yes")
 
-        # вселенная/ротация
         universe_mode = os.getenv("UNIVERSE_MODE", "all").strip().lower()
         universe_top_n = int(os.getenv("UNIVERSE_TOP_N", "15"))
         ws_symbols_max = int(os.getenv("WS_SYMBOLS_MAX", "60"))
         rotate_min = int(os.getenv("ROTATE_MIN", "5"))
 
-        # фильтры
         prob_min = float(os.getenv("PROB_MIN", "69.9"))
         profit_min_pct = float(os.getenv("PROFIT_MIN_PCT", "1.0"))
         rr_min = float(os.getenv("RR_MIN", "2.0"))
 
-        # триггеры
         vol_mult = float(os.getenv("VOL_MULT", "2.0"))
         vol_sma_period = int(os.getenv("VOL_SMA_PERIOD", "20"))
         body_atr_mult = float(os.getenv("BODY_ATR_MULT", "0.6"))
         atr_period = int(os.getenv("ATR_PERIOD", "14"))
 
-        # сигналы
         signal_cooldown_sec = int(os.getenv("SIGNAL_COOLDOWN_SEC", "600"))
         signal_ttl_min = int(os.getenv("SIGNAL_TTL_MIN", "12"))
 
@@ -154,7 +146,6 @@ class Config:
             signal_ttl_min=signal_ttl_min,
         )
 
-        # Логируем ключевые настройки
         log.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.allowed_chat_ids)
         log.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.primary_recipients)
         log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%d", cfg.public_url, cfg.http_port)
@@ -190,15 +181,24 @@ class Config:
 # ------------------------------ BYBIT CLIENT --------------------------------
 
 class BybitClient:
+    """Ленивая инициализация aiohttp-сессии — создаём её уже внутри работающего event loop."""
     def __init__(self):
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        self._session: Optional[aiohttp.ClientSession] = None
         self._base = "https://api.bybit.com"
         self._headers = {"User-Agent": "CheCryptoSignalsBot/1.0"}
 
+    async def open(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+
     async def close(self):
-        await self._session.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self._session is None or self._session.closed:
+            await self.open()
+        assert self._session is not None
         url = f"{self._base}{path}"
         async with self._session.get(url, params=params, headers=self._headers) as r:
             r.raise_for_status()
@@ -219,7 +219,6 @@ class BybitClient:
             result = data.get("result", {})
             list_ = result.get("list", []) or []
             for it in list_:
-                # Оставляем только USDT контракты в perpetual
                 symbol = it.get("symbol", "")
                 contract = (it.get("contractType") or "").lower()
                 if symbol.endswith("USDT") and ("perpetual" in contract):
@@ -246,9 +245,9 @@ class BybitClient:
 
 class UniverseState:
     def __init__(self):
-        self.total_symbols: List[str] = []      # полный список вселенной
-        self.active_symbols: List[str] = []     # текущий активный батч
-        self.batch_index: int = 0               # индекс батча (для ротации)
+        self.total_symbols: List[str] = []
+        self.active_symbols: List[str] = []
+        self.batch_index: int = 0
 
     def batches(self, batch_size: int) -> List[List[str]]:
         out: List[List[str]] = []
@@ -278,14 +277,11 @@ class Engine:
         self.ws_started: bool = False
 
     async def bootstrap_universe(self):
-        """Грузим вселенную (фьючерсы USDT)."""
         try:
             instruments = await self.client.get_instruments_linear()
             symbols: List[str] = [it["symbol"] for it in instruments]
-            # Немного сортировки для стабильности
             symbols.sort()
             self.state.total_symbols = symbols
-            # Выставляем первый активный батч
             self.state.batch_index = 0
             self.state.active_symbols = symbols[: self.cfg.ws_symbols_max]
             log.info(
@@ -301,30 +297,22 @@ class Engine:
         total = len(self.state.total_symbols)
         active = len(self.state.active_symbols)
         batch = self.state.batch_index
-        ws_topics = active * 2  # placeholder: допустим по 2 топика на символ
+        ws_topics = active * 2  # placeholder
         return total, active, batch, ws_topics
 
-    # ----------------- Плейсхолдеры WS/аналитики (не ломаем) -----------------
-
     async def start_ws(self):
-        """Имитация запуска WS подписки (для логов)."""
-        if not self.state.active_symbols:
+        if not self.state.active_symbols or self.ws_started:
             return
-        if self.ws_started:
-            return
-        # Здесь могла бы быть реальная подписка на WS.
         self.ws_started = True
         log.info("INFO [ws] subscribed %d topics for %d symbols", len(self.state.active_symbols) * 2, len(self.state.active_symbols))
 
     async def poll_open_interest_once(self):
-        """Опрос OI для активных символов (берём скромный срез, чтобы не спамить API)."""
-        slice_n = min(20, len(self.state.active_symbols))  # ограничим запросы
+        slice_n = min(20, len(self.state.active_symbols))
         for sym in self.state.active_symbols[:slice_n]:
             with contextlib.suppress(Exception):
                 await self.client.get_open_interest(sym, interval="5min", limit=6)
 
     async def rotate_active(self):
-        """Ротация активного окна."""
         self.state.rotate(self.cfg.ws_symbols_max)
         log.info(
             "INFO [rotate] now active=%d (batch#%d)",
@@ -339,7 +327,6 @@ async def _handle_root(_request: web.Request) -> web.Response:
     return web.Response(text="ok", status=200)
 
 def start_http_server(port: int):
-    """Простой aiohttp сервер, чтобы Render видел открытый порт."""
     app = web.Application()
     app.router.add_get("/", _handle_root)
     runner = web.AppRunner(app)
@@ -348,11 +335,9 @@ def start_http_server(port: int):
         await runner.setup()
         site = web.TCPSite(runner, host="0.0.0.0", port=port)
         await site.start()
-        # держим сервер живым
         while True:
             await asyncio.sleep(3600)
 
-    # Фоновая таска в отдельном loop (создадим без блокировки основного)
     def _bg():
         asyncio.run(_run())
 
@@ -404,20 +389,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def job_health(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.application.bot_data["cfg"]
-    text = "online"
     for chat_id in cfg.primary_recipients:
         with contextlib.suppress(Exception):
-            await context.bot.send_message(chat_id, text)
+            await context.bot.send_message(chat_id, "online")
 
 async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.application.bot_data["cfg"]
     if not cfg.public_url or not cfg.self_ping_enabled:
         return
-    url = cfg.public_url
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            async with s.get(url) as r:
-                _ = await r.text()
+            async with s.get(cfg.public_url) as r:
+                await r.text()
     except Exception:
         pass
 
@@ -439,7 +422,6 @@ async def job_poll_oi(context: ContextTypes.DEFAULT_TYPE):
 def build_app(cfg: Config, eng: Engine) -> Application:
     app = ApplicationBuilder().token(cfg.token).build()
 
-    # Пишем в bot_data, т.к. user_data/chat_data — mappingproxy (read-only) на этапе билда
     app.bot_data["cfg"] = cfg
     app.bot_data["engine"] = eng
 
@@ -447,28 +429,20 @@ def build_app(cfg: Config, eng: Engine) -> Application:
     app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Планировщик задач
     jq = app.job_queue
-    # Старт WS через 10 секунд после старта
     jq.run_once(job_start_ws, when=10, name="job_start_ws")
-    # Ротация каждые ROTATE_MIN минут
     jq.run_repeating(job_rotate, interval=cfg.rotate_min * 60, first=cfg.rotate_min * 60, name="job_rotate")
-    # Опрос OI раз в 60 секунд
     jq.run_repeating(job_poll_oi, interval=60, first=30, name="job_poll_oi")
-    # Health сообщения каждые 20 минут (по умолчанию)
     jq.run_repeating(job_health, interval=cfg.health_interval_sec, first=cfg.health_first_sec, name="job_health")
-    # Self-ping Render (если задан PUBLIC_URL)
     jq.run_repeating(job_self_ping, interval=cfg.self_ping_interval_sec, first=90, name="job_self_ping")
 
     return app
 
 
 async def initialize_bootstrap(app: Application):
-    """Начальная инициализация: грузим вселенную и отправляем привет."""
     cfg: Config = app.bot_data["cfg"]
     eng: Engine = app.bot_data["engine"]
     await eng.bootstrap_universe()
-
     for chat_id in cfg.primary_recipients:
         with contextlib.suppress(Exception):
             total, active, batch, ws_topics = eng.universe_stats()
@@ -484,7 +458,7 @@ def main():
     if not cfg.token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
-    # Поднимаем HTTP-порт (обязателен для Render web-сервиса)
+    # Поднимаем HTTP-порт (чтобы Render видел открытый порт)
     start_http_server(cfg.http_port)
 
     client = BybitClient()
@@ -492,14 +466,16 @@ def main():
     app = build_app(cfg, engine)
 
     async def runner():
-        # Сразу снимаем webhook (на всякий случай, чтобы точно работать через polling)
+        # на всякий случай уберём webhook
         with contextlib.suppress(Exception):
             await app.bot.delete_webhook(drop_pending_updates=True)
 
-        # Предзагрузка данных
+        # лениво откроем сессию клиента (внутри работающего loop)
+        await client.open()
+
+        # предзагрузка
         await initialize_bootstrap(app)
 
-        # Функция старта polling с авто-ретраем при Conflict
         async def start_polling_with_retry():
             backoff = 5
             while True:
@@ -514,7 +490,6 @@ def main():
                     return
                 except Conflict as e:
                     log.warning("Polling conflict: %s — retry in %ss", e, backoff)
-                    # Аккуратно закрываем частично поднятое приложение
                     with contextlib.suppress(Exception):
                         await app.updater.stop()
                     with contextlib.suppress(Exception):
@@ -535,10 +510,8 @@ def main():
 
         try:
             await start_polling_with_retry()
-            # держим процесс живым; polling крутится в фоне
             await asyncio.Event().wait()
         finally:
-            # корректное закрытие
             with contextlib.suppress(Exception):
                 await client.close()
             with contextlib.suppress(Exception):
