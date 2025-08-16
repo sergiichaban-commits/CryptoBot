@@ -47,8 +47,10 @@ HARDCODED_ENV = {
     # Минутные отчёты отключены
     "SNAPSHOT_ENABLED": "0",
 
-    # Минимальный R/R для публикации сигнала
+    # Фильтры сигналов
     "RR_MIN": "2.0",
+    "MIN_PROFIT_PCT": "2.0",     # минимальная ожидаемая прибыль (%)
+    "MIN_CONFIDENCE": "75",      # минимальная уверенность (0..100)
 
     # HTTP порт
     "PORT": "10000",
@@ -120,8 +122,10 @@ HEALTH_INTERVAL_SEC = int(os.environ.get("HEALTH_INTERVAL_SEC", "3600"))
 ENGINE_INTERVAL_SEC = int(os.environ.get("ENGINE_INTERVAL_SEC", "60"))
 SNAPSHOT_ENABLED = (os.environ.get("SNAPSHOT_ENABLED", "0") != "0")
 
-# Минимальный R/R для публикации сигнала
+# Фильтры сигналов
 RR_MIN = float(os.environ.get("RR_MIN", "2.0"))
+MIN_PROFIT_PCT = float(os.environ.get("MIN_PROFIT_PCT", "2.0"))
+MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "75"))
 
 print(f"[info] ALLOWED_CHAT_IDS = {sorted(ALLOWED_CHAT_IDS)}")
 print(f"[info] TELEGRAM_CHAT_ID(raw) = '{os.environ.get('TELEGRAM_CHAT_ID', '')}'")
@@ -134,7 +138,7 @@ print(f"[info] Volume trigger params: VOL_MULT={VOL_MULT}, VOL_SMA_PERIOD={VOL_S
       f"BODY_ATR_MULT={BODY_ATR_MULT}, ATR_PERIOD={ATR_PERIOD}, COOLDOWN={ALERT_COOLDOWN_SEC}s, RECENCY={RECENCY_MAX_SEC}s")
 print(f"[info] AutoVol: enabled={AUTO_VOL_ENABLED}, topN={AUTO_VOL_TOP_N}, "
       f"scan={AUTO_VOL_SCAN_COUNT}, time={AUTO_VOL_UTC_HOUR:02d}:{AUTO_VOL_UTC_MIN:02d}Z, max={MAX_SYMBOLS}")
-print(f"[info] Filters: RR_MIN={RR_MIN}")
+print(f"[info] Filters: RR_MIN={RR_MIN}, MIN_PROFIT_PCT={MIN_PROFIT_PCT}%, MIN_CONFIDENCE={MIN_CONFIDENCE}")
 
 # ====================== STATE & MODELS ======================
 
@@ -375,8 +379,8 @@ def conf_to_prob_pct(conf: int) -> float:
       50 -> ~55%, 60 -> ~62%, 70 -> ~69%, 80 -> ~76%, 90 -> ~83%, 100 -> ~90%
     Сделано, чтобы не обещать экстремальные проценты без статистической калибровки.
     """
-    p = 0.55 + (conf - 50) * 0.007  # шаг ~0.7% за 1 пункт confidence сверх 50
-    p = max(0.45, min(0.90, p))     # ограничим разумными рамками
+    p = 0.55 + (conf - 50) * 0.007
+    p = max(0.45, min(0.90, p))
     return round(p * 100.0, 1)
 
 # ====================== ENGINE ======================
@@ -715,9 +719,16 @@ async def job_engine(context: ContextTypes.DEFAULT_TYPE):
     sigs: List[Signal] = []
     for sym in syms:
         sig = await evaluate_symbol(sym)
-        # ---- ФИЛЬТР ПО R/R ----
-        if sig and sig.rr_ratio >= RR_MIN:
-            sigs.append(sig)
+        # ---- ФИЛЬТРЫ: R/R, минимум прибыли, минимум уверенности ----
+        if not sig:
+            continue
+        if sig.rr_ratio < RR_MIN:
+            continue
+        if abs(sig.pct_tp) < MIN_PROFIT_PCT:
+            continue
+        if sig.confidence < MIN_CONFIDENCE:
+            continue
+        sigs.append(sig)
     # если пусто — НИЧЕГО не отправляем
     await send_signals(app, sigs)
 
@@ -838,7 +849,8 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     syms = await STATE.get_symbols()
     auto_line = f"AutoVol: {'ON' if AUTO_VOL_ENABLED else 'OFF'}, topN={AUTO_VOL_TOP_N}, scan={AUTO_VOL_SCAN_COUNT}, max={MAX_SYMBOLS}"
-    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n{auto_line}\nFilters: RR_MIN={RR_MIN}")
+    await safe_reply(update, f"ChaSerBot (webhook)\nSymbols: {', '.join(syms)}\nWhitelist: {', '.join(map(str, ALLOWED_CHAT_IDS))}\n"
+                             f"{auto_line}\nFilters: RR_MIN={RR_MIN}, MIN_PROFIT_PCT={MIN_PROFIT_PCT}%, MIN_CONFIDENCE={MIN_CONFIDENCE}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id not in ALLOWED_CHAT_IDS:
