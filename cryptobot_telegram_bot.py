@@ -41,17 +41,15 @@ SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
 HTTP_PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 if not PUBLIC_URL:
-    # На всякий случай — не критично для отправки сигналов, но вебхук без URL не стартанёт
     print("[warn] PUBLIC_URL/RENDER_EXTERNAL_URL is empty — set PUBLIC_URL in env if webhook fails.")
 
 # Секрет для пути вебхука (не токен, чтобы не светить его в URL)
 WEBHOOK_PATH_SECRET = os.environ.get("WEBHOOK_SECRET", "wh-" + os.environ.get("TELEGRAM_BOT_TOKEN", "")[:8])
 WEBHOOK_PATH = f"/{WEBHOOK_PATH_SECRET}"
-# Доп. секрет заголовка X-Telegram-Bot-Api-Secret-Token (опционально, повысит безопасность)
+# Доп. секрет заголовка X-Telegram-Bot-Api-Secret-Token (опционально)
 WEBHOOK_HEADER_SECRET = os.environ.get("WEBHOOK_SECRET_TOKEN", None)
 
 def _parse_id_list(value: str) -> List[int]:
-    """Парсер chat_id, устойчивый к пробелам/кавычкам."""
     out: List[int] = []
     if not value:
         return out
@@ -261,27 +259,16 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
     if not PUBLIC_URL:
         print("[error] PUBLIC_URL not detected. Set env PUBLIC_URL to your Render URL (e.g. https://yourapp.onrender.com)")
-        # не выходим, но вебхук не поднимется — сообщения из чатов не нужны для сигналов
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.ALL, ignore_all))
 
-    # Гарантированно отключаем старый вебхук и чистим очередь перед установкой нового
-    # (run_webhook тоже умеет drop_pending_updates, но пусть будет явно)
-    try:
-        import asyncio as _asyncio
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
-        loop.close()
-        print("[info] Webhook deleted, pending updates dropped.")
-    except Exception as e:
-        print(f"[warn] delete_webhook failed: {e}")
-
-    if PUBLIC_URL:
-        webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+    # Никаких ручных манипуляций с event loop.
+    # run_webhook сам поднимет сервер и установит вебхук на PUBLIC_URL + WEBHOOK_PATH.
+    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}" if PUBLIC_URL else None
+    if webhook_url:
         print(f"[info] Setting webhook to: {webhook_url}")
         app.run_webhook(
             listen="0.0.0.0",
@@ -291,13 +278,11 @@ def main():
             secret_token=WEBHOOK_HEADER_SECRET,  # можно оставить None
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
+            stop_signals=None,  # не трогаем системные сигналы → меньше проблем в контейнерах
         )
     else:
-        # Фолбэк (на случай отсутствия PUBLIC_URL): не поднимаем вебхук.
-        # Сигналы Bybit и health будут работать, но команды /start /status — нет.
-        # Лучше задать PUBLIC_URL в окружении Render.
+        # Фолбэк: если нет PUBLIC_URL, просто держим процесс живым (сигналы Bybit + health работают).
         print("[warn] PUBLIC_URL is missing — webhook disabled. Signals still work.")
-        # Чтобы цикл не завершился:
         try:
             asyncio.get_event_loop().run_forever()
         except KeyboardInterrupt:
