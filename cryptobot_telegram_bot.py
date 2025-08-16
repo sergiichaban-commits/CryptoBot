@@ -3,6 +3,8 @@
 
 import os
 import re
+import math
+import time
 import asyncio
 import contextlib
 import logging
@@ -22,16 +24,16 @@ from telegram.ext import (
 from telegram.error import Conflict
 
 
-# ------------------------------- ЛОГИ --------------------------------------
+# =============================== ЛОГИ =======================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("chebot")
 
 
-# ---------------------------- КОНФИГ И ENV ---------------------------------
+# ============================ КОНФИГ И ENV ==================================
 
 def _parse_int_list(s: str) -> List[int]:
     out: List[int] = []
@@ -64,25 +66,28 @@ class Config:
     self_ping_enabled: bool = True
 
     # Вселенная и ротация
-    universe_mode: str = "all"
-    universe_top_n: int = 15
-    ws_symbols_max: int = 60
-    rotate_min: int = 5
+    universe_mode: str = "all"          # сейчас мониторим все linear USDT perpetual на Bybit
+    universe_top_n: int = 15            # не используется в all, оставлено на будущее
+    ws_symbols_max: int = 60            # активный батч
+    rotate_min: int = 5                 # ротируем батч каждые N минут
 
     # Фильтры сигналов
     prob_min: float = 69.9
     profit_min_pct: float = 1.0
     rr_min: float = 2.0
 
-    # Триггеры/параметры (информационно)
+    # Триггеры/параметры анализа
     vol_mult: float = 2.0
     vol_sma_period: int = 20
-    body_atr_mult: float = 0.6
+    body_atr_mult: float = 0.60
     atr_period: int = 14
 
-    # Сигнал-сервис
+    # Сервис сигналов
     signal_cooldown_sec: int = 600
     signal_ttl_min: int = 12
+    scan_interval_sec: int = 45
+    scan_batch_limit: int = 10          # сколько символов сканируем за один прогон
+    max_signals_per_run: int = 6        # чтобы не заспамить
 
     @staticmethod
     def load() -> "Config":
@@ -120,6 +125,9 @@ class Config:
 
         signal_cooldown_sec = int(os.getenv("SIGNAL_COOLDOWN_SEC", "600"))
         signal_ttl_min = int(os.getenv("SIGNAL_TTL_MIN", "12"))
+        scan_interval_sec = int(os.getenv("SCAN_INTERVAL_SEC", "45"))
+        scan_batch_limit = int(os.getenv("SCAN_BATCH_LIMIT", "10"))
+        max_signals_per_run = int(os.getenv("MAX_SIGNALS_PER_RUN", "6"))
 
         cfg = Config(
             token=token,
@@ -144,6 +152,9 @@ class Config:
             atr_period=atr_period,
             signal_cooldown_sec=signal_cooldown_sec,
             signal_ttl_min=signal_ttl_min,
+            scan_interval_sec=scan_interval_sec,
+            scan_batch_limit=scan_batch_limit,
+            max_signals_per_run=max_signals_per_run,
         )
 
         log.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.allowed_chat_ids)
@@ -151,37 +162,28 @@ class Config:
         log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%d", cfg.public_url, cfg.http_port)
         log.info(
             "INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=%s/%ss",
-            cfg.health_interval_sec,
-            cfg.health_first_sec,
-            cfg.self_ping_enabled,
-            cfg.self_ping_interval_sec,
+            cfg.health_interval_sec, cfg.health_first_sec,
+            cfg.self_ping_enabled, cfg.self_ping_interval_sec,
         )
         log.info(
-            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s UNIVERSE_TOP_N=%d WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
-            cfg.signal_cooldown_sec,
-            cfg.signal_ttl_min,
-            cfg.universe_mode,
-            cfg.universe_top_n,
-            cfg.ws_symbols_max,
-            cfg.rotate_min,
-            cfg.prob_min,
-            cfg.profit_min_pct,
-            cfg.rr_min,
+            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d UNIVERSE_MODE=%s UNIVERSE_TOP_N=%d "
+            "WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+            cfg.signal_cooldown_sec, cfg.signal_ttl_min,
+            cfg.universe_mode, cfg.universe_top_n,
+            cfg.ws_symbols_max, cfg.rotate_min,
+            cfg.prob_min, cfg.profit_min_pct, cfg.rr_min,
         )
         log.info(
             "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
-            cfg.vol_mult,
-            cfg.vol_sma_period,
-            cfg.body_atr_mult,
-            cfg.atr_period,
+            cfg.vol_mult, cfg.vol_sma_period, cfg.body_atr_mult, cfg.atr_period,
         )
         return cfg
 
 
-# ------------------------------ BYBIT CLIENT --------------------------------
+# ============================== BYBIT CLIENT =================================
 
 class BybitClient:
-    """Ленивая инициализация aiohttp-сессии — создаём её уже внутри работающего event loop."""
+    """Ленивая инициализация aiohttp-сессии в работающем event loop."""
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._base = "https://api.bybit.com"
@@ -202,11 +204,9 @@ class BybitClient:
         url = f"{self._base}{path}"
         async with self._session.get(url, params=params, headers=self._headers) as r:
             r.raise_for_status()
-            data = await r.json()
-            return data
+            return await r.json()
 
     async def get_instruments_linear(self) -> List[Dict[str, Any]]:
-        """Все фьючерсные линейные USDT инструменты (category=linear)."""
         instruments: List[Dict[str, Any]] = []
         cursor = None
         while True:
@@ -217,11 +217,10 @@ class BybitClient:
             if str(data.get("retCode")) != "0":
                 break
             result = data.get("result", {})
-            list_ = result.get("list", []) or []
-            for it in list_:
+            for it in (result.get("list") or []):
                 symbol = it.get("symbol", "")
-                contract = (it.get("contractType") or "").lower()
-                if symbol.endswith("USDT") and ("perpetual" in contract):
+                ctype = (it.get("contractType") or "").lower()
+                if symbol.endswith("USDT") and "perpetual" in ctype:
                     instruments.append(it)
             cursor = result.get("nextPageCursor") or None
             if not cursor:
@@ -241,7 +240,7 @@ class BybitClient:
         )
 
 
-# ----------------------------- ДЕРЖАТЕЛЬ СОСТОЯНИЯ --------------------------
+# ============================ СОСТОЯНИЕ/ВСЕЛЕННАЯ ============================
 
 class UniverseState:
     def __init__(self):
@@ -269,12 +268,221 @@ class UniverseState:
         self.active_symbols = batches[self.batch_index]
 
 
+# ======================== АНАЛИЗАТОР И ГЕНЕРАТОР СИГНАЛОВ ====================
+
+def _sma(values: List[float], period: int) -> float:
+    if len(values) < period or period <= 0:
+        return sum(values) / max(1, len(values))
+    return sum(values[-period:]) / period
+
+def _atr_from_ohlc(ohlc: List[Tuple[float,float,float,float]], period: int) -> float:
+    if len(ohlc) < period + 1:
+        period = max(1, min(period, len(ohlc)-1))
+    trs: List[float] = []
+    for i in range(1, len(ohlc)):
+        prev_close = ohlc[i-1][3]
+        high = ohlc[i][1]
+        low = ohlc[i][2]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        trs.append(tr)
+    if not trs:
+        return 0.0
+    if len(trs) < period:
+        return sum(trs) / len(trs)
+    return sum(trs[-period:]) / period
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+@dataclass
+class Signal:
+    symbol: str
+    side: str  # "LONG" / "SHORT"
+    price: float
+    entry: float
+    take: float
+    stop: float
+    profit_pct: float
+    rr: float
+    prob: float
+
+    def fmt(self) -> str:
+        if self.side == "LONG":
+            take_pct = (self.take - self.entry) / self.entry * 100.0
+            stop_pct = (self.stop - self.entry) / self.entry * 100.0
+        else:
+            take_pct = (self.entry - self.take) / self.entry * 100.0
+            stop_pct = (self.entry - self.stop) / self.entry * 100.0
+        dir_ru = "ЛОНГ" if self.side == "LONG" else "ШОРТ"
+        return (
+            f"#{self.symbol} — {dir_ru}\n"
+            f"Текущая: {self.price:.6g}\n"
+            f"Вход: {self.entry:.6g}\n"
+            f"Тейк: {self.take:.6g} ({take_pct:+.2f}%)\n"
+            f"Стоп: {self.stop:.6g} ({stop_pct:+.2f}%)\n"
+            f"R/R: {self.rr:.2f} | Вероятность: {self.prob:.1f}%"
+        )
+
+
+class Analyzer:
+    def __init__(self, cfg: Config, client: BybitClient):
+        self.cfg = cfg
+        self.client = client
+
+    @staticmethod
+    def _parse_kline(data: Dict[str, Any]) -> Tuple[List[Tuple[float,float,float,float]], List[float]]:
+        """Возвращает [(o,h,l,c)], [volume]."""
+        result = data.get("result", {})
+        kl = result.get("list") or []
+        ohlc: List[Tuple[float,float,float,float]] = []
+        vol: List[float] = []
+        # Bybit v5 kline item: [start, open, high, low, close, volume, turnover]
+        for row in kl:
+            try:
+                o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4]); v = float(row[5])
+                ohlc.append((o,h,l,c)); vol.append(v)
+            except Exception:
+                continue
+        ohlc.reverse(); vol.reverse()   # от старых к новым -> перевернём к хронологическому
+        return ohlc, vol
+
+    @staticmethod
+    def _parse_oi(data: Dict[str, Any]) -> List[Tuple[int,float]]:
+        """Список [(ts, oi)]."""
+        result = data.get("result", {})
+        lst = result.get("list") or []
+        out: List[Tuple[int,float]] = []
+        for row in lst:
+            try:
+                ts = int(row[0])
+                oi = float(row[1])
+                out.append((ts, oi))
+            except Exception:
+                continue
+        out.sort(key=lambda x: x[0])  # по времени
+        return out
+
+    async def analyze_symbol(self, symbol: str) -> Optional[Signal]:
+        # Kline
+        kline = await self.client.get_kline_5m(symbol, limit=120)
+        ohlc, vol = self._parse_kline(kline)
+        if not ohlc or not vol or len(ohlc) < max(self.cfg.atr_period+1, self.cfg.vol_sma_period+1):
+            return None
+        last_o, last_h, last_l, last_c = ohlc[-1]
+        price = last_c
+
+        # ATR/объём
+        atr = _atr_from_ohlc(ohlc, self.cfg.atr_period)
+        vol_sma = _sma(vol, self.cfg.vol_sma_period)
+        vol_spike = vol[-1] > (vol_sma * self.cfg.vol_mult)
+
+        # Свечное тело vs ATR
+        body = abs(last_c - last_o)
+        body_ok = body > (self.cfg.body_atr_mult * max(1e-12, atr))
+
+        # Простейший тренд: SMA10 vs SMA20
+        closes = [c for (_,_,_,c) in ohlc]
+        sma_fast = _sma(closes, 10)
+        sma_slow = _sma(closes, 20)
+        trend_up = sma_fast > sma_slow
+        trend_down = sma_fast < sma_slow
+
+        # OI тренд
+        oi_raw = await self.client.get_open_interest(symbol, interval="5min", limit=6)
+        oi_series = self._parse_oi(oi_raw)
+        oi_up = False; oi_down = False
+        if len(oi_series) >= 2:
+            oi_up = oi_series[-1][1] > oi_series[-2][1]
+            oi_down = oi_series[-1][1] < oi_series[-2][1]
+
+        # Сторона
+        long_score = 0.0
+        short_score = 0.0
+
+        if vol_spike:  # объёмный импульс
+            long_score += 0.2
+            short_score += 0.2
+        if body_ok:  # импульсное тело
+            # если close выше open — вклад в лонг, иначе — в шорт
+            if last_c >= last_o:
+                long_score += 0.25
+            else:
+                short_score += 0.25
+        if trend_up:
+            long_score += 0.25
+        if trend_down:
+            short_score += 0.25
+        if oi_up:
+            if last_c >= last_o:
+                long_score += 0.3
+            else:
+                short_score += 0.1  # рост OI на красной свече — неоднозначно
+        if oi_down:
+            if last_c < last_o:
+                short_score += 0.3
+            else:
+                long_score += 0.1
+
+        if long_score < short_score:
+            side = "SHORT"
+            # базовые уровни из ATR
+            entry = price + 0.10 * atr
+            take  = price - 2.40 * atr
+            stop  = price + 1.20 * atr
+            rr = (entry - take) / max(1e-12, (stop - entry))
+            profit_pct = (entry - take) / max(1e-12, entry) * 100.0
+            raw_prob = 50.0 + (short_score - long_score) * 100.0
+        else:
+            side = "LONG"
+            entry = price - 0.10 * atr
+            take  = price + 2.40 * atr
+            stop  = price - 1.20 * atr
+            rr = (take - entry) / max(1e-12, (entry - stop))
+            profit_pct = (take - entry) / max(1e-12, entry) * 100.0
+            raw_prob = 50.0 + (long_score - short_score) * 100.0
+
+        prob = _clamp(raw_prob, 0.0, 100.0)
+
+        # Защита от нулевых/битых данных
+        if any(math.isnan(x) or math.isinf(x) for x in (price, entry, take, stop, rr, profit_pct, prob)):
+            return None
+
+        # Фильтры
+        if prob < self.cfg.prob_min:
+            return None
+        if rr < self.cfg.rr_min:
+            return None
+        if profit_pct < self.cfg.profit_min_pct:
+            return None
+
+        return Signal(
+            symbol=symbol,
+            side=side,
+            price=price,
+            entry=entry,
+            take=take,
+            stop=stop,
+            profit_pct=profit_pct,
+            rr=rr,
+            prob=prob,
+        )
+
+
+# ================================ ДВИЖОК =====================================
+
 class Engine:
     def __init__(self, cfg: Config, client: BybitClient):
         self.cfg = cfg
         self.client = client
         self.state = UniverseState()
         self.ws_started: bool = False
+        self.last_sent_ts: Dict[str, float] = {}  # символ -> последняя отправка
+
+        self.analyzer = Analyzer(cfg, client)
 
     async def bootstrap_universe(self):
         try:
@@ -301,6 +509,7 @@ class Engine:
         return total, active, batch, ws_topics
 
     async def start_ws(self):
+        # пока без реального ws — только логирование
         if not self.state.active_symbols or self.ws_started:
             return
         self.ws_started = True
@@ -320,8 +529,30 @@ class Engine:
             self.state.batch_index,
         )
 
+    def _cooldown_ok(self, symbol: str, now_ts: float) -> bool:
+        last = self.last_sent_ts.get(symbol, 0.0)
+        return (now_ts - last) >= self.cfg.signal_cooldown_sec
 
-# ---------------------------- HTTP HEALTH SERVER ----------------------------
+    def _mark_sent(self, symbol: str, ts: float):
+        self.last_sent_ts[symbol] = ts
+
+    async def scan_active(self) -> List[Signal]:
+        if not self.state.active_symbols:
+            return []
+        # Сканируем ограниченное число символов за прогон
+        to_scan = self.state.active_symbols[: self.cfg.scan_batch_limit]
+        results: List[Signal] = []
+        for sym in to_scan:
+            with contextlib.suppress(Exception):
+                sig = await self.analyzer.analyze_symbol(sym)
+                if sig:
+                    results.append(sig)
+        # сортировка и ограничение
+        results.sort(key=lambda s: s.prob, reverse=True)
+        return results[: self.cfg.max_signals_per_run]
+
+
+# ============================ HTTP HEALTH SERVER =============================
 
 async def _handle_root(_request: web.Request) -> web.Response:
     return web.Response(text="ok", status=200)
@@ -346,7 +577,7 @@ def start_http_server(port: int):
     t.start()
 
 
-# ------------------------------ HANDLERS ------------------------------------
+# =============================== HANDLERS ====================================
 
 def is_allowed(cfg: Config, chat_id: int) -> bool:
     return (not cfg.allowed_chat_ids) or (chat_id in cfg.allowed_chat_ids)
@@ -384,8 +615,44 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Вселенная: total={total}, active={active}, batch#{batch}, ws_topics={ws_topics}"
     )
 
+async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.application.bot_data["cfg"]
+    if update.effective_chat and not is_allowed(cfg, update.effective_chat.id):
+        return
+    await update.effective_message.reply_text(
+        "Фильтры сигналов:\n"
+        f"- Вероятность ≥ {cfg.prob_min:.1f}%\n"
+        f"- Ожидаемая прибыль ≥ {cfg.profit_min_pct:.2f}%\n"
+        f"- R/R ≥ {cfg.rr_min:.2f}\n"
+        f"- Кулдаун: {cfg.signal_cooldown_sec}s\n"
+        f"- Батч сканирования: {cfg.scan_batch_limit} тикеров / {cfg.scan_interval_sec}s"
+    )
 
-# --------------------------- JOB QUEUE CALLBACKS ----------------------------
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной прогон сканера по активному батчу. Подчиняется тем же фильтрам и кулдауну."""
+    cfg: Config = context.application.bot_data["cfg"]
+    eng: Engine = context.application.bot_data["engine"]
+    if update.effective_chat and not is_allowed(cfg, update.effective_chat.id):
+        return
+
+    await update.effective_message.reply_text("Сканирую активный батч…")
+    signals = await eng.scan_active()
+    now_ts = time.time()
+    sent = 0
+    for sig in signals:
+        if not eng._cooldown_ok(sig.symbol, now_ts):
+            continue
+        text = sig.fmt()
+        for chat_id in cfg.primary_recipients:
+            with contextlib.suppress(Exception):
+                await context.bot.send_message(chat_id, text)
+        eng._mark_sent(sig.symbol, now_ts)
+        sent += 1
+    if sent == 0:
+        await update.effective_message.reply_text("Сетапов, удовлетворяющих фильтрам, сейчас нет.")
+
+
+# ========================== JOB QUEUE CALLBACKS ==============================
 
 async def job_health(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.application.bot_data["cfg"]
@@ -416,8 +683,34 @@ async def job_poll_oi(context: ContextTypes.DEFAULT_TYPE):
     eng: Engine = context.application.bot_data["engine"]
     await eng.poll_open_interest_once()
 
+async def job_scan(context: ContextTypes.DEFAULT_TYPE):
+    """Автоскан раз в cfg.scan_interval_sec."""
+    cfg: Config = context.application.bot_data["cfg"]
+    eng: Engine = context.application.bot_data["engine"]
 
-# ------------------------------ APP/MAIN ------------------------------------
+    try:
+        signals = await eng.scan_active()
+    except Exception as e:
+        log.warning("scan_active error: %s", e)
+        return
+
+    now_ts = time.time()
+    sent_count = 0
+    for sig in signals:
+        if not eng._cooldown_ok(sig.symbol, now_ts):
+            continue
+        text = sig.fmt()
+        for chat_id in cfg.primary_recipients:
+            with contextlib.suppress(Exception):
+                await context.bot.send_message(chat_id, text)
+        eng._mark_sent(sig.symbol, now_ts)
+        sent_count += 1
+
+    if sent_count:
+        log.info("INFO [signals] sent=%d", sent_count)
+
+
+# ================================ APP/MAIN ===================================
 
 def build_app(cfg: Config, eng: Engine) -> Application:
     app = ApplicationBuilder().token(cfg.token).build()
@@ -428,6 +721,8 @@ def build_app(cfg: Config, eng: Engine) -> Application:
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("filters", cmd_filters))
+    app.add_handler(CommandHandler("scan", cmd_scan))
 
     jq = app.job_queue
     jq.run_once(job_start_ws, when=10, name="job_start_ws")
@@ -435,6 +730,7 @@ def build_app(cfg: Config, eng: Engine) -> Application:
     jq.run_repeating(job_poll_oi, interval=60, first=30, name="job_poll_oi")
     jq.run_repeating(job_health, interval=cfg.health_interval_sec, first=cfg.health_first_sec, name="job_health")
     jq.run_repeating(job_self_ping, interval=cfg.self_ping_interval_sec, first=90, name="job_self_ping")
+    jq.run_repeating(job_scan, interval=cfg.scan_interval_sec, first=20, name="job_scan")
 
     return app
 
@@ -458,7 +754,7 @@ def main():
     if not cfg.token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
-    # Поднимаем HTTP-порт (чтобы Render видел открытый порт)
+    # Открываем порт для Render (healthcheck)
     start_http_server(cfg.http_port)
 
     client = BybitClient()
@@ -466,14 +762,11 @@ def main():
     app = build_app(cfg, engine)
 
     async def runner():
-        # на всякий случай уберём webhook
+        # снимаем webhook на всякий пожарный
         with contextlib.suppress(Exception):
             await app.bot.delete_webhook(drop_pending_updates=True)
 
-        # лениво откроем сессию клиента (внутри работающего loop)
         await client.open()
-
-        # предзагрузка
         await initialize_bootstrap(app)
 
         async def start_polling_with_retry():
