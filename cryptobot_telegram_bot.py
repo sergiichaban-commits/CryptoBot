@@ -1,9 +1,11 @@
 """
-CryptoBot — Bybit 1m Candles Test (Render-ready, JobQueue)
-- Secure: whitelist chat_ids
+CryptoBot — Bybit 1m Candles Test (Render-ready, JobQueue, robust env parsing)
+- Secure: whitelist chat_ids (env: ALLOWED_CHAT_IDS)
+- Recipients from TELEGRAM_CHAT_ID filtered by whitelist
 - Health-check every 60 minutes (JobQueue)
-- Bybit WS: kline.1 <SYMBOL>
+- Bybit WS: kline.1 <SYMBOL> (env: BYBIT_SYMBOL, default BTCUSDT)
 - Sends a compact candle summary every 5 minutes (on confirmed candle)
+- Render: run as Background Worker with Start Command: `python cryptobot_telegram_bot.py`
 """
 
 import os
@@ -23,33 +25,51 @@ from telegram.ext import (
 )
 
 # ---------------- Config / Security ----------------
-ALLOWED_DEFAULT: Set[int] = {533232884, -1002870952333}  # ты и твой канал
-PING_INTERVAL_MIN = 60
-POST_EVERY_N_MIN = 5           # отправляем сводку раз в 5 минут
+
+# По умолчанию whitelist включает тебя и твой канал ChaSerBot
+ALLOWED_DEFAULT: Set[int] = {533232884, -1002870952333}
+
+PING_INTERVAL_MIN = 60          # как часто слать "🟢 online"
+POST_EVERY_N_MIN = 5            # сводка свечей раз в N минут
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT")
+SYMBOL = os.environ.get("BYBIT_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
+
 
 def _parse_id_list(value: str) -> List[int]:
+    """
+    Устойчивый к лишним пробелам и кавычкам парсер списков chat_id.
+    Пример: " 533232884 , '-1002870952333' " -> [533232884, -1002870952333]
+    """
     out: List[int] = []
     if not value:
         return out
     for part in value.split(","):
-        part = part.strip()
+        part = part.strip().strip('"').strip("'")
         if not part:
             continue
         try:
             out.append(int(part))
         except Exception:
-            pass
+            print(f"[warn] cannot parse chat id from: {repr(part)}")
     return out
+
 
 ALLOWED_CHAT_IDS: Set[int] = set(_parse_id_list(os.environ.get("ALLOWED_CHAT_IDS", ""))) or ALLOWED_DEFAULT
 RECIPIENTS: List[int] = [cid for cid in _parse_id_list(os.environ.get("TELEGRAM_CHAT_ID", "")) if cid in ALLOWED_CHAT_IDS]
 
+# Диагностика в логи Render
+print(f"[info] ALLOWED_CHAT_IDS = {sorted(ALLOWED_CHAT_IDS)}")
+print(f"[info] TELEGRAM_CHAT_ID(raw) = {os.environ.get('TELEGRAM_CHAT_ID', '')!r}")
+print(f"[info] RECIPIENTS (whitelisted) = {RECIPIENTS}")
+print(f"[info] BYBIT_SYMBOL = {SYMBOL!r}")
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
 # ---------------- Handlers (whitelist) ----------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id not in ALLOWED_CHAT_IDS:
@@ -74,7 +94,9 @@ async def ignore_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in ALLOWED_CHAT_IDS:
         return
 
+
 # ---------------- Bybit WS consumer ----------------
+
 async def bybit_candles(application: Application):
     """
     Подписка на kline.1.<SYMBOL>.
@@ -83,6 +105,7 @@ async def bybit_candles(application: Application):
     last_posted_min: Optional[int] = None
 
     async def send_summary(candle: dict):
+        # item keys: start, end, open, high, low, close, volume, turnover, confirm
         o = float(candle["open"]); h = float(candle["high"]); l = float(candle["low"]); c = float(candle["close"])
         v = float(candle["volume"])
         ts = int(candle["end"])  # ms
@@ -117,10 +140,14 @@ async def bybit_candles(application: Application):
                                 await send_summary(item)
         except Exception as e:
             print("[warn] WS reconnecting due to:", e)
-            await asyncio.sleep(3)
+            await asyncio.sleep(3)  # backoff и переподключение
+
 
 # ---------------- Jobs (JobQueue) ----------------
+
 async def health_job(context: ContextTypes.DEFAULT_TYPE):
+    if not RECIPIENTS:
+        return
     for cid in RECIPIENTS:
         try:
             await context.bot.send_message(chat_id=cid, text="🟢 online", disable_notification=True)
@@ -131,17 +158,35 @@ async def start_ws_job(context: ContextTypes.DEFAULT_TYPE):
     # Запускаем длинную фоновую корутину уже ПОСЛЕ старта приложения
     context.application.create_task(bybit_candles(context.application))
 
+
 # ---------------- App lifecycle ----------------
+
 async def post_init(application: Application):
+    # Если получателей нет — логируем и пытаемся уведомить fallback (не роняем сервис)
     if not RECIPIENTS:
-        raise RuntimeError("TELEGRAM_CHAT_ID пуст или не в whitelist. Проверь переменные окружения.")
-    # Стартовое сообщение (короткое — допустимо в post_init)
+        print("[error] RECIPIENTS is empty. Check TELEGRAM_CHAT_ID and ALLOWED_CHAT_IDS env vars.")
+        fallback = [x for x in ALLOWED_DEFAULT if x in ALLOWED_CHAT_IDS]
+        for cid in fallback:
+            try:
+                await application.bot.send_message(
+                    chat_id=cid,
+                    text="❗ Нет валидного TELEGRAM_CHAT_ID на Render. Проверь переменные окружения."
+                )
+            except Exception as e:
+                print(f"[warn] cannot notify fallback {cid}: {e}")
+        # даже без получателей планируем запуск WS — он не будет spam'ить, т.к. RECIPIENTS пуст
+        application.job_queue.run_once(start_ws_job, when=timedelta(seconds=2), name="start_ws")
+        application.job_queue.run_repeating(health_job, interval=timedelta(minutes=PING_INTERVAL_MIN),
+                                            first=timedelta(minutes=1), name="health")
+        return
+
+    # Нормальный путь: уведомление о старте и планирование задач
     for cid in RECIPIENTS:
         try:
             await application.bot.send_message(chat_id=cid, text=f"✅ Render: бот запущен. Symbol={SYMBOL}")
         except Exception as e:
             print(f"[warn] startup -> {cid}: {e}")
-    # Планируем задачи через JobQueue (никаких create_task до запуска!)
+
     application.job_queue.run_repeating(
         health_job,
         interval=timedelta(minutes=PING_INTERVAL_MIN),
@@ -154,15 +199,17 @@ async def post_init(application: Application):
         name="start_ws"
     )
 
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN.")
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN env var.")
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.ALL, ignore_all))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
