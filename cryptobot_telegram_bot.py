@@ -84,6 +84,9 @@ class Config:
         self.first_scan_delay_sec: int = kw.get("first_scan_delay_sec", 10)
         self.heartbeat_sec: int = kw.get("heartbeat_sec", 900)
 
+        # >>> CHANGE: добавлен конфиг интервала сканирования
+        self.scan_interval_sec: int = kw.get("scan_interval_sec", 30)
+
         # Параметры «вселенной»
         self.universe_top_n: int = kw.get("universe_top_n", 30)
         self.ws_symbols_max: int = kw.get("ws_symbols_max", 60)
@@ -107,6 +110,9 @@ class Config:
             startup_delay_sec=_env_int("STARTUP_DELAY_SEC", 5),
             first_scan_delay_sec=_env_int("FIRST_SCAN_DELAY_SEC", 10),
             heartbeat_sec=_env_int("HEARTBEAT_SEC", 900),
+
+            # >>> CHANGE: читаем SCAN_INTERVAL_SEC
+            scan_interval_sec=_env_int("SCAN_INTERVAL_SEC", 30),
 
             universe_top_n=_env_int("UNIVERSE_TOP_N", 30),
             ws_symbols_max=_env_int("WS_SYMBOLS_MAX", 60),
@@ -228,6 +234,15 @@ async def notify(
     if cfg.only_channel:
         recipients = [cid for cid in recipients if isinstance(cid, int) and cid < 0]
 
+    # >>> CHANGE: предупреждение, если некуда слать
+    if not recipients:
+        logger.warning(
+            "[notify] recipients list is empty. ONLY_CHANNEL=%s, PRIMARY_RECIPIENTS=%s",
+            cfg.only_channel,
+            cfg.primary_recipients,
+        )
+        return
+
     for cid in recipients:
         try:
             await app.bot.send_message(
@@ -312,6 +327,44 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await cmd_universe(update, context)
 
 
+# >>> CHANGE: команда /jobs — показать расписание задач
+def _fmt_dt(dt) -> str:
+    try:
+        return dt.isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return str(dt)
+
+
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_allowed(update, cfg):
+        return
+    jobs: Dict[str, Any] = context.application.bot_data.get("jobs", {})
+    lines = ["Задачи:"]
+    for name, job in jobs.items():
+        nrt = getattr(job, "next_run_time", None)
+        lines.append(f"• {name}: next={_fmt_dt(nrt) if nrt else '—'}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+# >>> CHANGE: команда /debug — краткая диагностика
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_allowed(update, cfg):
+        return
+    st: UniverseState = context.application.bot_data["universe_state"]
+    text = (
+        "DEBUG:\n"
+        f"ONLY_CHANNEL={cfg.only_channel}\n"
+        f"PRIMARY_RECIPIENTS={cfg.primary_recipients}\n"
+        f"ALLOWED_CHAT_IDS={cfg.allowed_chat_ids}\n"
+        f"SCAN_INTERVAL_SEC={cfg.scan_interval_sec}\n"
+        f"HEARTBEAT_SEC={cfg.heartbeat_sec}\n"
+        f"universe total={st.total} active={st.active} ws_topics={st.ws_topics} batch#{st.batch}\n"
+    )
+    await update.effective_message.reply_text(text)
+
+
 # -----------------------------------------------------------------------------
 # ТЁПЛЫЙ СТАРТ / ПЛАНИРОВАНИЕ
 # -----------------------------------------------------------------------------
@@ -325,15 +378,17 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
 
     try:
         jq = app.job_queue
-        jq.run_repeating(
+
+        # >>> CHANGE: сохраняем ссылки на Job-объекты
+        job_scan_obj = jq.run_repeating(
             job_scan,
-            interval=30,
+            interval=cfg.scan_interval_sec,  # <<< CHANGE: из конфига
             first=cfg.first_scan_delay_sec,
             name="job_scan",
             coalesce=True,
             misfire_grace_time=30,
         )
-        jq.run_repeating(
+        job_hb_obj = jq.run_repeating(
             job_heartbeat,
             interval=cfg.heartbeat_sec,
             first=120,
@@ -341,6 +396,10 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
             coalesce=True,
             misfire_grace_time=120,
         )
+        app.bot_data["jobs"] = {
+            "scan": job_scan_obj,
+            "heartbeat": job_hb_obj,
+        }
     except Exception:
         logger.exception("warmup: scheduling failed")
 
@@ -368,10 +427,24 @@ async def main_async() -> None:
     application.bot_data["universe_state"] = UniverseState()
     application.bot_data["bybit"] = BybitClient(cfg.bybit_base)
 
+    # >>> CHANGE: логируем ключевые конфиги и предупреждаем, если некуда слать
+    chan_ids = [cid for cid in cfg.primary_recipients if isinstance(cid, int) and cid < 0]
+    logger.info(
+        "[cfg] ONLY_CHANNEL=%s PRIMARY_RECIPIENTS=%s ALLOWED_CHAT_IDS=%s PORT=%s",
+        cfg.only_channel, cfg.primary_recipients, cfg.allowed_chat_ids, cfg.port
+    )
+    if cfg.only_channel and not chan_ids:
+        logger.warning(
+            "[cfg] ONLY_CHANNEL=1, но среди PRIMARY_RECIPIENTS нет ID канала (отрицательного chat_id)."
+        )
+
     # 3) Хэндлеры
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
+    # >>> CHANGE: регистрируем новые команды
+    application.add_handler(CommandHandler("jobs", cmd_jobs))
+    application.add_handler(CommandHandler("debug", cmd_debug))
 
     # 4) Удаляем вебхук перед polling
     try:
@@ -404,7 +477,6 @@ async def main_async() -> None:
     finally:
         # --- КОРРЕКТНАЯ ОСТАНОВКА ---
         try:
-            # останавливаем polling явно
             if application.updater:
                 await application.updater.stop()
         except Exception:
