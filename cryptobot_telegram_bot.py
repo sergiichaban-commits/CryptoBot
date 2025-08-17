@@ -12,6 +12,35 @@ from telegram.ext import (
     ContextTypes
 )
 
+# --- tiny health HTTP server (only for Render Web Service) ---
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/_health", "/ping"):
+            content = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    # отключаем шумный лог http.server
+    def log_message(self, *args, **kwargs):
+        return
+
+def start_health_server(port: int) -> ThreadingHTTPServer:
+    srv = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    logging.getLogger("cryptobot").info("Health server started on 0.0.0.0:%d", port)
+    return srv
+# -------------------------------------------------------------
+
 # --------------------------- Logging ---------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -40,10 +69,10 @@ class Config:
     primary_recipients: List[int]
 
     # universe / rotation
-    active_symbols: int = 30        # сколько монет сканируем в «активной» корзине
-    rotate_min: int = 5             # каждые N минут смещаем окно
-    scan_interval_sec: int = 12     # как часто сканим активную корзину
-    heartbeat_sec: int = 900        # «онлайн»-пинг в канал
+    active_symbols: int = 30
+    rotate_min: int = 5
+    scan_interval_sec: int = 12
+    heartbeat_sec: int = 900
 
     # триггеры
     vol_mult: float = 2.0
@@ -52,9 +81,9 @@ class Config:
     body_atr_mult: float = 0.6
 
     # фильтры сигналов
-    profit_min_pct: float = 1.0     # минимум профит-таргета в %
+    profit_min_pct: float = 1.0
     rr_min: float = 2.0
-    prob_min: float = 0.70          # 0..1
+    prob_min: float = 0.70
 
     @staticmethod
     def load() -> "Config":
@@ -101,7 +130,6 @@ class BybitClient:
         self.sess = session
 
     async def get_instruments_linear_usdt(self) -> List[str]:
-        """Все USDT линейные perpetual/linear контракты со статусом Trading."""
         url = f"{self.BASE}/v5/market/instruments-info"
         params = {"category": "linear", "limit": "1000"}
         symbols: List[str] = []
@@ -119,7 +147,6 @@ class BybitClient:
             res = data["result"]
             for it in res.get("list", []):
                 if it.get("status") == "Trading" and it.get("quoteCoin") == "USDT":
-                    # фильтруем perpetual/futures линейные
                     sym = it.get("symbol")
                     if sym:
                         symbols.append(sym)
@@ -127,7 +154,6 @@ class BybitClient:
             if not cursor:
                 break
 
-        # dedup & sort
         symbols = sorted(list(dict.fromkeys(symbols)))
         return symbols
 
@@ -141,10 +167,9 @@ class BybitClient:
             raise RuntimeError(f"kline error {symbol}: {data}")
         out: List[Dict[str, float]] = []
         for row in data["result"]["list"]:
-            # Bybit: [start, open, high, low, close, volume, turnover]
             o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
             out.append({"o": o, "h": h, "l": l, "c": c, "v": v})
-        out.reverse()  # к последней свече в конце -> в финале последняя
+        out.reverse()
         return out
 
     async def get_open_interest_5m(self, symbol: str, limit: int = 6) -> List[float]:
@@ -157,7 +182,6 @@ class BybitClient:
             raise RuntimeError(f"OI error {symbol}: {data}")
         vals: List[float] = []
         for row in data["result"]["list"]:
-            # row: [timestamp, openInterest, turnover, ...] — специфика: берем openInterest
             try:
                 vals.append(float(row[1]))
             except Exception:
@@ -193,40 +217,25 @@ def volume_spike(kl: List[Dict[str, float]], period: int, mult: float) -> bool:
         return False
     return vols[-1] >= avg * mult
 
-def estimate_probability(
-    long: bool, vol_ok: bool, body_vs_atr: float, oi_delta: float
-) -> float:
-    # базовая вероятностная модель — варьируется по факторам, чтобы НЕ было одинаковых 75% постоянно
+def estimate_probability(long: bool, vol_ok: bool, body_vs_atr: float, oi_delta: float) -> float:
     prob = 0.58
     if vol_ok:
         prob += 0.08
-    # чем больше тело свечи относительно ATR — тем выше доверие
     prob += min(0.12, max(0.0, (body_vs_atr - 0.4) * 0.15))
-    # подтверждение OI в сторону сигнала
     if (long and oi_delta > 0) or ((not long) and oi_delta < 0):
         prob += min(0.10, abs(oi_delta) * 0.25)
-    # лёгкая «рандомизация» внутри диапазона на основе синуса последней цены
-    drift = (math.sin(body_vs_atr * 3.1415) + 1) * 0.02  # 0..0.04
+    drift = (math.sin(body_vs_atr * 3.1415) + 1) * 0.02
     prob += drift
     return max(0.50, min(0.88, prob))
 
-def make_signal(
-    symbol: str,
-    kl: List[Dict[str, float]],
-    oi: List[float],
-    cfg: Config
-) -> Optional[Dict[str, Any]]:
+def make_signal(symbol: str, kl: List[Dict[str, float]], oi: List[float], cfg: Config) -> Optional[Dict[str, Any]]:
     if len(kl) < max(cfg.vol_sma_period + 1, cfg.atr_period + 1):
         return None
 
     last = kl[-1]
     c, o, h, l, v = last["c"], last["o"], last["h"], last["l"], last["v"]
-    closes = [x["c"] for x in kl]
-    highs  = [x["h"] for x in kl]
-    lows   = [x["l"] for x in kl]
-    vols   = [x["v"] for x in kl]
 
-    sma20 = sma(closes, cfg.vol_sma_period)
+    sma20 = sma([x["c"] for x in kl], cfg.vol_sma_period)
     atr14 = atr(kl, cfg.atr_period)
     if not sma20 or not atr14 or atr14 <= 0:
         return None
@@ -242,29 +251,23 @@ def make_signal(
     if len(oi) >= 2:
         oi_delta = (oi[-1] - oi[-2]) / max(1e-9, abs(oi[-2]))
 
-    # простая логика
     long_cond  = trend_up and vol_ok and body_vs_atr >= cfg.body_atr_mult and c > o
     short_cond = trend_dn and vol_ok and body_vs_atr >= cfg.body_atr_mult and c < o
-
     if not (long_cond or short_cond):
         return None
 
     is_long = bool(long_cond)
 
-    # расстояния: стоп около 0.45*ATR, тейк ~ RR*стоп
     stop_dist  = max(atr14 * 0.45,  c * 0.002)
-    # RR варьируем слегка по силе факторов
     rr = cfg.rr_min + min(0.8, 0.5 * max(0.0, body_vs_atr - cfg.body_atr_mult)) + min(0.5, abs(oi_delta) * 2.0)
-
     take_dist = stop_dist * rr
 
+    entry = c
     if is_long:
-        entry = c
         tp = entry + take_dist
         sl = entry - stop_dist
         profit_pct = (tp / entry - 1.0) * 100.0
     else:
-        entry = c
         tp = entry - take_dist
         sl = entry + stop_dist
         profit_pct = (1.0 - tp / entry) * 100.0
@@ -295,9 +298,9 @@ class BotState:
     session: Optional[aiohttp.ClientSession] = None
     bybit: Optional[BybitClient] = None
 
-    universe: List[str] = field(default_factory=list)     # все символы
-    active_idx: int = 0                                   # откуда берём окно
-    active: List[str] = field(default_factory=list)       # активная корзина
+    universe: List[str] = field(default_factory=list)
+    active_idx: int = 0
+    active: List[str] = field(default_factory=list)
 
     last_signal_ts: Dict[str, float] = field(default_factory=dict)
     signal_cooldown_sec: int = 600
@@ -309,7 +312,6 @@ def allowed_chat(update: Update, cfg: Config) -> bool:
     return chat_id in cfg.allowed_chat_ids
 
 def fmt_price(x: float) -> str:
-    # компактный формат чисел
     if x == 0:
         return "0"
     mag = abs(x)
@@ -363,14 +365,12 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def job_boot(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     st: BotState = app.bot_data["state"]
-    # загрузка вселенной
     try:
         st.universe = await st.bybit.get_instruments_linear_usdt()
     except Exception as e:
         log.exception("Failed to load instruments: %s", e)
         st.universe = []
 
-    # сформировать активную корзину
     st.active_idx = 0
     st.active = st.universe[: st.cfg.active_symbols] if st.universe else []
     await send_only_to_channels(app, st.cfg,
@@ -384,10 +384,7 @@ async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
         return
     n = st.cfg.active_symbols
     st.active_idx = (st.active_idx + n) % max(1, len(st.universe))
-    new = []
-    for i in range(n):
-        new.append(st.universe[(st.active_idx + i) % len(st.universe)])
-    st.active = new
+    st.active = [st.universe[(st.active_idx + i) % len(st.universe)] for i in range(n)]
     log.info("Rotate -> batch#%d active=%d", st.active_idx, len(st.active))
 
 async def _scan_symbol(st: BotState, symbol: str) -> Optional[Dict[str, Any]]:
@@ -396,8 +393,7 @@ async def _scan_symbol(st: BotState, symbol: str) -> Optional[Dict[str, Any]]:
             st.bybit.get_klines_5m(symbol, limit=max(st.cfg.vol_sma_period + st.cfg.atr_period + 5, 80)),
             st.bybit.get_open_interest_5m(symbol, limit=6),
         )
-        sig = make_signal(symbol, kl, oi, st.cfg)
-        return sig
+        return make_signal(symbol, kl, oi, st.cfg)
     except Exception as e:
         log.debug("scan %s failed: %s", symbol, e)
         return None
@@ -409,16 +405,14 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
         return
 
     sem = asyncio.Semaphore(6)
-
     async def guarded(sym: str):
         async with sem:
             return await _scan_symbol(st, sym)
 
-    tasks = [guarded(s) for s in st.active]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
+    results = await asyncio.gather(*(guarded(s) for s in st.active), return_exceptions=False)
 
     now = asyncio.get_running_loop().time()
-    out_msgs = []
+    sent = 0
     for sig in results:
         if not sig:
             continue
@@ -442,10 +436,10 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
             f"Стоп: {sl}\n"
             f"R/R: {rr} | Вероятность: {prob}"
         )
-        out_msgs.append(text)
+        await send_only_to_channels(app, st.cfg, text)
+        sent += 1
 
-    for msg in out_msgs:
-        await send_only_to_channels(app, st.cfg, msg)
+    log.info("scan: candidates=%d sent=%d active=%d batch#%d", len(st.active), sent, len(st.active), st.active_idx)
 
 async def job_heartbeat(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
@@ -459,13 +453,11 @@ async def job_heartbeat(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     cfg: Config = app.bot_data["cfg"]
-    # session + client
     timeout = aiohttp.ClientTimeout(total=20)
     st = BotState(cfg=cfg, session=aiohttp.ClientSession(timeout=timeout))
     st.bybit = BybitClient(st.session)
     app.bot_data["state"] = st
 
-    # планируем задачи
     app.job_queue.run_once(job_boot, when=1)
     app.job_queue.run_repeating(job_rotate, interval=cfg.rotate_min * 60, first=cfg.rotate_min * 60)
     app.job_queue.run_repeating(job_scan, interval=cfg.scan_interval_sec, first=cfg.scan_interval_sec + 5)
@@ -481,8 +473,6 @@ async def post_shutdown(app: Application):
 def build_app(cfg: Config) -> Application:
     app = ApplicationBuilder().token(cfg.token).post_init(post_init).post_shutdown(post_shutdown).build()
     app.bot_data["cfg"] = cfg
-
-    # команды (только для разрешённых чатов)
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("universe", cmd_universe))
@@ -490,14 +480,22 @@ def build_app(cfg: Config) -> Application:
 
 def main():
     cfg = Config.load()
-    app = build_app(cfg)
 
-    # ВАЖНО: run_polling — синхронный вызов, НЕ внутри asyncio.run и без await
+    # если $PORT задан (Web Service), запустим tiny health-сервер в отдельном потоке
+    port_env = os.getenv("PORT")
+    if port_env:
+        try:
+            port = int(port_env)
+            start_health_server(port)
+        except Exception as e:
+            log.warning("Health server failed to start on PORT=%s: %s", port_env, e)
+
+    app = build_app(cfg)
     log.info("Starting polling…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        stop_signals=None  # безопаснее для хостингов, которые сами шлют SIGTERM/SIGINT
+        stop_signals=None
     )
 
 if __name__ == "__main__":
