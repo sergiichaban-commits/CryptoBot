@@ -68,6 +68,18 @@ def _env_list_int(name: str, default: Optional[List[int]] = None) -> List[int]:
     return out
 
 
+def _normalize_public_url(u: Optional[str]) -> Optional[str]:
+    """Нормализуем публичный URL сервиса (для keepalive)."""
+    if not u:
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
+    return u.rstrip("/")
+
+
 # -----------------------------------------------------------------------------
 # КОНФИГ
 # -----------------------------------------------------------------------------
@@ -94,11 +106,23 @@ class Config:
         # Bybit
         self.bybit_base: str = kw.get("bybit_base", "https://api.bybit.com")
 
+        # >>> CHANGE: Keepalive (само-пинг)
+        self.public_url: Optional[str] = kw.get("public_url")
+        self.self_ping: bool = kw.get("self_ping", True)
+        self.self_ping_interval_sec: int = kw.get("self_ping_interval_sec", 780)  # ~13 мин
+
     @staticmethod
     def load() -> "Config":
         token = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN is required")
+
+        # >>> CHANGE: читаем PUBLIC_URL/RENDER_EXTERNAL_URL для keepalive
+        pub_url = (
+            os.getenv("PUBLIC_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+        )
+        pub_url = _normalize_public_url(pub_url)
 
         return Config(
             telegram_token=token,
@@ -118,6 +142,11 @@ class Config:
             ws_symbols_max=_env_int("WS_SYMBOLS_MAX", 60),
 
             bybit_base=os.getenv("BYBIT_BASE", "https://api.bybit.com"),
+
+            # >>> CHANGE: keepalive env
+            public_url=pub_url,
+            self_ping=_env_bool("SELF_PING", True),
+            self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 780),
         )
 
 
@@ -290,6 +319,22 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.sleep(0)
 
 
+# >>> CHANGE: keepalive — периодический само-пинг, чтобы Render не засыпал
+async def job_keepalive(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    cfg: Config = app.bot_data["cfg"]
+    # приоритет — внешний публичный URL, иначе локальный health
+    url = (cfg.public_url + "/health") if cfg.public_url else f"http://127.0.0.1:{cfg.port}/health"
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url) as r:
+                await r.text()
+        logger.info(f"[keepalive] ping {url} ✓")
+    except Exception:
+        logger.exception(f"[keepalive] ping {url} failed")
+
+
 # -----------------------------------------------------------------------------
 # КОМАНДЫ
 # -----------------------------------------------------------------------------
@@ -360,6 +405,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ALLOWED_CHAT_IDS={cfg.allowed_chat_ids}\n"
         f"SCAN_INTERVAL_SEC={cfg.scan_interval_sec}\n"
         f"HEARTBEAT_SEC={cfg.heartbeat_sec}\n"
+        f"SELF_PING={cfg.self_ping} KEEPALIVE_SEC={cfg.self_ping_interval_sec}\n"
+        f"PUBLIC_URL={cfg.public_url or '-'} PORT={cfg.port}\n"
         f"universe total={st.total} active={st.active} ws_topics={st.ws_topics} batch#{st.batch}\n"
     )
     await update.effective_message.reply_text(text)
@@ -396,10 +443,27 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
             coalesce=True,
             misfire_grace_time=120,
         )
-        app.bot_data["jobs"] = {
+
+        # >>> CHANGE: планируем keepalive, если включен
+        job_ka_obj = None
+        if cfg.self_ping:
+            job_ka_obj = jq.run_repeating(
+                job_keepalive,
+                interval=cfg.self_ping_interval_sec,
+                first=cfg.self_ping_interval_sec,
+                name="job_keepalive",
+                coalesce=True,
+                misfire_grace_time=cfg.self_ping_interval_sec,
+            )
+
+        jobs_map: Dict[str, Any] = {
             "scan": job_scan_obj,
             "heartbeat": job_hb_obj,
         }
+        if job_ka_obj:
+            jobs_map["keepalive"] = job_ka_obj
+
+        app.bot_data["jobs"] = jobs_map
     except Exception:
         logger.exception("warmup: scheduling failed")
 
