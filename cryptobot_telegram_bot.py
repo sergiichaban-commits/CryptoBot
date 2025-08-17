@@ -78,7 +78,6 @@ class Config:
 
     PUBLIC_URL: str
     PORT: int
-    WEBHOOK_PATH: str
 
     HEALTH_SECONDS: int
     FIRST_HEALTH_DELAY: int
@@ -112,7 +111,6 @@ class Config:
 
         public_url = os.getenv("PUBLIC_URL", "").strip()
         port = _env_int("PORT", 10000)
-        wh_path = os.getenv("WEBHOOK_PATH", "") or _random_path()
 
         health = _env_int("HEALTH_SECONDS", 20 * 60)
         first = _env_int("FIRST_HEALTH_DELAY", 60)
@@ -127,7 +125,7 @@ class Config:
         rotate_min = _env_int("ROTATE_MIN", 5)
 
         prob_min = _env_float("PROB_MIN", 69.9)
-        profit_min_pct = _env_float("PROFIT_MIN_PCT", 1.0)  # снижено до 1%
+        profit_min_pct = _env_float("PROFIT_MIN_PCT", 1.0)  # порог прибыли 1%
         rr_min = _env_float("RR_MIN", 2.0)
 
         vol_mult = _env_float("VOL_MULT", 2.0)
@@ -141,7 +139,6 @@ class Config:
             PRIMARY_RECIPIENTS=primary,
             PUBLIC_URL=public_url,
             PORT=port,
-            WEBHOOK_PATH=wh_path,
             HEALTH_SECONDS=health,
             FIRST_HEALTH_DELAY=first,
             SELF_PING_SECONDS=self_ping,
@@ -411,6 +408,7 @@ class State:
         self.last_signal_sent: Dict[str, float] = {}
         self.live_signals: Dict[str, Signal] = {}
         self.ready: bool = False
+        self.last_update_ts: float = 0.0  # время последнего входящего апдейта
 
 
 # ============================ ХЭНДЛЕРЫ ============================
@@ -429,15 +427,18 @@ async def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st: State = context.bot_data["state"]
+    st.last_update_ts = time.time()
     if not await _is_allowed(update, context):
         return
     await update.effective_message.reply_text("pong")
 
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st: State = context.bot_data["state"]
+    st.last_update_ts = time.time()
     if not await _is_allowed(update, context):
         return
-    st: State = context.bot_data.get("state")
     if not st or not st.total_symbols:
         await update.effective_message.reply_text("Вселенная пока не загружена (жду Bybit API/повторяю попытки)…")
         return
@@ -451,14 +452,19 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st: State = context.bot_data["state"]
+    st.last_update_ts = time.time()
     if not await _is_allowed(update, context):
-        return
-    st: State = context.bot_data.get("state")
-    if not st:
-        await update.effective_message.reply_text("Статус недоступен…")
         return
     txt = f"Вселенная: total={len(st.total_symbols)}, active={len(st.active_symbols)}, batch#{st.batch_idx}, ws_topics={len(st.active_symbols)*2}"
     await update.effective_message.reply_text(txt)
+
+
+async def any_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # фиксируем, что апдейты доходят
+    st: State = context.bot_data["state"]
+    st.last_update_ts = time.time()
+    log.debug("update: %s", getattr(update, "to_dict", lambda: update)())
 
 
 async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -466,6 +472,13 @@ async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================ ДЖОБЫ ============================
+async def _safe_job(job_coro, context: ContextTypes.DEFAULT_TYPE, name: str):
+    try:
+        await job_coro(context)
+    except Exception:
+        log.exception("JOB %s crashed", name)
+
+
 async def job_health(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.bot_data["cfg"]
     for cid in cfg.PRIMARY_RECIPIENTS:
@@ -481,7 +494,7 @@ async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
         return
     session: aiohttp.ClientSession = context.bot_data.get("aiohttp_session")
     try:
-        url = cfg.PUBLIC_URL
+        url = cfg.PUBLIC_URL.rstrip("/") + "/healthz"
         if session and not session.closed:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)):
                 pass
@@ -563,8 +576,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_bootstrap(context: ContextTypes.DEFAULT_TYPE):
-    """Стартовая джоба: создаёт HTTP-сессию, Bybit клиент, грузит вселенную,
-    а затем регистрирует остальные джобы."""
     cfg: Config = context.bot_data["cfg"]
     st: State = context.bot_data["state"]
 
@@ -590,15 +601,16 @@ async def job_bootstrap(context: ContextTypes.DEFAULT_TYPE):
         st.ready = True
         log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
     except Exception as e:
-        log.error("universe load failed: %s", e)
+        log.exception("universe load failed: %s", e)
 
     # 3) Регулярные джобы
     jq = context.job_queue
-    jq.run_repeating(job_health, interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
+    jq.run_repeating(lambda c: _safe_job(job_health, c, "health"), interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
     if cfg.PUBLIC_URL:
-        jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
-    jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
-    jq.run_repeating(job_scan, interval=30, first=15, name="scan")
+        jq.run_repeating(lambda c: _safe_job(job_self_ping, c, "self_ping"), interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
+    jq.run_repeating(lambda c: _safe_job(job_rotate, c, "rotate"), interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
+    jq.run_repeating(lambda c: _safe_job(job_scan, c, "scan"), interval=30, first=15, name="scan")
+    jq.run_repeating(lambda c: _safe_job(job_watchdog, c, "watchdog"), interval=120, first=180, name="watchdog")
 
     # 4) Уведомление о старте
     for cid in cfg.PRIMARY_RECIPIENTS:
@@ -611,6 +623,28 @@ async def job_bootstrap(context: ContextTypes.DEFAULT_TYPE):
     log.info("BOOTSTRAP: done")
 
 
+async def job_watchdog(context: ContextTypes.DEFAULT_TYPE):
+    """Если апдейтов давно не было — логируем предупреждение и шлём тихий self-check."""
+    st: State = context.bot_data["state"]
+    cfg: Config = context.bot_data["cfg"]
+    now = time.time()
+    silence_min = (now - st.last_update_ts) / 60 if st.last_update_ts else 9999
+    if silence_min > 15:
+        log.warning("WATCHDOG: no incoming updates for %.1f minutes", silence_min)
+        # мягкий self-check: getMe
+        try:
+            _ = await context.bot.get_me()
+        except Exception as e:
+            log.warning("WATCHDOG getMe failed: %s", e)
+        # и пинг в чат раз в час максимум
+        if int(now // 3600) != int((now - 120) // 3600):  # не чаще раза в час
+            for cid in cfg.PRIMARY_RECIPIENTS:
+                try:
+                    await context.bot.send_message(chat_id=cid, text="⛑ watchdog: still alive, no updates lately")
+                except Exception:
+                    pass
+
+
 # ============================ HTTP HEALTH ============================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -619,7 +653,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        # Чтобы Render видел порт — на / тоже отвечаем 200
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"web-ok")
@@ -643,40 +676,28 @@ def _start_health_server(port: int):
 def main():
     cfg = Config.load()
 
-    # Собираем приложение
+    # Всегда POLLING. Поднимем health-сервер, чтобы Render видел открытый порт.
+    _start_health_server(cfg.PORT)
+
     application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
     application.bot_data["cfg"] = cfg
     application.bot_data["state"] = State()
 
-    # Хэндлеры команд
+    # Команды
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
 
-    # (необязательный) логгер всех апдейтов — поможет понять, доходят ли апдейты
-    application.add_handler(MessageHandler(filters.ALL, lambda u, c: log.debug("update: %s", getattr(u, "to_dict", lambda: u)())))
-
-    # Глобальный обработчик ошибок
+    # Лог всех апдейтов (DEBUG) + отметка времени
+    application.add_handler(MessageHandler(filters.ALL, any_update_logger))
     application.add_error_handler(err_handler)
 
-    # Планируем bootstrap сразу после старта (внутри уже будет рабочий loop)
+    # Планируем bootstrap после старта event loop
     application.job_queue.run_once(job_bootstrap, when=1, name="bootstrap")
 
-    use_webhook = bool(cfg.PUBLIC_URL and cfg.PUBLIC_URL.startswith("https://"))
-    if use_webhook:
-        webhook_url = cfg.PUBLIC_URL.rstrip("/") + (cfg.WEBHOOK_PATH or _random_path())
-        log.info("WEBHOOK mode: %s", webhook_url)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=cfg.PORT,
-            webhook_url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-        )
-    else:
-        # Открываем порт, чтобы Render считал сервис живым (и можно смотреть /healthz)
-        _start_health_server(cfg.PORT)
-        log.info("POLLING mode: starting long-polling …")
-        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("POLLING mode: starting long-polling …")
+    # drop_pending_updates=True — чистим хвост при рестарте
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
