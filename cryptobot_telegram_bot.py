@@ -3,7 +3,6 @@
 
 import os
 import asyncio
-import json
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -321,7 +320,8 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     uni: Universe = app.bot_data.get("universe")  # type: ignore
     if not uni or not uni.active:
         return
-    # тут ваш анализ; отправка через send_signal_msg(...)
+    # Здесь выполняется ваш анализ и, при необходимости, отправка сигнала:
+    # await send_signal_msg(app.bot, cfg, cfg.PRIMARY_RECIPIENTS, symbol=..., ...)
 
 # ======================================================================
 #                               MAIN
@@ -330,13 +330,13 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def main_async() -> None:
     cfg = Config.load()
 
-    # health порт для Render
+    # Health-порт для Render (чтобы не было Port scan timeout)
     asyncio.create_task(start_health_server(cfg.PORT))
 
     # Telegram application
     application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
 
-    # Bybit client
+    # Все сторонние клиенты создаём уже в работающем loop
     bybit = await BybitClient.create()
 
     # Вселенная
@@ -364,20 +364,38 @@ async def main_async() -> None:
     jq.run_repeating(job_rotate_universe, interval=cfg.ROTATE_MIN * 60, first=30, name="job_rotate")
     jq.run_repeating(job_scan, interval=30, first=15, name="job_scan")
 
-    # ---------- THE ONLY CHANGE HERE ----------
-    # избегаем попытки закрыть уже работающий loop
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        stop_signals=None,
-        close_loop=False,   # <— ключ к вашей ошибке
-    )
-    # -----------------------------------------
+    # -------------------- ВАЖНАЯ ПРАВКА ТУТ --------------------
+    # Вместо run_polling внутри asyncio.run(...):
+    # используем "ручной" запуск, чтобы не было
+    # RuntimeError: This event loop is already running
+    async with application:
+        await application.start()
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
-    try:
-        await bybit.close()
-    except Exception:
-        pass
+        # boot-сообщение — только в каналы (если SUPPRESS_DM_SIGNALS=1)
+        targets = _channels_only(cfg.PRIMARY_RECIPIENTS, cfg.SUPPRESS_DM_SIGNALS)
+        if targets:
+            boot_msg = (f"🚀 Бот запущен\n{universe.summary()}, "
+                        f"active={len(universe.active)}, ws_topics={len(universe.active)*2}")
+            for cid in targets:
+                try:
+                    await application.bot.send_message(chat_id=cid, text=boot_msg)
+                except Exception:
+                    pass
+
+        # Ждём «вечно», пока процесс жив
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # аккуратно закрываем bybit-клиент
+            try:
+                await bybit.close()
+            except Exception:
+                pass
+    # -----------------------------------------------------------
 
 
 def main() -> None:
