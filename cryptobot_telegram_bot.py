@@ -6,7 +6,9 @@ import re
 import json
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from statistics import mean
+from datetime import datetime, timedelta
 
 import aiohttp
 from aiohttp import web
@@ -20,8 +22,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 from telegram.error import Conflict
 
@@ -49,6 +49,13 @@ def _env_bool(name: str, default: bool) -> bool:
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
     except Exception:
         return default
 
@@ -111,6 +118,18 @@ class Config:
         self.self_ping: bool = kw.get("self_ping", True)
         self.self_ping_interval_sec: int = kw.get("self_ping_interval_sec", 780)  # ~13 мин
 
+        # Аналитика/сигналы
+        self.analysis_enabled: bool = kw.get("analysis_enabled", True)
+        self.analysis_batch_size: int = kw.get("analysis_batch_size", 3)
+        self.signal_ttl_min: int = kw.get("signal_ttl_min", 12)
+        self.signal_cooldown_sec: int = kw.get("signal_cooldown_sec", 600)
+
+        # Пороговые параметры анализа
+        self.vol_sma_period: int = kw.get("vol_sma_period", 20)
+        self.vol_mult: float = kw.get("vol_mult", 2.0)
+        self.atr_period: int = kw.get("atr_period", 14)
+        self.body_atr_mult: float = kw.get("body_atr_mult", 0.60)
+
     @staticmethod
     def load() -> "Config":
         token = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
@@ -144,6 +163,16 @@ class Config:
             public_url=pub_url,
             self_ping=_env_bool("SELF_PING", True),
             self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 780),
+
+            analysis_enabled=_env_bool("ANALYSIS_ENABLED", True),
+            analysis_batch_size=_env_int("ANALYSIS_BATCH_SIZE", 3),
+            signal_ttl_min=_env_int("SIGNAL_TTL_MIN", 12),
+            signal_cooldown_sec=_env_int("SIGNAL_COOLDOWN_SEC", 600),
+
+            vol_sma_period=_env_int("VOL_SMA_PERIOD", 20),
+            vol_mult=_env_float("VOL_MULT", 2.0),
+            atr_period=_env_int("ATR_PERIOD", 14),
+            body_atr_mult=_env_float("BODY_ATR_MULT", 0.60),
         )
 
 
@@ -194,6 +223,36 @@ class BybitClient:
                 break
             await asyncio.sleep(0)
         return sorted(set(out))
+
+    async def fetch_kline(self, symbol: str, interval: str = "5", limit: int = 200) -> Dict[str, Any]:
+        """
+        Kline по v5:
+        GET /v5/market/kline?category=linear&symbol=SYM&interval=5&limit=200
+        """
+        session = await self._ensure_session()
+        url = f"{self.base}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+        async with session.get(url) as resp:
+            return await resp.json()
+
+    async def fetch_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> Dict[str, Any]:
+        """
+        Open Interest:
+        GET /v5/market/open-interest?category=linear&symbol=SYM&intervalTime=5min&limit=6
+        """
+        session = await self._ensure_session()
+        url = f"{self.base}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
+        async with session.get(url) as resp:
+            return await resp.json()
+
+    async def fetch_liquidations(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
+        """
+        Liquidations:
+        GET /v5/market/liquidation?category=linear&symbol=SYM&limit=50
+        """
+        session = await self._ensure_session()
+        url = f"{self.base}/v5/market/liquidation?category=linear&symbol={symbol}&limit={limit}"
+        async with session.get(url) as resp:
+            return await resp.json()
 
 
 # -----------------------------------------------------------------------------
@@ -283,6 +342,193 @@ async def notify(
 
 
 # -----------------------------------------------------------------------------
+# ПРОСТЕЙШИЙ АНАЛИЗ
+# -----------------------------------------------------------------------------
+def _calc_atr(candles: List[List[str]], period: int) -> float:
+    """
+    candles: список строковых [startTs, open, high, low, close, volume, ...] (как от Bybit)
+    ATR — упрощённо через средний (high-low).
+    """
+    if not candles:
+        return 0.0
+    span = candles[-period:]
+    rng = []
+    for c in span:
+        try:
+            high = float(c[2])
+            low = float(c[3])
+            rng.append(abs(high - low))
+        except Exception:
+            pass
+    return mean(rng) if rng else 0.0
+
+
+def _fmt_pct(x: float) -> str:
+    return f"{x*100:.2f}%"
+
+
+def _pick_batch_symbols(symbols: List[str], batch: int, batch_size: int) -> List[str]:
+    if not symbols:
+        return []
+    n = len(symbols)
+    start = (batch * batch_size) % n
+    out = symbols[start:start + batch_size]
+    if len(out) < batch_size:  # докрутить из начала, если вышли за край
+        out += symbols[: batch_size - len(out)]
+    return out
+
+
+def _make_bybit_link(symbol: str) -> str:
+    # простая ссылка на фьючерс USDT
+    base = symbol.replace("USDT", "")
+    return f"https://www.bybit.com/trade/usdt/{base}"
+
+
+async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает словарь с метриками и потенциальным направлением;
+    либо None, если триггеров нет/ошибка.
+    """
+    client: BybitClient = app.bot_data["bybit"]
+
+    # параллельно дернем три запроса
+    k_task = asyncio.create_task(client.fetch_kline(symbol, interval="5", limit=max(60, cfg.vol_sma_period + 5)))
+    oi_task = asyncio.create_task(client.fetch_open_interest(symbol, interval="5min", limit=6))
+    liq_task = asyncio.create_task(client.fetch_liquidations(symbol, limit=50))
+
+    k = await k_task
+    oi = await oi_task
+    lq = await liq_task
+
+    # --- KLINE ---
+    k_ok = (k or {}).get("retCode") == 0
+    k_list = ((k or {}).get("result") or {}).get("list") or []
+    k_list = list(reversed(k_list))  # Bybit часто отдает от старых к новым — перевернём
+    chg = vol_mult = atr_val = body = last_close = 0.0
+    if k_ok and len(k_list) >= max(3, cfg.vol_sma_period + 1):
+        try:
+            o1 = float(k_list[-2][1])
+            c1 = float(k_list[-2][4])
+            o2 = float(k_list[-1][1])
+            c2 = float(k_list[-1][4])
+            v2 = float(k_list[-1][5])
+            vols = [float(x[5]) for x in k_list[-(cfg.vol_sma_period+1):-1]]
+            v_sma = mean(vols) if vols else 0.0
+            vol_mult = (v2 / v_sma) if v_sma > 0 else 0.0
+            atr_val = _calc_atr(k_list, cfg.atr_period)
+            body = abs(c2 - o2)
+            last_close = c2
+            chg = (c2 - c1) / c1 if c1 else 0.0
+        except Exception:
+            pass
+    logger.info(f"[kline] {symbol}: chg={_fmt_pct(chg)} volx={vol_mult:.2f} atr={atr_val:.6f} body={body:.6f}")
+
+    # --- OPEN INTEREST ---
+    oi_ok = (oi or {}).get("retCode") == 0
+    oi_list = ((oi or {}).get("result") or {}).get("list") or []
+    oi_d = 0.0
+    oi_last = 0.0
+    if oi_ok and len(oi_list) >= 2:
+        try:
+            oi_prev = float(oi_list[-2][1])  # value
+            oi_last = float(oi_list[-1][1])
+            oi_d = (oi_last - oi_prev) / oi_prev if oi_prev else 0.0
+        except Exception:
+            pass
+    logger.info(f"[open-interest] {symbol}: d_5min={_fmt_pct(oi_d)} last={oi_last:.3f}")
+
+    # --- LIQUIDATIONS ---
+    lq_ok = (lq or {}).get("retCode") == 0
+    lq_list = ((lq or {}).get("result") or {}).get("list") or []
+    liq_events = 0
+    liq_notional = 0.0
+    side_long = side_short = 0
+    for it in lq_list:
+        try:
+            liq_events += 1
+            liq_notional += float(it.get("value", 0) or 0)  # может быть qty/USDT — зависит от ответа; лог — ориентир
+            s = (it.get("side") or "").lower()
+            if s == "buy":
+                side_long += 1
+            elif s == "sell":
+                side_short += 1
+        except Exception:
+            pass
+    dom = "long>short" if side_long > side_short else ("short>long" if side_short > side_long else "balanced")
+    logger.info(f"[liquidation] {symbol}: events={liq_events} notional≈{liq_notional:.0f} side={dom}")
+
+    # --- ПРОСТЕЙШИЙ ТРИГГЕР ---
+    # сигналы только если включено
+    if not cfg.analysis_enabled:
+        return None
+
+    # условия: всплеск объёма + тело свечи >= body_atr_mult*ATR + направленное изменение OI + есть ликвидации
+    cond_vol = vol_mult >= cfg.vol_mult
+    cond_body = body >= cfg.body_atr_mult * atr_val if atr_val > 0 else False
+    # направление: if chg>0 => хотим рост OI, если chg<0 => падение OI
+    cond_oi = (chg > 0 and oi_d > 0) or (chg < 0 and oi_d < 0)
+    cond_liq = liq_events >= 1
+
+    if cond_vol and cond_body and cond_oi and cond_liq and last_close > 0:
+        side = "LONG" if chg > 0 else "SHORT"
+
+        # элементарный SL/TP от ATR
+        sl_dist = max(1e-6, cfg.body_atr_mult * atr_val)
+        rr = 2.0 + max(0.0, min(1.0, vol_mult - cfg.vol_mult)) * 0.5  # чтобы не было одинаковых R/R
+        tp_dist = rr * sl_dist
+
+        if side == "LONG":
+            entry = last_close
+            sl = entry - sl_dist
+            tp = entry + tp_dist
+        else:
+            entry = last_close
+            sl = entry + sl_dist
+            tp = entry - tp_dist
+
+        # псевдо-вероятность: 60..82% в зависимости от vol_mult и согласованности OI
+        prob = 0.60 + min(0.22, 0.04 * max(0.0, vol_mult - cfg.vol_mult) + (0.04 if cond_oi else 0.0))
+
+        return {
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "rr": rr,
+            "prob": prob,
+        }
+
+    return None
+
+
+def _format_signal(sig: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    sym = sig["symbol"]
+    side = "ЛОНГ" if sig["side"] == "LONG" else "ШОРТ"
+    entry = sig["entry"]
+    tp = sig["tp"]
+    sl = sig["sl"]
+    rr = sig["rr"]
+    prob = sig["prob"]
+
+    # проценты к тейку/стопу
+    tp_pct = (tp - entry) / entry if sig["side"] == "LONG" else (entry - tp) / entry
+    sl_pct = (entry - sl) / entry if sig["side"] == "LONG" else (sl - entry) / entry
+
+    text = (
+        f"#{sym} — {side}\n"
+        f"Вход: {entry:g}\n"
+        f"Тейк: {tp:g} (+{tp_pct*100:.2f}%)\n"
+        f"Стоп: {sl:g} (-{sl_pct*100:.2f}%)\n"
+        f"R/R: {rr:.2f} | Вероятность: {prob*100:.1f}%"
+    )
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть в Bybit", url=_make_bybit_link(sym))]]
+    )
+    return text, kb
+
+
+# -----------------------------------------------------------------------------
 # ДЖОБЫ
 # -----------------------------------------------------------------------------
 async def job_heartbeat_simple(app: Application) -> None:
@@ -306,10 +552,48 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if not st.total:
             await build_universe(app, cfg)
+
+        # вращаем batch-счётчик как раньше — чтобы не мешать существующей логике
         if st.sample_active:
+            # на всякий увеличим модуль от количества "частей" (3 для красоты)
             st.batch = (st.batch + 1) % max(1, (st.active // 10) or 1)
+
+        # --- МИНИ-АНАЛИЗ БАТЧА ---
+        sent_now = 0
+        if cfg.analysis_enabled and st.sample_active:
+            batch_syms = _pick_batch_symbols(st.sample_active, st.batch, max(1, cfg.analysis_batch_size))
+
+            # параллельно анализируем символы
+            results = await asyncio.gather(
+                *[ _analyze_symbol(app, cfg, s) for s in batch_syms ],
+                return_exceptions=True
+            )
+
+            # анти-дубли (TTL и cooldown)
+            sent_map: Dict[str, float] = app.bot_data.setdefault("sent_signals", {})
+            now_ts = datetime.utcnow().timestamp()
+
+            for sym, res in zip(batch_syms, results):
+                if isinstance(res, Exception) or not res:
+                    continue
+
+                last_ts = sent_map.get(sym, 0.0)
+                if now_ts - last_ts < cfg.signal_cooldown_sec:
+                    continue  # рано
+
+                # внутри TTL — не повторяем
+                if now_ts - last_ts < cfg.signal_ttl_min * 60:
+                    continue
+
+                text, kb = _format_signal(res)
+                await notify(app, text, reply_markup=kb)
+                sent_map[sym] = now_ts
+                sent_now += 1
+                if sent_now >= 2:
+                    break  # на один проход — максимум 2 сигнала
+
         logger.info(
-            f"scan: candidates={st.active} sent=0 active={st.active} batch#{st.batch}"
+            f"scan: candidates={st.active} sent={sent_now} active={st.active} batch#{st.batch}"
         )
     except Exception:
         logger.exception("job_scan failed")
@@ -400,6 +684,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"SCAN_INTERVAL_SEC={cfg.scan_interval_sec}\n"
         f"HEARTBEAT_SEC={cfg.heartbeat_sec}\n"
         f"SELF_PING={cfg.self_ping} KEEPALIVE_SEC={cfg.self_ping_interval_sec}\n"
+        f"ANALYSIS_ENABLED={cfg.analysis_enabled} BATCH_SIZE={cfg.analysis_batch_size}\n"
+        f"SIGNAL_TTL_MIN={cfg.signal_ttl_min} SIGNAL_COOLDOWN_SEC={cfg.signal_cooldown_sec}\n"
+        f"VOL_SMA_PERIOD={cfg.vol_sma_period} VOL_MULT={cfg.vol_mult} ATR_PERIOD={cfg.atr_period} BODY_ATR_MULT={cfg.body_atr_mult}\n"
         f"PUBLIC_URL={cfg.public_url or '-'} PORT={cfg.port}\n"
         f"universe total={st.total} active={st.active} ws_topics={st.ws_topics} batch#{st.batch}\n"
     )
@@ -420,7 +707,7 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
     try:
         jq = app.job_queue
 
-        # >>> ЕДИНСТВЕННАЯ ПРАВКА: перенос coalesce/misfire_grace_time в job_kwargs
+        # перенос ограничителей в job_kwargs (совместимо с PTB 21.x)
         job_scan_obj = jq.run_repeating(
             job_scan,
             interval=cfg.scan_interval_sec,
