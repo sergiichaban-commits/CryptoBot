@@ -49,14 +49,13 @@ class Config:
     PUBLIC_URL: str
     PORT: int
 
-    # --- PATCH: deeplinks/flags/heartbeat ---
+    # Deeplinks / flags / heartbeat
     BYBIT_APP_URL_TMPL: str
     BYBIT_WEB_URL_TMPL: str
     ONLINE_INTERVAL_SEC: int
     SUPPRESS_DM_SIGNALS: bool
-    # ----------------------------------------
 
-    # Пара опций для «вселенной»
+    # Universe
     UNIVERSE_TOP_N: int
     WS_SYMBOLS_MAX: int
     ROTATE_MIN: int
@@ -73,12 +72,10 @@ class Config:
         public_url = os.getenv("PUBLIC_URL", "").strip()
         port = int(os.getenv("PORT", "10000"))
 
-        # --- PATCH: deeplinks/flags/heartbeat ---
         bybit_app = os.getenv("BYBIT_APP_URL_TMPL", "bybit://trade?symbol={symbol}&category=linear")
         bybit_web = os.getenv("BYBIT_WEB_URL_TMPL", "https://www.bybit.com/trade/derivatives/USDT/{symbol}")
-        online_sec = int(os.getenv("ONLINE_INTERVAL_SEC", "1800"))  # 30 минут по умолчанию
-        suppress_dm = os.getenv("SUPPRESS_DM_SIGNALS", "1") == "1"  # если 1 — шлём только в каналы
-        # ----------------------------------------
+        online_sec = int(os.getenv("ONLINE_INTERVAL_SEC", "1800"))
+        suppress_dm = os.getenv("SUPPRESS_DM_SIGNALS", "1") == "1"
 
         universe_top_n = int(os.getenv("UNIVERSE_TOP_N", "15"))
         ws_symbols_max = int(os.getenv("WS_SYMBOLS_MAX", "60"))
@@ -112,7 +109,6 @@ class BybitClient:
     @classmethod
     async def create(cls) -> "BybitClient":
         self = cls()
-        # создаём сессию ТОЛЬКО внутри event loop
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
         return self
 
@@ -128,10 +124,6 @@ class BybitClient:
             return await resp.json()
 
     async def get_linear_instruments(self) -> List[str]:
-        """
-        Берём список линейных USDT контрактов с v5/market/instruments-info.
-        Фильтр по суффиксу USDT.
-        """
         params = {"category": "linear", "limit": 1000}
         data = await self._get("/v5/market/instruments-info", params)
         result = data.get("result", {}) or {}
@@ -148,7 +140,6 @@ class BybitClient:
 # ======================================================================
 
 def _channels_only(recipients: List[int], suppress_dm: bool) -> List[int]:
-    """Оставляем только каналы/супергруппы (отрицательные chat_id), если suppress_dm=True."""
     if not suppress_dm:
         return recipients
     return [cid for cid in recipients if isinstance(cid, int) and cid < 0]
@@ -184,7 +175,6 @@ async def send_signal_msg(
     rr: float,
     prob_pct: float
 ) -> None:
-    """Единообразная отправка сигналов: кликабельный хэштег -> Bybit deeplink, кнопки, рассылка только в канал."""
     app_url, _ = _bybit_links(symbol, cfg)
     link_as_hashtag = f'<a href="{app_url}">#{symbol.upper()}</a>'
 
@@ -210,7 +200,6 @@ async def send_signal_msg(
                 disable_web_page_preview=True,
             )
         except Exception:
-            # не валим весь поток из-за 1 ошибки отправки
             pass
 
 # ======================================================================
@@ -270,7 +259,6 @@ def _is_allowed(cfg: Config, update: Update) -> bool:
     chat = update.effective_chat
     if not chat:
         return False
-    # если список ALLOWED_CHAT_IDS пуст — не ограничиваем
     if not cfg.ALLOWED_CHAT_IDS:
         return True
     return chat.id in cfg.ALLOWED_CHAT_IDS
@@ -322,42 +310,18 @@ async def job_online(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def job_rotate_universe(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     uni: Universe = app.bot_data.get("universe")  # type: ignore
-    cfg: Config = app.bot_data["cfg"]  # type: ignore
     if not uni:
         return
     uni.rotate()
-    # необязательное уведомление раз в ротацию — по желанию можно выключить
-    # targets = _channels_only(cfg.PRIMARY_RECIPIENTS, cfg.SUPPRESS_DM_SIGNALS)
-    # for cid in targets:
-    #     try:
-    #         await app.bot.send_message(chat_id=cid, text=f"Ротация: active={len(uni.active)}")
-    #     except Exception:
-    #         pass
 
 
-# Заглушка для сканера — оставлена минимальной, чтобы ничего лишнего не менять.
 async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     cfg: Config = app.bot_data["cfg"]  # type: ignore
     uni: Universe = app.bot_data.get("universe")  # type: ignore
     if not uni or not uni.active:
         return
-
-    # Здесь оставляем вызов вашего реального анализа,
-    # а отправку заменяем на send_signal_msg(...) — это единственное изменение в логике сигналов.
-    # Ниже — пример-заглушка: ничего не шлём.
-    # Пример использования:
-    #
-    # await send_signal_msg(
-    #     app.bot, cfg, cfg.PRIMARY_RECIPIENTS,
-    #     symbol="BTCUSDT",
-    #     direction="long",
-    #     price_now=60000.0, entry=60010.0, take=60750.0, stop=59700.0,
-    #     rr=2.27, prob_pct=75.0
-    # )
-    #
-    # В остальном — ваш код анализа не трогаем.
-    return
+    # тут ваш анализ; отправка через send_signal_msg(...)
 
 # ======================================================================
 #                               MAIN
@@ -366,13 +330,13 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def main_async() -> None:
     cfg = Config.load()
 
-    # Запускаем health-сервер, чтобы Render видел открытый порт
+    # health порт для Render
     asyncio.create_task(start_health_server(cfg.PORT))
 
     # Telegram application
     application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
 
-    # Делаем Bybit-клиент внутри event loop
+    # Bybit client
     bybit = await BybitClient.create()
 
     # Вселенная
@@ -380,31 +344,36 @@ async def main_async() -> None:
     try:
         all_syms = await bybit.get_linear_instruments()
     except Exception:
-        # если Bybit временно недоступен, не валим старта — просто пустая вселенная
         all_syms = []
 
     universe = Universe(all_syms, ws_symbols_max=cfg.WS_SYMBOLS_MAX)
 
-    # Сохраняем в bot_data (чтобы не ломать остальной код)
+    # shared state
     application.bot_data["cfg"] = cfg
     application.bot_data["bybit"] = bybit
     application.bot_data["universe"] = universe
 
-    # Команды
+    # handlers
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
 
-    # JobQueue: онлайн-пульс, ротация, скан
+    # jobs
     jq = application.job_queue
     jq.run_repeating(job_online, interval=cfg.ONLINE_INTERVAL_SEC, first=10, name="job_online")
     jq.run_repeating(job_rotate_universe, interval=cfg.ROTATE_MIN * 60, first=30, name="job_rotate")
     jq.run_repeating(job_scan, interval=30, first=15, name="job_scan")
 
-    # Старт long-polling (без вебхуков). close_loop оставляем по умолчанию.
-    await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # ---------- THE ONLY CHANGE HERE ----------
+    # избегаем попытки закрыть уже работающий loop
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        stop_signals=None,
+        close_loop=False,   # <— ключ к вашей ошибке
+    )
+    # -----------------------------------------
 
-    # корректное закрытие Bybit-сессии после остановки
     try:
         await bybit.close()
     except Exception:
