@@ -437,18 +437,29 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             pass
     logger.info(f"[kline] {symbol}: chg={_fmt_pct(chg)} volx={vol_mult:.2f} atr={atr_val:.6f} body={body:.6f}")
 
-    # --- OPEN INTEREST ---
+    # --- OPEN INTEREST ---  (ИСПРАВЛЕНО: парсим словари v5)
     oi_ok = (oi or {}).get("retCode") == 0
     oi_list = ((oi or {}).get("result") or {}).get("list") or []
     oi_d = 0.0
     oi_last = 0.0
     if oi_ok and len(oi_list) >= 2:
         try:
-            oi_prev = float(oi_list[-2][1])  # value
-            oi_last = float(oi_list[-1][1])
+            def _oi_val(item: Any) -> float:
+                # v5 обычный формат — словарь {"openInterest": "...", "timestamp": "..."}
+                if isinstance(item, dict):
+                    v = item.get("openInterest") or item.get("value") or item.get("open_interest") or item.get("oi")
+                    return float(v or 0)
+                # совместимость на случай массивов [ts, value]
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    return float(item[1] or 0)
+                return 0.0
+
+            oi_prev = _oi_val(oi_list[-2])
+            oi_last = _oi_val(oi_list[-1])
             oi_d = (oi_last - oi_prev) / oi_prev if oi_prev else 0.0
         except Exception:
-            pass
+            oi_d = 0.0
+            oi_last = 0.0
     logger.info(f"[open-interest] {symbol}: d_5min={_fmt_pct(oi_d)} last={oi_last:.3f}")
 
     # --- LIQUIDATIONS ---
@@ -480,6 +491,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     cond_body = body >= cfg.body_atr_mult * atr_val if atr_val > 0 else False
     cond_oi = (chg > 0 and oi_d > 0) or (chg < 0 and oi_d < 0)
     cond_liq = liq_events >= 1
+
+    # Доп. отладка условий — видно при LOG_LEVEL=DEBUG
+    logger.debug(f"[triggers] {symbol}: cond_vol={cond_vol} cond_body={cond_body} cond_oi={cond_oi} cond_liq={cond_liq}")
 
     if cond_vol and cond_body and cond_oi and cond_liq and last_close > 0:
         side = "LONG" if chg > 0 else "SHORT"
