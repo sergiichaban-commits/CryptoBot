@@ -135,7 +135,7 @@ class Config:
         self.liq_events_min: int = kw.get("liq_events_min", 5)              # мин. число событий
         self.liq_notional_min: float = kw.get("liq_notional_min", 25000.0)  # мин. номинал (USDT)
         self.liq_reversal_lookback: int = kw.get("liq_reversal_lookback", 3)  # глубина проверки реверса
-        self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.2)        # мин. объём для liq-сигнала
+        self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.05)        # ↓ было 1.2
 
     @staticmethod
     def load() -> "Config":
@@ -186,7 +186,7 @@ class Config:
             liq_events_min=_env_int("LIQ_EVENTS_MIN", 5),
             liq_notional_min=_env_float("LIQ_NOTIONAL_MIN", 25000.0),
             liq_reversal_lookback=_env_int("LIQ_REVERSAL_LOOKBACK", 3),
-            liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.2),
+            liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.05),  # ↓ было 1.2
         )
 
 
@@ -513,21 +513,28 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     # Идея: после крупной односторонней волны ликвидаций ждём разворот цены в противоположную сторону.
     # Требования: достаточный «шок», согласованный переворот на последней свече и минимальный объём.
     if cfg.liq_enable_reversal and last_close > 0 and atr_val > 0:
-        liq_shock = (liq_events >= cfg.liq_events_min) or (liq_notional >= cfg.liq_notional_min)
+        # ↓ точечная правка: мягче критерии «шока»
+        liq_shock = (
+            (liq_events >= cfg.liq_events_min)
+            or (liq_notional >= cfg.liq_notional_min)
+            or (liq_events >= 3)
+            or (liq_notional >= 0.6 * cfg.liq_notional_min)
+        )
+
         expected_side: Optional[str] = None
         if side_short > side_long:
             expected_side = "LONG"   # больше sell-ликвидов → ищем отскок вверх
         elif side_long > side_short:
             expected_side = "SHORT"  # больше buy-ликвидов → ждём разворот вниз
 
-        # простая проверка реверса по последним барам: направление последней свечи
-        # + тело хотя бы половина от базового порога
+        # ↓ точечная правка: порог тела свечи 0.4 вместо 0.5
         rev_ok = False
         if expected_side == "LONG":
-            rev_ok = (chg > 0) and (body >= 0.5 * cfg.body_atr_mult * atr_val)
+            rev_ok = (chg > 0) and (body >= 0.4 * cfg.body_atr_mult * atr_val)
         elif expected_side == "SHORT":
-            rev_ok = (chg < 0) and (body >= 0.5 * cfg.body_atr_mult * atr_val)
+            rev_ok = (chg < 0) and (body >= 0.4 * cfg.body_atr_mult * atr_val)
 
+        # ↓ точечная правка: по умолчанию требуем vol_mult >= 1.05 (можно поднять через ENV)
         vol_ok = vol_mult >= cfg.liq_vol_mult_min
 
         logger.info(f"[liq-reversal] {symbol}: shock={liq_shock} expect={expected_side or '-'} rev_ok={rev_ok} vol_ok={vol_ok}")
@@ -549,7 +556,7 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
                 tp = entry - tp_dist
 
             # вероятность — базовая + бонус за шок ликвидаций
-            prob = 0.62 + min(0.20, 0.03 * (liq_events - cfg.liq_events_min) + 0.00001 * max(0.0, liq_notional - cfg.liq_notional_min))
+            prob = 0.62 + min(0.20, 0.03 * max(0, liq_events - 3) + 0.00001 * max(0.0, liq_notional - 0.6 * cfg.liq_notional_min))
 
             return {
                 "symbol": symbol,
