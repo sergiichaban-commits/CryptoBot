@@ -130,6 +130,13 @@ class Config:
         self.atr_period: int = kw.get("atr_period", 14)
         self.body_atr_mult: float = kw.get("body_atr_mult", 0.60)
 
+        # --- ДОБАВЛЕНО: параметры «шока ликвидаций» и реверс-сценария ---
+        self.liq_enable_reversal: bool = kw.get("liq_enable_reversal", True)
+        self.liq_events_min: int = kw.get("liq_events_min", 5)              # мин. число событий
+        self.liq_notional_min: float = kw.get("liq_notional_min", 25000.0)  # мин. номинал (USDT)
+        self.liq_reversal_lookback: int = kw.get("liq_reversal_lookback", 3)  # глубина проверки реверса
+        self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.2)        # мин. объём для liq-сигнала
+
     @staticmethod
     def load() -> "Config":
         token = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
@@ -173,6 +180,13 @@ class Config:
             vol_mult=_env_float("VOL_MULT", 2.0),
             atr_period=_env_int("ATR_PERIOD", 14),
             body_atr_mult=_env_float("BODY_ATR_MULT", 0.60),
+
+            # --- ДОБАВЛЕНО: ENV для liq-reversal ---
+            liq_enable_reversal=_env_bool("LIQ_REVERSAL_ENABLED", True),
+            liq_events_min=_env_int("LIQ_EVENTS_MIN", 5),
+            liq_notional_min=_env_float("LIQ_NOTIONAL_MIN", 25000.0),
+            liq_reversal_lookback=_env_int("LIQ_REVERSAL_LOOKBACK", 3),
+            liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.2),
         )
 
 
@@ -446,7 +460,8 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     for it in lq_list:
         try:
             liq_events += 1
-            liq_notional += float(it.get("value", 0) or 0)  # может быть qty/USDT — зависит от ответа; лог — ориентир
+            # Обычно 'value' — USDT-номинал; если нет — будет 0. Это ок.
+            liq_notional += float(it.get("value", 0) or 0)
             s = (it.get("side") or "").lower()
             if s == "buy":
                 side_long += 1
@@ -457,24 +472,20 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     dom = "long>short" if side_long > side_short else ("short>long" if side_short > side_long else "balanced")
     logger.info(f"[liquidation] {symbol}: events={liq_events} notional≈{liq_notional:.0f} side={dom}")
 
-    # --- ПРОСТЕЙШИЙ ТРИГГЕР ---
-    # сигналы только если включено
+    # --- БАЗОВЫЙ ТРИГГЕР (как было) ---
     if not cfg.analysis_enabled:
         return None
 
-    # условия: всплеск объёма + тело свечи >= body_atr_mult*ATR + направленное изменение OI + есть ликвидации
     cond_vol = vol_mult >= cfg.vol_mult
     cond_body = body >= cfg.body_atr_mult * atr_val if atr_val > 0 else False
-    # направление: if chg>0 => хотим рост OI, если chg<0 => падение OI
     cond_oi = (chg > 0 and oi_d > 0) or (chg < 0 and oi_d < 0)
     cond_liq = liq_events >= 1
 
     if cond_vol and cond_body and cond_oi and cond_liq and last_close > 0:
         side = "LONG" if chg > 0 else "SHORT"
 
-        # элементарный SL/TP от ATR
         sl_dist = max(1e-6, cfg.body_atr_mult * atr_val)
-        rr = 2.0 + max(0.0, min(1.0, vol_mult - cfg.vol_mult)) * 0.5  # чтобы не было одинаковых R/R
+        rr = 2.0 + max(0.0, min(1.0, vol_mult - cfg.vol_mult)) * 0.5  # чуть разбросать R/R
         tp_dist = rr * sl_dist
 
         if side == "LONG":
@@ -486,7 +497,6 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             sl = entry + sl_dist
             tp = entry - tp_dist
 
-        # псевдо-вероятность: 60..82% в зависимости от vol_mult и согласованности OI
         prob = 0.60 + min(0.22, 0.04 * max(0.0, vol_mult - cfg.vol_mult) + (0.04 if cond_oi else 0.0))
 
         return {
@@ -498,6 +508,58 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             "rr": rr,
             "prob": prob,
         }
+
+    # --- ДОБАВЛЕНО: LIQUIDATION SHOCK → REVERSAL ---
+    # Идея: после крупной односторонней волны ликвидаций ждём разворот цены в противоположную сторону.
+    # Требования: достаточный «шок», согласованный переворот на последней свече и минимальный объём.
+    if cfg.liq_enable_reversal and last_close > 0 and atr_val > 0:
+        liq_shock = (liq_events >= cfg.liq_events_min) or (liq_notional >= cfg.liq_notional_min)
+        expected_side: Optional[str] = None
+        if side_short > side_long:
+            expected_side = "LONG"   # больше sell-ликвидов → ищем отскок вверх
+        elif side_long > side_short:
+            expected_side = "SHORT"  # больше buy-ликвидов → ждём разворот вниз
+
+        # простая проверка реверса по последним барам: направление последней свечи
+        # + тело хотя бы половина от базового порога
+        rev_ok = False
+        if expected_side == "LONG":
+            rev_ok = (chg > 0) and (body >= 0.5 * cfg.body_atr_mult * atr_val)
+        elif expected_side == "SHORT":
+            rev_ok = (chg < 0) and (body >= 0.5 * cfg.body_atr_mult * atr_val)
+
+        vol_ok = vol_mult >= cfg.liq_vol_mult_min
+
+        logger.info(f"[liq-reversal] {symbol}: shock={liq_shock} expect={expected_side or '-'} rev_ok={rev_ok} vol_ok={vol_ok}")
+
+        if liq_shock and expected_side and rev_ok and vol_ok:
+            side = expected_side
+
+            # тот же калькулятор SL/TP, но R/R чуть поднимем, т.к. это отдельный сетап
+            sl_dist = max(1e-6, 0.8 * cfg.body_atr_mult * atr_val)  # чуть ближе стоп для реверса
+            rr = 2.2 + min(0.6, 0.2 * max(0.0, vol_mult - cfg.liq_vol_mult_min))
+            tp_dist = rr * sl_dist
+
+            entry = last_close
+            if side == "LONG":
+                sl = entry - sl_dist
+                tp = entry + tp_dist
+            else:
+                sl = entry + sl_dist
+                tp = entry - tp_dist
+
+            # вероятность — базовая + бонус за шок ликвидаций
+            prob = 0.62 + min(0.20, 0.03 * (liq_events - cfg.liq_events_min) + 0.00001 * max(0.0, liq_notional - cfg.liq_notional_min))
+
+            return {
+                "symbol": symbol,
+                "side": side,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "rr": rr,
+                "prob": min(prob, 0.85),
+            }
 
     return None
 
@@ -687,6 +749,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ANALYSIS_ENABLED={cfg.analysis_enabled} BATCH_SIZE={cfg.analysis_batch_size}\n"
         f"SIGNAL_TTL_MIN={cfg.signal_ttl_min} SIGNAL_COOLDOWN_SEC={cfg.signal_cooldown_sec}\n"
         f"VOL_SMA_PERIOD={cfg.vol_sma_period} VOL_MULT={cfg.vol_mult} ATR_PERIOD={cfg.atr_period} BODY_ATR_MULT={cfg.body_atr_mult}\n"
+        f"LIQ_REVERSAL_ENABLED={cfg.liq_enable_reversal} LIQ_EVENTS_MIN={cfg.liq_events_min} LIQ_NOTIONAL_MIN={cfg.liq_notional_min} "
+        f"LIQ_REVERSAL_LOOKBACK={cfg.liq_reversal_lookback} LIQ_VOL_MULT_MIN={cfg.liq_vol_mult_min}\n"
         f"PUBLIC_URL={cfg.public_url or '-'} PORT={cfg.port}\n"
         f"universe total={st.total} active={st.active} ws_topics={st.ws_topics} batch#{st.batch}\n"
     )
