@@ -96,7 +96,7 @@ class Config:
         self.first_scan_delay_sec: int = kw.get("first_scan_delay_sec", 10)
         self.heartbeat_sec: int = kw.get("heartbeat_sec", 900)
 
-        # >>> CHANGE: добавлен конфиг интервала сканирования
+        # интервал сканирования
         self.scan_interval_sec: int = kw.get("scan_interval_sec", 30)
 
         # Параметры «вселенной»
@@ -106,7 +106,7 @@ class Config:
         # Bybit
         self.bybit_base: str = kw.get("bybit_base", "https://api.bybit.com")
 
-        # >>> CHANGE: Keepalive (само-пинг)
+        # Keepalive (само-пинг)
         self.public_url: Optional[str] = kw.get("public_url")
         self.self_ping: bool = kw.get("self_ping", True)
         self.self_ping_interval_sec: int = kw.get("self_ping_interval_sec", 780)  # ~13 мин
@@ -117,7 +117,6 @@ class Config:
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN is required")
 
-        # >>> CHANGE: читаем PUBLIC_URL/RENDER_EXTERNAL_URL для keepalive
         pub_url = (
             os.getenv("PUBLIC_URL")
             or os.getenv("RENDER_EXTERNAL_URL")
@@ -135,7 +134,6 @@ class Config:
             first_scan_delay_sec=_env_int("FIRST_SCAN_DELAY_SEC", 10),
             heartbeat_sec=_env_int("HEARTBEAT_SEC", 900),
 
-            # >>> CHANGE: читаем SCAN_INTERVAL_SEC
             scan_interval_sec=_env_int("SCAN_INTERVAL_SEC", 30),
 
             universe_top_n=_env_int("UNIVERSE_TOP_N", 30),
@@ -143,7 +141,6 @@ class Config:
 
             bybit_base=os.getenv("BYBIT_BASE", "https://api.bybit.com"),
 
-            # >>> CHANGE: keepalive env
             public_url=pub_url,
             self_ping=_env_bool("SELF_PING", True),
             self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 780),
@@ -263,7 +260,7 @@ async def notify(
     if cfg.only_channel:
         recipients = [cid for cid in recipients if isinstance(cid, int) and cid < 0]
 
-    # >>> CHANGE: предупреждение, если некуда слать
+    # предупреждение, если некуда слать
     if not recipients:
         logger.warning(
             "[notify] recipients list is empty. ONLY_CHANNEL=%s, PRIMARY_RECIPIENTS=%s",
@@ -319,11 +316,10 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.sleep(0)
 
 
-# >>> CHANGE: keepalive — периодический само-пинг, чтобы Render не засыпал
+# keepalive — периодический само-пинг, чтобы Render не засыпал
 async def job_keepalive(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     cfg: Config = app.bot_data["cfg"]
-    # приоритет — внешний публичный URL, иначе локальный health
     url = (cfg.public_url + "/health") if cfg.public_url else f"http://127.0.0.1:{cfg.port}/health"
     try:
         timeout = aiohttp.ClientTimeout(total=10)
@@ -372,7 +368,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await cmd_universe(update, context)
 
 
-# >>> CHANGE: команда /jobs — показать расписание задач
 def _fmt_dt(dt) -> str:
     try:
         return dt.isoformat(sep=" ", timespec="seconds")
@@ -392,7 +387,6 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("\n".join(lines))
 
 
-# >>> CHANGE: команда /debug — краткая диагностика
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     if not _is_allowed(update, cfg):
@@ -426,25 +420,22 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
     try:
         jq = app.job_queue
 
-        # >>> CHANGE: сохраняем ссылки на Job-объекты
+        # >>> ЕДИНСТВЕННАЯ ПРАВКА: перенос coalesce/misfire_grace_time в job_kwargs
         job_scan_obj = jq.run_repeating(
             job_scan,
-            interval=cfg.scan_interval_sec,  # <<< CHANGE: из конфига
+            interval=cfg.scan_interval_sec,
             first=cfg.first_scan_delay_sec,
             name="job_scan",
-            coalesce=True,
-            misfire_grace_time=30,
+            job_kwargs={"misfire_grace_time": 30, "coalesce": True},
         )
         job_hb_obj = jq.run_repeating(
             job_heartbeat,
             interval=cfg.heartbeat_sec,
             first=120,
             name="job_heartbeat",
-            coalesce=True,
-            misfire_grace_time=120,
+            job_kwargs={"misfire_grace_time": 120, "coalesce": True},
         )
 
-        # >>> CHANGE: планируем keepalive, если включен
         job_ka_obj = None
         if cfg.self_ping:
             job_ka_obj = jq.run_repeating(
@@ -452,8 +443,7 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
                 interval=cfg.self_ping_interval_sec,
                 first=cfg.self_ping_interval_sec,
                 name="job_keepalive",
-                coalesce=True,
-                misfire_grace_time=cfg.self_ping_interval_sec,
+                job_kwargs={"misfire_grace_time": cfg.self_ping_interval_sec, "coalesce": True},
             )
 
         jobs_map: Dict[str, Any] = {
@@ -474,7 +464,7 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# MAIN — явный lifecycle (фикс RuntimeError и отсутствия wait_until_closed)
+# MAIN — явный lifecycle
 # -----------------------------------------------------------------------------
 async def main_async() -> None:
     cfg = Config.load()
@@ -491,7 +481,6 @@ async def main_async() -> None:
     application.bot_data["universe_state"] = UniverseState()
     application.bot_data["bybit"] = BybitClient(cfg.bybit_base)
 
-    # >>> CHANGE: логируем ключевые конфиги и предупреждаем, если некуда слать
     chan_ids = [cid for cid in cfg.primary_recipients if isinstance(cid, int) and cid < 0]
     logger.info(
         "[cfg] ONLY_CHANNEL=%s PRIMARY_RECIPIENTS=%s ALLOWED_CHAT_IDS=%s PORT=%s",
@@ -506,11 +495,10 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
-    # >>> CHANGE: регистрируем новые/алиасы команд
     application.add_handler(CommandHandler("jobs", cmd_jobs))
     application.add_handler(CommandHandler("debug", cmd_debug))
-    application.add_handler(CommandHandler("diag", cmd_debug))          # <<< добавлен алиас
-    application.add_handler(CommandHandler("diagnostics", cmd_debug))   # <<< добавлен алиас
+    application.add_handler(CommandHandler("diag", cmd_debug))
+    application.add_handler(CommandHandler("diagnostics", cmd_debug))
 
     # 4) Удаляем вебхук перед polling
     try:
@@ -536,9 +524,9 @@ async def main_async() -> None:
             logger.error("Another instance is polling (Conflict). Exiting this one.")
             return
 
-        # --- ОЖИДАНИЕ (замена отсутствующего Updater.wait_until_closed) ---
+        # --- ОЖИДАНИЕ ---
         stop_forever = asyncio.Event()
-        await stop_forever.wait()  # блокируемся, пока процесс живёт
+        await stop_forever.wait()
 
     finally:
         # --- КОРРЕКТНАЯ ОСТАНОВКА ---
