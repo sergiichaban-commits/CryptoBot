@@ -351,7 +351,7 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# MAIN — явный lifecycle вместо run_polling (фикс RuntimeError)
+# MAIN — явный lifecycle (фикс RuntimeError и отсутствия wait_until_closed)
 # -----------------------------------------------------------------------------
 async def main_async() -> None:
     cfg = Config.load()
@@ -379,13 +379,15 @@ async def main_async() -> None:
     except Exception:
         logger.exception("delete_webhook failed")
 
-    # 5) Тёплый старт и задания
-    application.create_task(_warmup_and_schedule(application, cfg), name="warmup")
-
-    # 6) Явное управление жизненным циклом (без run_until_complete внутри PTB)
     try:
+        # --- ИНИЦИАЛИЗАЦИЯ/СТАРТ ---
         await application.initialize()
         await application.start()
+
+        # тёплый старт и задания запускаем ПОСЛЕ старта приложения
+        application.create_task(_warmup_and_schedule(application, cfg), name="warmup")
+
+        # --- ЗАПУСК POLLING ---
         try:
             await application.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -395,11 +397,18 @@ async def main_async() -> None:
             logger.error("Another instance is polling (Conflict). Exiting this one.")
             return
 
-        # Блокируемся, пока не остановят
-        await application.updater.wait_until_closed()
+        # --- ОЖИДАНИЕ (замена отсутствующего Updater.wait_until_closed) ---
+        stop_forever = asyncio.Event()
+        await stop_forever.wait()  # блокируемся, пока процесс живёт
 
     finally:
-        # Остановка и корректное завершение
+        # --- КОРРЕКТНАЯ ОСТАНОВКА ---
+        try:
+            # останавливаем polling явно
+            if application.updater:
+                await application.updater.stop()
+        except Exception:
+            pass
         try:
             await application.stop()
         except Exception:
