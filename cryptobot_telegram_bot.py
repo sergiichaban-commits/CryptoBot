@@ -442,9 +442,11 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
-    # >>> CHANGE: регистрируем новые команды
+    # >>> CHANGE: регистрируем новые/алиасы команд
     application.add_handler(CommandHandler("jobs", cmd_jobs))
     application.add_handler(CommandHandler("debug", cmd_debug))
+    application.add_handler(CommandHandler("diag", cmd_debug))          # <<< добавлен алиас
+    application.add_handler(CommandHandler("diagnostics", cmd_debug))   # <<< добавлен алиас
 
     # 4) Удаляем вебхук перед polling
     try:
