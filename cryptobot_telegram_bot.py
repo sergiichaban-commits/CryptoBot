@@ -1,99 +1,58 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import json
-import logging
-import math
 import os
-import random
-import string
-import threading
+import asyncio
 import time
-from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional, Tuple
+import math
+import logging
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, replace
 
 import aiohttp
+from aiohttp import web
+
+import numpy as np
+import pandas as pd
+
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 
-# ============================ ЛОГИ ============================
+# --------------------------------
+# ЛОГИ
+# --------------------------------
 logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO,
 )
-log = logging.getLogger("cryptobot")
+log = logging.getLogger(__name__)
 
 
-# ============================ УТИЛС ============================
-def _parse_int_list(val: str) -> List[int]:
-    if not val:
-        return []
-    try:
-        if val.strip().startswith("["):
-            arr = json.loads(val)
-            return [int(x) for x in arr]
-        return [int(x.strip()) for x in val.split(",") if x.strip()]
-    except Exception:
-        return []
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _random_path(n=8) -> str:
-    return "/wh-" + "".join(random.choice(string.digits) for _ in range(n))
-
-
-# ============================ КОНФИГ ============================
-@dataclass
+# --------------------------------
+# КОНФИГ
+# --------------------------------
+@dataclass(frozen=True)
 class Config:
     TELEGRAM_TOKEN: str
     ALLOWED_CHAT_IDS: List[int]
     PRIMARY_RECIPIENTS: List[int]
 
-    PUBLIC_URL: str
     PORT: int
-
-    HEALTH_SECONDS: int
-    FIRST_HEALTH_DELAY: int
-    SELF_PING_SECONDS: int
+    PUBLIC_URL: str  # может быть пустым -> работаем в режиме polling
+    HEALTH_SEC: int
+    SELF_PING_SEC: int
 
     SIGNAL_COOLDOWN_SEC: int
     SIGNAL_TTL_MIN: int
 
-    UNIVERSE_MODE: str
-    UNIVERSE_TOP_N: int
     WS_SYMBOLS_MAX: int
     ROTATE_MIN: int
 
     PROB_MIN: float
-    PROFIT_MIN_PCT: float
     RR_MIN: float
+    PROFIT_MIN_PCT: float
 
     VOL_MULT: float
     VOL_SMA_PERIOD: int
@@ -101,194 +60,185 @@ class Config:
     ATR_PERIOD: int
 
     @staticmethod
+    def _read_list_int(name: str, default: Optional[str]) -> List[int]:
+        raw = os.getenv(name, default or "").strip()
+        if not raw:
+            return []
+        out: List[int] = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                out.append(int(tok))
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
     def load() -> "Config":
         token = os.getenv("TELEGRAM_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN is required")
 
-        allowed = _parse_int_list(os.getenv("ALLOWED_CHAT_IDS", ""))
-        primary = _parse_int_list(os.getenv("PRIMARY_RECIPIENTS", "")) or allowed
+        allowed = Config._read_list_int("ALLOWED_CHAT_IDS", os.getenv("PRIMARY_CHAT_ID", ""))  # bwd compat
+        if not allowed:
+            # В крайнем случае — разрешим только себе (если указан PRIMARY_CHAT_ID)
+            prim_chat = os.getenv("PRIMARY_CHAT_ID", "").strip()
+            if prim_chat:
+                try:
+                    allowed = [int(prim_chat)]
+                except Exception:
+                    allowed = []
+        recipients = Config._read_list_int("PRIMARY_RECIPIENTS", os.getenv("PRIMARY_CHAT_ID", "")) or allowed
 
+        port = int(os.getenv("PORT", "10000"))
         public_url = os.getenv("PUBLIC_URL", "").strip()
-        port = _env_int("PORT", 10000)
 
-        health = _env_int("HEALTH_SECONDS", 20 * 60)
-        first = _env_int("FIRST_HEALTH_DELAY", 60)
-        self_ping = _env_int("SELF_PING_SECONDS", 13 * 60)
+        health = int(os.getenv("HEALTH_SEC", "1200"))           # 20 мин
+        self_ping = int(os.getenv("SELF_PING_SEC", "780"))      # 13 мин
 
-        cooldown = _env_int("SIGNAL_COOLDOWN_SEC", 600)
-        ttl = _env_int("SIGNAL_TTL_MIN", 12)
+        cooldown = int(os.getenv("SIGNAL_COOLDOWN_SEC", "600"))
+        ttl_min = int(os.getenv("SIGNAL_TTL_MIN", "12"))
 
-        universe_mode = os.getenv("UNIVERSE_MODE", "all").strip()  # all/top
-        universe_top = _env_int("UNIVERSE_TOP_N", 15)
-        ws_symbols = _env_int("WS_SYMBOLS_MAX", 60)
-        rotate_min = _env_int("ROTATE_MIN", 5)
+        ws_max = int(os.getenv("WS_SYMBOLS_MAX", "60"))
+        rotate_min = int(os.getenv("ROTATE_MIN", "5"))
 
-        prob_min = _env_float("PROB_MIN", 69.9)
-        profit_min_pct = _env_float("PROFIT_MIN_PCT", 1.0)  # порог прибыли 1%
-        rr_min = _env_float("RR_MIN", 2.0)
+        prob_min = float(os.getenv("PROB_MIN", "69.9"))
+        rr_min = float(os.getenv("RR_MIN", "2.0"))
+        profit_min = float(os.getenv("PROFIT_MIN_PCT", "1.0"))
 
-        vol_mult = _env_float("VOL_MULT", 2.0)
-        vol_sma = _env_int("VOL_SMA_PERIOD", 20)
-        body_atr = _env_float("BODY_ATR_MULT", 0.60)
-        atr_period = _env_int("ATR_PERIOD", 14)
+        vol_mult = float(os.getenv("VOL_MULT", "2.0"))
+        vol_sma = int(os.getenv("VOL_SMA_PERIOD", "20"))
+        body_atr = float(os.getenv("BODY_ATR_MULT", "0.60"))
+        atr_period = int(os.getenv("ATR_PERIOD", "14"))
 
-        cfg = Config(
+        log.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", allowed)
+        log.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", recipients)
+        log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%d", public_url, port)
+        log.info("INFO [cfg] HEALTH=%ss SELF_PING=%ss", health, self_ping)
+        log.info(
+            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%d SIGNAL_TTL_MIN=%d WS_SYMBOLS_MAX=%d ROTATE_MIN=%d PROB_MIN>%.1f PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
+            cooldown, ttl_min, ws_max, rotate_min, prob_min, profit_min, rr_min
+        )
+        log.info(
+            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
+            vol_mult, vol_sma, body_atr, atr_period
+        )
+
+        return Config(
             TELEGRAM_TOKEN=token,
             ALLOWED_CHAT_IDS=allowed,
-            PRIMARY_RECIPIENTS=primary,
-            PUBLIC_URL=public_url,
+            PRIMARY_RECIPIENTS=recipients,
             PORT=port,
-            HEALTH_SECONDS=health,
-            FIRST_HEALTH_DELAY=first,
-            SELF_PING_SECONDS=self_ping,
+            PUBLIC_URL=public_url,
+            HEALTH_SEC=health,
+            SELF_PING_SEC=self_ping,
             SIGNAL_COOLDOWN_SEC=cooldown,
-            SIGNAL_TTL_MIN=ttl,
-            UNIVERSE_MODE=universe_mode,
-            UNIVERSE_TOP_N=universe_top,
-            WS_SYMBOLS_MAX=ws_symbols,
+            SIGNAL_TTL_MIN=ttl_min,
+            WS_SYMBOLS_MAX=ws_max,
             ROTATE_MIN=rotate_min,
             PROB_MIN=prob_min,
-            PROFIT_MIN_PCT=profit_min_pct,
             RR_MIN=rr_min,
+            PROFIT_MIN_PCT=profit_min,
             VOL_MULT=vol_mult,
             VOL_SMA_PERIOD=vol_sma,
             BODY_ATR_MULT=body_atr,
             ATR_PERIOD=atr_period,
         )
 
-        log.info("INFO [cfg] ALLOWED_CHAT_IDS=%s", cfg.ALLOWED_CHAT_IDS)
-        log.info("INFO [cfg] PRIMARY_RECIPIENTS=%s", cfg.PRIMARY_RECIPIENTS)
-        log.info("INFO [cfg] PUBLIC_URL='%s' PORT=%s", cfg.PUBLIC_URL, cfg.PORT)
-        log.info("INFO [cfg] HEALTH=%ss FIRST=%ss SELF_PING=%ss", cfg.HEALTH_SECONDS, cfg.FIRST_HEALTH_DELAY, cfg.SELF_PING_SECONDS)
-        log.info(
-            "INFO [cfg] SIGNAL_COOLDOWN_SEC=%s SIGNAL_TTL_MIN=%s UNIVERSE_MODE=%s "
-            "UNIVERSE_TOP_N=%s WS_SYMBOLS_MAX=%s ROTATE_MIN=%s PROB_MIN>%.1f "
-            "PROFIT_MIN_PCT>=%.1f%% RR_MIN>=%.2f",
-            cfg.SIGNAL_COOLDOWN_SEC, cfg.SIGNAL_TTL_MIN, cfg.UNIVERSE_MODE,
-            cfg.UNIVERSE_TOP_N, cfg.WS_SYMBOLS_MAX, cfg.ROTATE_MIN, cfg.PROB_MIN,
-            cfg.PROFIT_MIN_PCT, cfg.RR_MIN,
-        )
-        log.info(
-            "INFO [cfg] Trigger params: VOL_MULT=%.2f, VOL_SMA_PERIOD=%d, BODY_ATR_MULT=%.2f, ATR_PERIOD=%d",
-            cfg.VOL_MULT, cfg.VOL_SMA_PERIOD, cfg.BODY_ATR_MULT, cfg.ATR_PERIOD,
-        )
-        return cfg
 
+# --------------------------------
+# BYBIT CLIENT
+# --------------------------------
+BYBIT_V5 = "https://api.bybit.com"
 
-# ============================ BYBIT API ============================
 class BybitClient:
-    BASE_URL = "https://api.bybit.com"
+    def __init__(self) -> None:
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    def __init__(self, session: aiohttp.ClientSession):
-        self._session = session
+    async def start(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
 
-    async def _get(self, path: str, params: Dict) -> Dict:
-        url = f"{self.BASE_URL}{path}"
-        async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data
+    async def close(self):
+        if self._session:
+            await self._session.close()
+            self._session = None
 
-    async def get_symbols_linear(self) -> List[str]:
+    async def _get(self, path: str, params: Dict[str, str]) -> dict:
+        assert self._session is not None, "session not started"
+        url = f"{BYBIT_V5}{path}"
+        async with self._session.get(url, params=params) as r:
+            r.raise_for_status()
+            js = await r.json()
+            return js
+
+    async def list_futures_usdt(self) -> List[str]:
+        """Все linear USDT-контракты в статусе Trading."""
         out: List[str] = []
-        cursor = ""
+        cursor = None
         while True:
-            params = {"category": "linear", "cursor": cursor, "limit": 500}
-            data = await self._get("/v5/market/instruments-info", params)
-            if data.get("retCode") != 0:
-                raise RuntimeError(f"Bybit instruments error: {data}")
-            result = data.get("result", {}) or {}
-            rows = result.get("list", []) or []
-            for r in rows:
-                if r.get("status") == "Trading" and r.get("quoteCoin") == "USDT" and r.get("contractType") == "LinearPerpetual":
-                    sym = r.get("symbol")
+            params = {"category": "linear"}
+            if cursor:
+                params["cursor"] = cursor
+            js = await self._get("/v5/market/instruments-info", params)
+            if js.get("retCode") != 0:
+                raise RuntimeError(f"Bybit instruments error: {js}")
+            res = js["result"]
+            for it in res.get("list", []):
+                if it.get("status") == "Trading" and it.get("quoteCoin") == "USDT":
+                    sym = it.get("symbol")
                     if sym:
                         out.append(sym)
-            cursor = result.get("nextPageCursor") or ""
+            cursor = res.get("nextPageCursor") or None
             if not cursor:
                 break
-            await asyncio.sleep(0.05)
-        return sorted(list(set(out)))
+        return sorted(set(out))
 
-    async def get_klines(self, symbol: str, interval: str = "5", limit: int = 300) -> List[Dict]:
-        params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-        data = await self._get("/v5/market/kline", params)
-        if data.get("retCode") != 0:
-            raise RuntimeError(f"Bybit kline error: {data}")
-        rows = (data.get("result", {}) or {}).get("list", []) or []
-        candles: List[Dict] = []
-        for r in rows:
-            candles.append({"t": int(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]), "v": float(r[5])})
-        candles.sort(key=lambda x: x["t"])
-        return candles
+    async def get_klines(self, symbol: str, interval: str = "5", limit: int = 300) -> pd.DataFrame:
+        params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
+        js = await self._get("/v5/market/kline", params)
+        if js.get("retCode") != 0:
+            raise RuntimeError(f"Bybit kline error: {js}")
+        arr = js["result"]["list"]
+        # Bybit v5 kline: [start, open, high, low, close, volume, turnover]
+        data = []
+        for row in arr:
+            ts = int(row[0])
+            o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+            v = float(row[5])
+            data.append((ts, o, h, l, c, v))
+        df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+        df.sort_values("ts", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
 
-    async def get_oi(self, symbol: str, interval: str = "5min", limit: int = 6) -> List[Tuple[int, float]]:
-        params = {"category": "linear", "symbol": symbol, "intervalTime": interval, "limit": limit}
-        data = await self._get("/v5/market/open-interest", params)
-        if data.get("retCode") != 0:
-            raise RuntimeError(f"Bybit OI error: {data}")
-        rows = (data.get("result", {}) or {}).get("list", []) or []
-        out: List[Tuple[int, float]] = []
-        for r in rows:
-            out.append((int(r[0]), float(r[1])))
-        out.sort(key=lambda x: x[0])
-        return out
-
-
-# ============================ ИНДИКАТОРЫ ============================
-def _atr(candles: List[Dict], period: int) -> float:
-    if len(candles) < period + 1:
-        return float("nan")
-    trs: List[float] = []
-    for i in range(1, len(candles)):
-        h = candles[i]["h"]
-        l = candles[i]["l"]
-        pc = candles[i - 1]["c"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    if len(trs) < period:
-        return float("nan")
-    return sum(trs[-period:]) / period
+    async def get_oi(self, symbol: str, interval: str = "5min", limit: int = 6) -> pd.DataFrame:
+        params = {"category": "linear", "symbol": symbol, "intervalTime": interval, "limit": str(limit)}
+        js = await self._get("/v5/market/open-interest", params)
+        if js.get("retCode") != 0:
+            raise RuntimeError(f"Bybit OI error: {js}")
+        arr = js["result"]["list"]
+        data = []
+        # list entries: [timestamp, openInterest, ...]
+        for row in arr:
+            ts = int(row[0])
+            oi = float(row[1])
+            data.append((ts, oi))
+        df = pd.DataFrame(data, columns=["ts", "oi"])
+        df.sort_values("ts", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
 
 
-def _volume_sma(candles: List[Dict], period: int) -> float:
-    if len(candles) < period:
-        return float("nan")
-    vs = [c["v"] for c in candles[-period:]]
-    return sum(vs) / max(1, len(vs))
-
-
-def _ema_series(vals: List[float], period: int) -> List[float]:
-    if not vals:
-        return []
-    k = 2.0 / (period + 1.0)
-    ema = []
-    for i, v in enumerate(vals):
-        if i == 0:
-            ema.append(v)
-        else:
-            ema.append(v * k + ema[-1] * (1.0 - k))
-    return ema
-
-
-def _rolling_high(candles: List[Dict], lookback: int) -> float:
-    hi = [c["h"] for c in candles[-lookback:]] if len(candles) >= lookback else [c["h"] for c in candles]
-    return max(hi) if hi else float("nan")
-
-
-def _rolling_low(candles: List[Dict], lookback: int) -> float:
-    lo = [c["l"] for c in candles[-lookback:]] if len(candles) >= lookback else [c["l"] for c in candles]
-    return min(lo) if lo else float("nan")
-
-
-# ============================ СИГНАЛ ============================
-from dataclasses import dataclass as _dataclass
-
-@_dataclass
+# --------------------------------
+# СОСТОЯНИЕ
+# --------------------------------
+@dataclass
 class Signal:
     symbol: str
-    dir: str  # "LONG"/"SHORT"
+    dir: str              # "LONG"/"SHORT"
     price: float
     entry: float
     take: float
@@ -298,242 +248,352 @@ class Signal:
     rr: float
     prob: float
     ttl_min: int
-    created_ts: float = time.time()
+    created_ts: float
+
+@dataclass
+class State:
+    universe_all: List[str]
+    active_symbols: List[str]
+    batch_idx: int
+    ws_topics: int
+
+    last_signal_sent: Dict[str, float]
+    live_signals: Dict[str, Signal]
+
+    last_health_ts: float
 
 
-def _analyze(cfg: Config, symbol: str, candles: List[Dict], oi: List[Tuple[int, float]]) -> Optional[Signal]:
-    need = max(cfg.VOL_SMA_PERIOD, cfg.ATR_PERIOD, 30) + 2
-    if len(candles) < need:
+# --------------------------------
+# ТЕХНИКА/АНАЛИТИКА
+# --------------------------------
+def _atr(df: pd.DataFrame, period: int) -> pd.Series:
+    h, l, c = df["high"].values, df["low"].values, df["close"].values
+    prev_close = np.r_[c[0], c[:-1]]
+    tr = np.maximum(h - l, np.maximum(abs(h - prev_close), abs(l - prev_close)))
+    atr = pd.Series(tr).rolling(window=period, min_periods=period).mean()
+    atr.index = df.index
+    return atr
+
+def _sma(x: pd.Series, period: int) -> pd.Series:
+    return x.rolling(window=period, min_periods=period).mean()
+
+def _analyze(cfg: Config, symbol: str, kl: pd.DataFrame, oi: pd.DataFrame) -> Optional[Signal]:
+    if len(kl) < max(cfg.ATR_PERIOD, cfg.VOL_SMA_PERIOD) + 5:
         return None
 
-    last = candles[-1]
-    close = last["c"]
-    body = abs(last["c"] - last["o"])
+    df = kl.copy()
+    df["atr"] = _atr(df, cfg.ATR_PERIOD)
+    df["vol_sma"] = _sma(df["volume"], cfg.VOL_SMA_PERIOD)
 
-    atr = _atr(candles, cfg.ATR_PERIOD)
-    if not math.isfinite(atr) or atr <= 0:
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # признаки
+    body = abs(last["close"] - last["open"])
+    body_vs_atr = (df["atr"].iloc[-1] > 0) and (body / df["atr"].iloc[-1] >= cfg.BODY_ATR_MULT)
+    vol_spike = (last["volume"] >= cfg.VOL_MULT * (last["vol_sma"] if not math.isnan(last["vol_sma"]) else 0))
+
+    # свип локального экстремума последних N (10) свечей
+    N = 10
+    hh = df["high"].iloc[-(N+1):-1].max()
+    ll = df["low"].iloc[-(N+1):-1].min()
+    sweep_up = (last["high"] > hh) and (last["close"] < hh)        # прокол вверх и закрытие ниже
+    sweep_down = (last["low"] < ll) and (last["close"] > ll)       # прокол вниз и закрытие выше
+
+    # простая тенденция: close vs SMA(20)
+    df["ma20"] = _sma(df["close"], 20)
+    trend_up = last["close"] > df["ma20"].iloc[-1] if not math.isnan(df["ma20"].iloc[-1]) else False
+    trend_down = last["close"] < df["ma20"].iloc[-1] if not math.isnan(df["ma20"].iloc[-1]) else False
+
+    # OI дельта %
+    oi_delta_pct = 0.0
+    if len(oi) >= 3:
+        oi_now = oi["oi"].iloc[-1]
+        oi_prev = oi["oi"].iloc[-3]
+        if oi_prev > 0:
+            oi_delta_pct = (oi_now - oi_prev) / oi_prev * 100.0
+
+    # Решаем направление
+    long_score = 0
+    short_score = 0
+
+    if body_vs_atr and vol_spike:
+        if last["close"] >= last["open"]:
+            long_score += 2
+        else:
+            short_score += 2
+
+    if sweep_down:
+        long_score += 2
+    if sweep_up:
+        short_score += 2
+
+    if trend_up:
+        long_score += 1
+    if trend_down:
+        short_score += 1
+
+    # OI: рост OI при росте цены — больше за LONG; рост OI при падении цены — за SHORT
+    price_chg = last["close"] - prev["close"]
+    if oi_delta_pct != 0:
+        if price_chg > 0 and oi_delta_pct > 0:
+            long_score += 1
+        if price_chg < 0 and oi_delta_pct > 0:
+            short_score += 1
+        if oi_delta_pct < 0:
+            # сокращение OI ослабляет направление — легкий минус
+            if price_chg > 0:
+                long_score -= 0.5
+            if price_chg < 0:
+                short_score -= 0.5
+
+    if long_score <= 0 and short_score <= 0:
         return None
 
-    vol_sma = _volume_sma(candles, cfg.VOL_SMA_PERIOD)
-    if not math.isfinite(vol_sma) or vol_sma <= 0:
+    direction = "LONG" if long_score >= short_score else "SHORT"
+    price = float(last["close"])
+    atr = float(df["atr"].iloc[-1]) if not math.isnan(df["atr"].iloc[-1]) else 0.0
+    if atr <= 0:
         return None
 
-    if body <= cfg.BODY_ATR_MULT * atr:
-        return None
-    if last["v"] <= (cfg.VOL_MULT * vol_sma):
-        return None
-
-    direction = "LONG" if last["c"] > last["o"] else "SHORT"
-
-    closes = [c["c"] for c in candles]
-    ema20_ser = _ema_series(closes, 20)
-    ema20, ema20_prev = ema20_ser[-1], ema20_ser[-2]
-    ema_dir = 1 if ema20 > ema20_prev else -1
-    dir_sign = 1 if direction == "LONG" else -1
-
-    trend_unit = abs((ema20 - ema20_prev) / max(1e-9, atr))
-    trend_strength = max(0.9, min(1.4, 0.9 + trend_unit * 0.6))
-    trend_strength *= (1.05 if ema_dir == dir_sign else 0.95)
-    trend_strength = max(0.85, min(1.5, trend_strength))
-
-    TAKE_ATR_BASE = 1.20
-    STOP_ATR_BASE = 0.60
+    # Конструируем вход/стоп/тейк
+    # вход — лёгкий ретест 0.15*ATR от цены (в сторону против направления)
+    retr = 0.15 * atr
     if direction == "LONG":
-        take = close + (TAKE_ATR_BASE * trend_strength) * atr
-        stop = close - (STOP_ATR_BASE / max(0.5, trend_strength)) * atr
+        entry = max(df["low"].iloc[-1], price - retr)
+        # стоп — ниже минимума бара/или 0.8*ATR от входа (берём дальше)
+        stop_a = df["low"].iloc[-1] - 1e-9
+        stop_b = entry - 0.8 * atr
+        stop = min(stop_a, stop_b)
+        risk = entry - stop
     else:
-        take = close - (TAKE_ATR_BASE * trend_strength) * atr
-        stop = close + (STOP_ATR_BASE / max(0.5, trend_strength)) * atr
+        entry = min(df["high"].iloc[-1], price + retr)
+        stop_a = df["high"].iloc[-1] + 1e-9
+        stop_b = entry + 0.8 * atr
+        stop = max(stop_a, stop_b)
+        risk = stop - entry
 
-    entry = close
-    risk = abs(entry - stop)
-    reward = abs(take - entry)
-    rr = (reward / risk) if risk > 0 else 0.0
+    if risk <= 0:
+        return None
 
-    take_pct = (abs(take - entry) / entry) * 100.0 if entry > 0 else 0.0
-    stop_pct = (abs(entry - stop) / entry) * 100.0 if entry > 0 else 0.0
+    # множитель тейка зависит от качества набора сигналов, чтобы R/R не был одинаковым
+    quality = 0
+    quality += 1 if body_vs_atr else 0
+    quality += 1 if vol_spike else 0
+    quality += 1 if (sweep_up or sweep_down) else 0
+    quality += 1 if ((direction == "LONG" and trend_up) or (direction == "SHORT" and trend_down)) else 0
+    quality += 1 if ((direction == "LONG" and oi_delta_pct > 0) or (direction == "SHORT" and oi_delta_pct > 0)) else 0
 
-    breakout_units = 0.0
-    lookback = 20
+    # базовый множитель
+    base_rr = 1.6
+    tp_mult = base_rr + 0.2 * quality    # ~1.6 .. 2.6 (иногда 2.8)
+    # слегка рандомизируем через рыночные данные (без RNG): используем доли цены
+    frac = (price - math.floor(price)) if price > 1 else price
+    tp_mult += (frac % 0.07)  # 0..0.07 — мелкая де-синхронизация для «разных R/R»
+
     if direction == "LONG":
-        hh = _rolling_high(candles, lookback)
-        if math.isfinite(hh):
-            breakout_units = max(0.0, (close - hh) / max(1e-9, atr))
+        take = entry + tp_mult * risk
     else:
-        ll = _rolling_low(candles, lookback)
-        if math.isfinite(ll):
-            breakout_units = max(0.0, (ll - close) / max(1e-9, atr))
+        take = entry - tp_mult * risk
 
-    oi_boost = 0.0
-    if len(oi) >= 2 and oi[-2][1] > 0:
-        oi_delta_pct = (oi[-1][1] - oi[-2][1]) / oi[-2][1] * 100.0
-        oi_boost = max(-8.0, min(8.0, 0.6 * oi_delta_pct * dir_sign))
+    # проценты и R/R
+    stop_pct = abs((entry - stop) / entry) * 100.0
+    take_pct = abs((take - entry) / entry) * 100.0
+    rr = take_pct / max(1e-9, stop_pct)
 
-    vol_spike = last["v"] / max(1e-9, vol_sma)
-    body_rel = body / max(1e-9, atr)
+    # вероятность: базовая 60 + бонусы за сигналы
+    prob = 60.0
+    if body_vs_atr: prob += 6.0
+    if vol_spike: prob += 6.0
+    if sweep_up or sweep_down: prob += 5.0
+    if (direction == "LONG" and trend_up) or (direction == "SHORT" and trend_down):
+        prob += 5.0
+    if (direction == "LONG" and oi_delta_pct > 0) or (direction == "SHORT" and oi_delta_pct > 0):
+        prob += 4.0
+    if rr >= 2.0:
+        prob += 2.0
+    prob = max(50.0, min(92.0, prob))  # зажимаем
 
-    prob = 50.0
-    prob += 10.0 * math.log2(max(1.0, vol_spike))
-    prob += 8.0 * (body_rel / cfg.BODY_ATR_MULT - 1.0)
-    prob += 6.0 * (trend_strength - 1.0) * 5.0
-    prob += 10.0 * breakout_units
-    prob += oi_boost
-    prob += (4.0 if ema_dir == dir_sign else -6.0)
-    prob = max(0.0, min(99.9, prob))
-
-    if prob < cfg.PROB_MIN or rr < cfg.RR_MIN or take_pct < cfg.PROFIT_MIN_PCT:
+    # фильтры
+    if rr < cfg.RR_MIN:
+        return None
+    if take_pct < cfg.PROFIT_MIN_PCT:
+        return None
+    if not (prob > cfg.PROB_MIN):
         return None
 
     return Signal(
         symbol=symbol,
         dir=direction,
-        price=close,
-        entry=entry,
-        take=take,
-        stop=stop,
-        take_pct=take_pct,
-        stop_pct=stop_pct,
-        rr=rr,
-        prob=prob,
+        price=price,
+        entry=float(entry),
+        take=float(take),
+        stop=float(stop),
+        take_pct=float(take_pct),
+        stop_pct=float(stop_pct),
+        rr=float(rr),
+        prob=float(prob),
         ttl_min=cfg.SIGNAL_TTL_MIN,
+        created_ts=time.time(),
     )
 
 
-# ============================ СОСТОЯНИЕ ============================
-class State:
-    def __init__(self):
-        self.total_symbols: List[str] = []
-        self.active_symbols: List[str] = []
-        self.batch_idx: int = 0
-        self.last_signal_sent: Dict[str, float] = {}
-        self.live_signals: Dict[str, Signal] = {}
-        self.ready: bool = False
-        self.last_update_ts: float = 0.0  # время последнего входящего апдейта
-
-
-# ============================ ХЭНДЛЕРЫ ============================
-async def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    cfg: Config = context.bot_data["cfg"]
+# --------------------------------
+# КОМАНДЫ
+# --------------------------------
+def _allowed(update: Update, cfg: Config) -> bool:
     chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return False
-    if cfg.ALLOWED_CHAT_IDS and chat_id not in cfg.ALLOWED_CHAT_IDS:
-        try:
-            await update.effective_message.reply_text("⛔️ Доступ запрещён.")
-        except Exception:
-            pass
-        return False
-    return True
-
+    return chat_id in cfg.ALLOWED_CHAT_IDS
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    st: State = context.bot_data["state"]
-    st.last_update_ts = time.time()
-    if not await _is_allowed(update, context):
+    cfg: Config = context.bot_data["cfg"]
+    if not _allowed(update, cfg):
         return
     await update.effective_message.reply_text("pong")
 
-
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
     st: State = context.bot_data["state"]
-    st.last_update_ts = time.time()
-    if not await _is_allowed(update, context):
+    if not _allowed(update, cfg):
         return
-    if not st or not st.total_symbols:
+    if not st.universe_all:
         await update.effective_message.reply_text("Вселенная пока не загружена (жду Bybit API/повторяю попытки)…")
         return
     sample = ", ".join(st.active_symbols[:15])
-    txt = (
-        f"Вселенная: total={len(st.total_symbols)}, active={len(st.active_symbols)}, "
-        f"batch#{st.batch_idx}, ws_topics={len(st.active_symbols)*2}\n"
-        f"Активные (пример): {sample} ..."
+    await update.effective_message.reply_text(
+        f"Вселенная: total={len(st.universe_all)}, active={len(st.active_symbols)}, batch#{st.batch_idx}, ws_topics={st.ws_topics}\n"
+        + (f"Активные (пример): {sample} ..." if sample else "")
     )
-    await update.effective_message.reply_text(txt)
-
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
     st: State = context.bot_data["state"]
-    st.last_update_ts = time.time()
-    if not await _is_allowed(update, context):
+    if not _allowed(update, cfg):
         return
-    txt = f"Вселенная: total={len(st.total_symbols)}, active={len(st.active_symbols)}, batch#{st.batch_idx}, ws_topics={len(st.active_symbols)*2}"
-    await update.effective_message.reply_text(txt)
+    await update.effective_message.reply_text(
+        f"Вселенная: total={len(st.universe_all)}, active={len(st.active_symbols)}, batch#{st.batch_idx}, ws_topics={st.ws_topics}"
+    )
 
-
-async def any_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # фиксируем, что апдейты доходят
+async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
     st: State = context.bot_data["state"]
-    st.last_update_ts = time.time()
-    log.debug("update: %s", getattr(update, "to_dict", lambda: update)())
-
-
-async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error: %s", context.error)
-
-
-# ============================ ДЖОБЫ ============================
-async def _safe_job(job_coro, context: ContextTypes.DEFAULT_TYPE, name: str):
+    client: BybitClient = context.bot_data["bybit"]
+    if not _allowed(update, cfg):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Использование: /probe SYMBOL (например: /probe BTCUSDT)")
+        return
+    sym = context.args[0].upper().strip()
     try:
-        await job_coro(context)
-    except Exception:
-        log.exception("JOB %s crashed", name)
+        kl = await client.get_klines(sym, interval="5", limit=300)
+        oi = await client.get_oi(sym, interval="5min", limit=6)
+        sig = _analyze(cfg, sym, kl, oi)
+        if sig:
+            sign = "ЛОНГ" if sig.dir == "LONG" else "ШОРТ"
+            msg = (
+                f"#{sig.symbol} — {sign}\n"
+                f"Текущая: {sig.price:.6g}\n"
+                f"Вход: {sig.entry:.6g}\n"
+                f"Тейк: {sig.take:.6g} (+{sig.take_pct:.2f}%)\n"
+                f"Стоп: {sig.stop:.6g} (-{sig.stop_pct:.2f}%)\n"
+                f"R/R: {sig.rr:.2f} | Вероятность: {sig.prob:.1f}%"
+            )
+        else:
+            msg = "Сетап не прошёл фильтр (недостаточный R/R / прибыль / вероятность или мало данных)."
+        await update.effective_message.reply_text(msg)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Ошибка /probe: {e}")
 
 
+# --------------------------------
+# ДЖОБЫ
+# --------------------------------
 async def job_health(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.bot_data["cfg"]
+    st: State = context.bot_data["state"]
+    now = time.time()
+    # не спамим чаще чем HEALTH_SEC/2
+    if now - st.last_health_ts < max(30, cfg.HEALTH_SEC / 2):
+        return
+    st.last_health_ts = now
+    msg = f"online · total={len(st.universe_all)} active={len(st.active_symbols)} batch#{st.batch_idx}"
     for cid in cfg.PRIMARY_RECIPIENTS:
         try:
-            await context.bot.send_message(chat_id=cid, text="online")
+            await context.bot.send_message(cid, msg)
         except Exception as e:
             log.warning("health send failed: %s", e)
-
 
 async def job_self_ping(context: ContextTypes.DEFAULT_TYPE):
     cfg: Config = context.bot_data["cfg"]
     if not cfg.PUBLIC_URL:
         return
-    session: aiohttp.ClientSession = context.bot_data.get("aiohttp_session")
     try:
-        url = cfg.PUBLIC_URL.rstrip("/") + "/healthz"
-        if session and not session.closed:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)):
-                pass
-        else:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
-                async with s.get(url):
-                    pass
-    except Exception as e:
-        log.debug("self-ping error: %s", e)
-
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+            async with s.get(cfg.PUBLIC_URL) as r:
+                _ = await r.text()
+    except Exception:
+        pass
 
 async def job_rotate(context: ContextTypes.DEFAULT_TYPE):
-    st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
-    if not st.total_symbols:
+    st: State = context.bot_data["state"]
+    if not st.universe_all:
         return
-    n = cfg.WS_SYMBOLS_MAX
-    start = (st.batch_idx * n) % len(st.total_symbols)
-    st.active_symbols = [st.total_symbols[(start + i) % len(st.total_symbols)] for i in range(min(n, len(st.total_symbols)))]
+    total = len(st.universe_all)
+    size = max(5, min(cfg.WS_SYMBOLS_MAX, total))
+    start = (st.batch_idx * size) % total
+    end = start + size
+    if end <= total:
+        st.active_symbols = st.universe_all[start:end]
+    else:
+        st.active_symbols = st.universe_all[start:] + st.universe_all[: (end % total)]
     st.batch_idx += 1
-    log.info("INFO [universe] rotated: active=%d batch#%d", len(st.active_symbols), st.batch_idx)
+    st.ws_topics = len(st.active_symbols) * 2  # профанация метрики ws для статуса
 
+async def job_refresh_universe(context: ContextTypes.DEFAULT_TYPE):
+    cfg: Config = context.bot_data["cfg"]
+    st: State = context.bot_data["state"]
+    client: BybitClient = context.bot_data["bybit"]
+    try:
+        syms = await client.list_futures_usdt()
+        if syms:
+            st.universe_all = syms
+            if not st.active_symbols:
+                await job_rotate(context)
+            log.info("INFO [universe] total=%d active=%d", len(st.universe_all), len(st.active_symbols))
+    except Exception as e:
+        log.warning("universe load failed: %s", e)
 
 async def job_scan(context: ContextTypes.DEFAULT_TYPE):
     st: State = context.bot_data["state"]
     cfg: Config = context.bot_data["cfg"]
-    client: BybitClient = context.bot_data.get("bybit")
+    client: BybitClient = context.bot_data["bybit"]
     if not st.active_symbols or not client:
         return
+
+    # --- АДАПТИВНЫЕ ПОРОГИ ПРИ ТИШИНЕ ---
+    now = time.time()
+    last_any = max(st.last_signal_sent.values()) if st.last_signal_sent else 0.0
+    minutes_since_any = (now - last_any) / 60 if last_any else 1e9
+    eff_cfg = cfg
+    if minutes_since_any > 45:
+        prob = max(55.0, cfg.PROB_MIN - 8.0)
+        rr = max(1.4, cfg.RR_MIN - 0.3)
+        prof = max(0.6, cfg.PROFIT_MIN_PCT - 0.3)
+        eff_cfg = replace(cfg, PROB_MIN=prob, RR_MIN=rr, PROFIT_MIN_PCT=prof)
+        if int(now) % 300 < 2:
+            log.info("ADAPTIVE: relax thresholds to PROB_MIN=%.1f RR_MIN=%.2f PROFIT_MIN_PCT=%.2f",
+                     eff_cfg.PROB_MIN, eff_cfg.RR_MIN, eff_cfg.PROFIT_MIN_PCT)
 
     candidates: List[Signal] = []
     for sym in st.active_symbols:
         try:
-            candles = await client.get_klines(sym, interval="5", limit=300)
+            kl = await client.get_klines(sym, interval="5", limit=300)
             oi = await client.get_oi(sym, interval="5min", limit=6)
-            sig = _analyze(cfg, sym, candles, oi)
-            if sig:
-                candidates.append(sig)
-            await asyncio.sleep(0.05)
+            s = _analyze(eff_cfg, sym, kl, oi)
+            if s:
+                candidates.append(s)
+            await asyncio.sleep(0.03)
         except Exception as e:
             log.debug("scan %s error: %s", sym, e)
 
@@ -551,10 +611,8 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
         live = st.live_signals.get(s.symbol)
         if live and (now_ts - live.created_ts) < (live.ttl_min * 60) and s.prob <= live.prob:
             continue
-
         st.last_signal_sent[s.symbol] = now_ts
         st.live_signals[s.symbol] = s
-
         sign = "ЛОНГ" if s.dir == "LONG" else "ШОРТ"
         msg = (
             f"#{s.symbol} — {sign}\n"
@@ -572,133 +630,105 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=cid, text=msg)
             except Exception as e:
                 log.warning("send signal failed: %s", e)
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.5)
 
 
-async def job_bootstrap(context: ContextTypes.DEFAULT_TYPE):
-    cfg: Config = context.bot_data["cfg"]
-    st: State = context.bot_data["state"]
+# --------------------------------
+# ВЕБ-СЕРВЕР (для Render)
+# --------------------------------
+async def _http_index(_):
+    return web.Response(text="OK", content_type="text/plain")
 
-    if context.bot_data.get("bootstrapped"):
-        return
-
-    log.info("BOOTSTRAP: start")
-
-    # 1) HTTP-сессия/Bybit
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-    context.bot_data["aiohttp_session"] = session
-    client = BybitClient(session)
-    context.bot_data["bybit"] = client
-
-    # 2) Вселенная
-    try:
-        all_syms = await client.get_symbols_linear()
-        if cfg.UNIVERSE_MODE == "top" and cfg.UNIVERSE_TOP_N > 0:
-            st.total_symbols = all_syms[: cfg.UNIVERSE_TOP_N]
-        else:
-            st.total_symbols = all_syms
-        await job_rotate(context)
-        st.ready = True
-        log.info("INFO [universe] total=%d active=%d mode=%s", len(st.total_symbols), len(st.active_symbols), cfg.UNIVERSE_MODE)
-    except Exception as e:
-        log.exception("universe load failed: %s", e)
-
-    # 3) Регулярные джобы
-    jq = context.job_queue
-    jq.run_repeating(lambda c: _safe_job(job_health, c, "health"), interval=cfg.HEALTH_SECONDS, first=cfg.FIRST_HEALTH_DELAY, name="health")
-    if cfg.PUBLIC_URL:
-        jq.run_repeating(lambda c: _safe_job(job_self_ping, c, "self_ping"), interval=cfg.SELF_PING_SECONDS, first=cfg.SELF_PING_SECONDS, name="self_ping")
-    jq.run_repeating(lambda c: _safe_job(job_rotate, c, "rotate"), interval=cfg.ROTATE_MIN * 60, first=cfg.ROTATE_MIN * 60, name="rotate")
-    jq.run_repeating(lambda c: _safe_job(job_scan, c, "scan"), interval=30, first=15, name="scan")
-    jq.run_repeating(lambda c: _safe_job(job_watchdog, c, "watchdog"), interval=120, first=180, name="watchdog")
-
-    # 4) Уведомление о старте
-    for cid in cfg.PRIMARY_RECIPIENTS:
-        try:
-            await context.bot.send_message(chat_id=cid, text="✅ Bot started. Universe loading done.")
-        except Exception:
-            pass
-
-    context.bot_data["bootstrapped"] = True
-    log.info("BOOTSTRAP: done")
+async def start_http_server(port: int):
+    app = web.Application()
+    app.add_routes([web.get("/", _http_index), web.get("/health", _http_index)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("HTTP server started on :%d", port)
 
 
-async def job_watchdog(context: ContextTypes.DEFAULT_TYPE):
-    """Если апдейтов давно не было — логируем предупреждение и шлём тихий self-check."""
-    st: State = context.bot_data["state"]
-    cfg: Config = context.bot_data["cfg"]
-    now = time.time()
-    silence_min = (now - st.last_update_ts) / 60 if st.last_update_ts else 9999
-    if silence_min > 15:
-        log.warning("WATCHDOG: no incoming updates for %.1f minutes", silence_min)
-        # мягкий self-check: getMe
-        try:
-            _ = await context.bot.get_me()
-        except Exception as e:
-            log.warning("WATCHDOG getMe failed: %s", e)
-        # и пинг в чат раз в час максимум
-        if int(now // 3600) != int((now - 120) // 3600):  # не чаще раза в час
-            for cid in cfg.PRIMARY_RECIPIENTS:
-                try:
-                    await context.bot.send_message(chat_id=cid, text="⛑ watchdog: still alive, no updates lately")
-                except Exception:
-                    pass
+# --------------------------------
+# MAIN
+# --------------------------------
+def build_app(cfg: Config) -> Application:
+    application: Application = (
+        ApplicationBuilder()
+        .token(cfg.TELEGRAM_TOKEN)
+        .build()
+    )
 
-
-# ============================ HTTP HEALTH ============================
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/healthz":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-            return
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"web-ok")
-
-    def log_message(self, fmt, *args):
-        return
-
-
-def _start_health_server(port: int):
-    def _run():
-        srv = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-        log.info("HTTP health server started on :%d", port)
-        srv.serve_forever()
-
-    th = threading.Thread(target=_run, daemon=True)
-    th.start()
-    return th
-
-
-# ============================ MAIN ============================
-def main():
-    cfg = Config.load()
-
-    # Всегда POLLING. Поднимем health-сервер, чтобы Render видел открытый порт.
-    _start_health_server(cfg.PORT)
-
-    application = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
-    application.bot_data["cfg"] = cfg
-    application.bot_data["state"] = State()
-
-    # Команды
+    # handlers
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("probe", cmd_probe))
 
-    # Лог всех апдейтов (DEBUG) + отметка времени
-    application.add_handler(MessageHandler(filters.ALL, any_update_logger))
-    application.add_error_handler(err_handler)
+    # простая защита: игнор всех сообщений не из списка
+    application.add_handler(MessageHandler(~filters.COMMAND & filters.ALL, lambda u, c: None))
 
-    # Планируем bootstrap после старта event loop
-    application.job_queue.run_once(job_bootstrap, when=1, name="bootstrap")
+    return application
 
-    log.info("POLLING mode: starting long-polling …")
-    # drop_pending_updates=True — чистим хвост при рестарте
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+async def main_async():
+    cfg = Config.load()
 
+    # HTTP сервер для Render (порт должен быть открыт)
+    await start_http_server(cfg.PORT)
+
+    # Telegram application
+    app = build_app(cfg)
+
+    # Состояние и клиент
+    st = State(
+        universe_all=[],
+        active_symbols=[],
+        batch_idx=0,
+        ws_topics=0,
+        last_signal_sent={},
+        live_signals={},
+        last_health_ts=0.0,
+    )
+    client = BybitClient()
+    await client.start()
+
+    # bot_data
+    app.bot_data["cfg"] = cfg
+    app.bot_data["state"] = st
+    app.bot_data["bybit"] = client
+
+    # Планировщик (JobQueue PTB)
+    jq = app.job_queue
+    # начальная загрузка вселенной и ротация
+    jq.run_once(job_refresh_universe, when=1.0)
+    jq.run_repeating(job_refresh_universe, interval=15 * 60, first=15 * 60)  # периодически обновляем список
+    jq.run_repeating(job_rotate, interval=cfg.ROTATE_MIN * 60, first=10)
+    # сканер
+    jq.run_repeating(job_scan, interval=30, first=20)
+    # health
+    jq.run_repeating(job_health, interval=cfg.HEALTH_SEC, first=cfg.HEALTH_SEC)
+    # self-ping (если есть PUBLIC_URL)
+    jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SEC, first=cfg.SELF_PING_SEC)
+
+    # ВАЖНО: не вызываем run_polling(), чтобы не словить loop.run_until_complete внутри PTB.
+    await app.initialize()
+    await app.start()
+    # Включаем polling "вручную"
+    await app.updater.start_polling(drop_pending_updates=True)
+    log.info("Application started (polling)")
+
+    try:
+        # Спим бесконечно; Updater сам крутит polling-таски
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await client.close()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
