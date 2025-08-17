@@ -706,7 +706,7 @@ async def main_async():
     # сканер
     jq.run_repeating(job_scan, interval=30, first=20)
     # health
-    jq.run_repeating(job_health, interval=cfg.HEALTH_SEC, first=cfg.HEALTH_SEC)
+    jq.run_repeating(job_health, interval=cfg.HEALTH_SEC, first=15)
     # self-ping (если есть PUBLIC_URL)
     jq.run_repeating(job_self_ping, interval=cfg.SELF_PING_SEC, first=cfg.SELF_PING_SEC)
 
@@ -715,6 +715,14 @@ async def main_async():
     await app.start()
     # Включаем polling "вручную"
     await app.updater.start_polling(drop_pending_updates=True)
+    # Разовый "online" сразу после старта
+try:
+    boot_msg = f"online · boot · total={len(st.universe_all)} active={len(st.active_symbols)} batch#{st.batch_idx}"
+    for cid in cfg.PRIMARY_RECIPIENTS:
+        await app.bot.send_message(chat_id=cid, text=boot_msg)
+except Exception as e:
+    log.warning("boot online send failed: %s", e)
+
     log.info("Application started (polling)")
 
     try:
@@ -732,3 +740,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
