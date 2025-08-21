@@ -455,6 +455,11 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     if not cfg.analysis_enabled:
         return None
 
+    # общий meta для краткого обоснования
+    def _reason_base(oi_stmt: str) -> str:
+        atr_ratio = (body / atr_val) if atr_val > 0 else 0.0
+        return f"объём x{vol_mult:.2f}, тело {atr_ratio:.2f} ATR, {oi_stmt} ({oi_d*100:.2f}%)"
+
     # --- УСЛОВИЯ ---
     cond_vol = vol_mult >= cfg.vol_mult
     cond_body = atr_val > 0 and (body >= cfg.body_atr_mult * atr_val)
@@ -475,8 +480,11 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             sl = entry + sl_dist
             tp = entry - tp_dist
         prob = 0.58 + min(0.20, 0.05 * max(0.0, vol_mult - cfg.vol_mult) + (0.02 if cond_oi_soft else 0.0))
+        oi_stmt = "OI в ту же сторону" if (chg * oi_d > 0) else ("OI почти плоский" if abs(oi_d) <= cfg.oi_flat_tolerance else "OI смешанный")
+        reason = f"База: {_reason_base(oi_stmt)}."
         return {
-            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.82),
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr,
+            "prob": min(prob, 0.82), "reason": reason
         }
 
     # ДОП.СЕТАП: «СИЛЬНЫЙ ОБЪЁМ» — без OI/ликвидаций
@@ -493,8 +501,10 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             sl = entry + sl_dist
             tp = entry - tp_dist
         prob = 0.55 + min(0.20, 0.06 * max(0.0, vol_mult - cfg.vol_mult_strong))
+        reason = f"Сильный объём: объём x{vol_mult:.2f}, тело {(body/atr_val if atr_val>0 else 0):.2f} ATR."
         return {
-            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.80),
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr,
+            "prob": min(prob, 0.80), "reason": reason
         }
 
     # ДОП.СЕТАП: «спайк OI» (небольшой) + тело свечи
@@ -511,11 +521,13 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             sl = entry + sl_dist
             tp = entry - tp_dist
         prob = 0.56 + min(0.18, 0.04 * (abs(oi_d) / cfg.oi_spike_min - 1.0))
+        reason = f"Спайк OI: {oi_d*100:.2f}%, объём x{vol_mult:.2f}, тело {(body/atr_val if atr_val>0 else 0):.2f} ATR."
         return {
-            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.80),
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr,
+            "prob": min(prob, 0.80), "reason": reason
         }
 
-    # --- РЕВЕРС ПО ЛИКВИДАЦИЯМ (как было, мягкие пороги уже встроены) ---
+    # --- РЕВЕРС ПО ЛИКВИДАЦИЯМ ---
     if cfg.liq_enable_reversal and last_close > 0 and atr_val > 0:
         liq_shock = (
             (liq_events >= cfg.liq_events_min)
@@ -551,12 +563,23 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
                 sl = entry + sl_dist
                 tp = entry - tp_dist
             prob = 0.62 + min(0.20, 0.03 * max(0, liq_events - 3) + 0.00001 * max(0.0, liq_notional - 0.6 * cfg.liq_notional_min))
-            return {"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.85)}
+            reason = (
+                f"Реверс ликвидаций: {liq_events} эв., ≈{liq_notional:.0f}$, перевес "
+                f"{('short→long' if side == 'LONG' else 'long→short')}, объём x{vol_mult:.2f}."
+            )
+            return {"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr,
+                    "prob": min(prob, 0.85), "reason": reason}
 
     return None
 
 
-def _format_signal(sig: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+def _format_signal(sig: Dict[str, Any]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    """
+    Обновлённый формат:
+    - без кнопки Bybit
+    - добавлена текущая цена
+    - краткое обоснование
+    """
     sym = sig["symbol"]
     side = "ЛОНГ" if sig["side"] == "LONG" else "ШОРТ"
     entry = sig["entry"]
@@ -564,21 +587,22 @@ def _format_signal(sig: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     sl = sig["sl"]
     rr = sig["rr"]
     prob = sig["prob"]
+    reason = sig.get("reason", "-")
 
     tp_pct = (tp - entry) / entry if sig["side"] == "LONG" else (entry - tp) / entry
     sl_pct = (entry - sl) / entry if sig["side"] == "LONG" else (sl - entry) / entry
 
     text = (
         f"#{sym} — {side}\n"
+        f"Цена: {entry:g}\n"
         f"Вход: {entry:g}\n"
         f"Тейк: {tp:g} (+{tp_pct*100:.2f}%)\n"
         f"Стоп: {sl:g} (-{sl_pct*100:.2f}%)\n"
-        f"R/R: {rr:.2f} | Вероятность: {prob*100:.1f}%"
+        f"R/R: {rr:.2f} | Вероятность: {prob*100:.1f}%\n"
+        f"Обоснование: {reason}"
     )
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Открыть в Bybit", url=_make_bybit_link(sym))]]
-    )
-    return text, kb
+    # Кнопку убираем — возвращаем None
+    return text, None
 
 
 # -----------------------------------------------------------------------------
@@ -625,14 +649,28 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if isinstance(res, Exception) or not res:
                     continue
 
+                # --- анти-спам (ttl/cooldown) ---
                 last_ts = sent_map.get(sym, 0.0)
                 if now_ts - last_ts < cfg.signal_cooldown_sec:
                     continue
                 if now_ts - last_ts < cfg.signal_ttl_min * 60:
                     continue
 
+                # --- новые ФИЛЬТРЫ по требованию ---
+                # 1) Вероятность >= 70%
+                if res.get("prob", 0.0) < 0.70:
+                    logger.info(f"[filter] skip {sym}: prob<{0.70}")
+                    continue
+                # 2) Потенциальная прибыль (до тейка) >= 1%
+                entry = res["entry"]
+                tp = res["tp"]
+                tp_pct = (tp - entry) / entry if res["side"] == "LONG" else (entry - tp) / entry
+                if tp_pct < 0.01:
+                    logger.info(f"[filter] skip {sym}: tp_pct<{0.01:.2%} (actual {tp_pct:.2%})")
+                    continue
+
                 text, kb = _format_signal(res)
-                await notify(app, text, reply_markup=kb)
+                await notify(app, text, reply_markup=kb)  # kb == None (кнопка Bybit убрана)
                 sent_map[sym] = now_ts
                 sent_now += 1
                 if sent_now >= 2:
