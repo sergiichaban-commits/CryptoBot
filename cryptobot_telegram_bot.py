@@ -76,7 +76,6 @@ def _env_list_int(name: str, default: Optional[List[int]] = None) -> List[int]:
 
 
 def _normalize_public_url(u: Optional[str]) -> Optional[str]:
-    """Нормализуем публичный URL сервиса (для keepalive)."""
     if not u:
         return None
     u = u.strip()
@@ -120,22 +119,25 @@ class Config:
 
         # Аналитика/сигналы
         self.analysis_enabled: bool = kw.get("analysis_enabled", True)
-        self.analysis_batch_size: int = kw.get("analysis_batch_size", 3)
+        self.analysis_batch_size: int = kw.get("analysis_batch_size", 5)  # ↑ было 3
         self.signal_ttl_min: int = kw.get("signal_ttl_min", 12)
         self.signal_cooldown_sec: int = kw.get("signal_cooldown_sec", 600)
 
-        # Пороговые параметры анализа
+        # Пороговые параметры анализа (мягче дефолты)
         self.vol_sma_period: int = kw.get("vol_sma_period", 20)
-        self.vol_mult: float = kw.get("vol_mult", 2.0)
+        self.vol_mult: float = kw.get("vol_mult", 1.15)               # ↓ было 2.0
+        self.vol_mult_strong: float = kw.get("vol_mult_strong", 1.60) # новый порог для «сильного объёма»
         self.atr_period: int = kw.get("atr_period", 14)
-        self.body_atr_mult: float = kw.get("body_atr_mult", 0.60)
+        self.body_atr_mult: float = kw.get("body_atr_mult", 0.45)     # ↓ было 0.60
+        self.oi_flat_tolerance: float = kw.get("oi_flat_tolerance", 0.002)  # 0.2% — допускаем «плоский» OI
+        self.oi_spike_min: float = kw.get("oi_spike_min", 0.003)            # 0.3% — слабый спайк OI
 
-        # --- ДОБАВЛЕНО: параметры «шока ликвидаций» и реверс-сценария ---
+        # параметры «шока ликвидаций» и реверс-сценария
         self.liq_enable_reversal: bool = kw.get("liq_enable_reversal", True)
-        self.liq_events_min: int = kw.get("liq_events_min", 5)              # мин. число событий
-        self.liq_notional_min: float = kw.get("liq_notional_min", 25000.0)  # мин. номинал (USDT)
-        self.liq_reversal_lookback: int = kw.get("liq_reversal_lookback", 3)  # глубина проверки реверса
-        self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.05)        # ↓ было 1.2
+        self.liq_events_min: int = kw.get("liq_events_min", 5)
+        self.liq_notional_min: float = kw.get("liq_notional_min", 25000.0)
+        self.liq_reversal_lookback: int = kw.get("liq_reversal_lookback", 3)
+        self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.05)
 
     @staticmethod
     def load() -> "Config":
@@ -143,10 +145,7 @@ class Config:
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN is required")
 
-        pub_url = (
-            os.getenv("PUBLIC_URL")
-            or os.getenv("RENDER_EXTERNAL_URL")
-        )
+        pub_url = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL"))
         pub_url = _normalize_public_url(pub_url)
 
         return Config(
@@ -172,26 +171,28 @@ class Config:
             self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 780),
 
             analysis_enabled=_env_bool("ANALYSIS_ENABLED", True),
-            analysis_batch_size=_env_int("ANALYSIS_BATCH_SIZE", 3),
+            analysis_batch_size=_env_int("ANALYSIS_BATCH_SIZE", 5),
             signal_ttl_min=_env_int("SIGNAL_TTL_MIN", 12),
             signal_cooldown_sec=_env_int("SIGNAL_COOLDOWN_SEC", 600),
 
             vol_sma_period=_env_int("VOL_SMA_PERIOD", 20),
-            vol_mult=_env_float("VOL_MULT", 2.0),
+            vol_mult=_env_float("VOL_MULT", 1.15),
+            vol_mult_strong=_env_float("VOL_MULT_STRONG", 1.60),
             atr_period=_env_int("ATR_PERIOD", 14),
-            body_atr_mult=_env_float("BODY_ATR_MULT", 0.60),
+            body_atr_mult=_env_float("BODY_ATR_MULT", 0.45),
+            oi_flat_tolerance=_env_float("OI_FLAT_TOLERANCE", 0.002),
+            oi_spike_min=_env_float("OI_SPIKE_MIN", 0.003),
 
-            # --- ДОБАВЛЕНО: ENV для liq-reversal ---
             liq_enable_reversal=_env_bool("LIQ_REVERSAL_ENABLED", True),
             liq_events_min=_env_int("LIQ_EVENTS_MIN", 5),
             liq_notional_min=_env_float("LIQ_NOTIONAL_MIN", 25000.0),
             liq_reversal_lookback=_env_int("LIQ_REVERSAL_LOOKBACK", 3),
-            liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.05),  # ↓ было 1.2
+            liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.05),
         )
 
 
 # -----------------------------------------------------------------------------
-# BYBIT КЛИЕНТ (создаём СЕССИЮ ТОЛЬКО ПОСЛЕ СТАРТА ЛУПА!)
+# BYBIT КЛИЕНТ
 # -----------------------------------------------------------------------------
 class BybitClient:
     def __init__(self, base: str = "https://api.bybit.com") -> None:
@@ -214,9 +215,6 @@ class BybitClient:
             self._session = None
 
     async def fetch_linear_symbols(self) -> List[str]:
-        """
-        Тянем список фьючерсных USDT-символов (category=linear).
-        """
         session = await self._ensure_session()
         url = f"{self.base}/v5/market/instruments-info?category=linear"
         out: List[str] = []
@@ -239,30 +237,18 @@ class BybitClient:
         return sorted(set(out))
 
     async def fetch_kline(self, symbol: str, interval: str = "5", limit: int = 200) -> Dict[str, Any]:
-        """
-        Kline по v5:
-        GET /v5/market/kline?category=linear&symbol=SYM&interval=5&limit=200
-        """
         session = await self._ensure_session()
         url = f"{self.base}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
         async with session.get(url) as resp:
             return await resp.json()
 
     async def fetch_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> Dict[str, Any]:
-        """
-        Open Interest:
-        GET /v5/market/open-interest?category=linear&symbol=SYM&intervalTime=5min&limit=6
-        """
         session = await self._ensure_session()
         url = f"{self.base}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
         async with session.get(url) as resp:
             return await resp.json()
 
     async def fetch_liquidations(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
-        """
-        Liquidations:
-        GET /v5/market/liquidation?category=linear&symbol=SYM&limit=50
-        """
         session = await self._ensure_session()
         url = f"{self.base}/v5/market/liquidation?category=linear&symbol={symbol}&limit={limit}"
         async with session.get(url) as resp:
@@ -282,9 +268,6 @@ class UniverseState:
 
 
 async def build_universe(app: Application, cfg: Config) -> None:
-    """
-    Тяжёлая инициализация вселенной — запускаем ПОСЛЕ открытия порта.
-    """
     client: BybitClient = app.bot_data["bybit"]
     st: UniverseState = app.bot_data["universe_state"]
 
@@ -301,7 +284,7 @@ async def build_universe(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# HEALTH-СЕРВЕР — открываем порт сразу
+# HEALTH-СЕРВЕР
 # -----------------------------------------------------------------------------
 async def start_health_server(port: int) -> None:
     app = web.Application()
@@ -318,7 +301,7 @@ async def start_health_server(port: int) -> None:
 
 
 # -----------------------------------------------------------------------------
-# ОТПРАВКА (только в канал при ONLY_CHANNEL=1)
+# ОТПРАВКА
 # -----------------------------------------------------------------------------
 async def notify(
     app: Application,
@@ -333,7 +316,6 @@ async def notify(
     if cfg.only_channel:
         recipients = [cid for cid in recipients if isinstance(cid, int) and cid < 0]
 
-    # предупреждение, если некуда слать
     if not recipients:
         logger.warning(
             "[notify] recipients list is empty. ONLY_CHANNEL=%s, PRIMARY_RECIPIENTS=%s",
@@ -359,10 +341,6 @@ async def notify(
 # ПРОСТЕЙШИЙ АНАЛИЗ
 # -----------------------------------------------------------------------------
 def _calc_atr(candles: List[List[str]], period: int) -> float:
-    """
-    candles: список строковых [startTs, open, high, low, close, volume, ...] (как от Bybit)
-    ATR — упрощённо через средний (high-low).
-    """
     if not candles:
         return 0.0
     span = candles[-period:]
@@ -387,25 +365,19 @@ def _pick_batch_symbols(symbols: List[str], batch: int, batch_size: int) -> List
     n = len(symbols)
     start = (batch * batch_size) % n
     out = symbols[start:start + batch_size]
-    if len(out) < batch_size:  # докрутить из начала, если вышли за край
+    if len(out) < batch_size:
         out += symbols[: batch_size - len(out)]
     return out
 
 
 def _make_bybit_link(symbol: str) -> str:
-    # простая ссылка на фьючерс USDT
     base = symbol.replace("USDT", "")
     return f"https://www.bybit.com/trade/usdt/{base}"
 
 
 async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает словарь с метриками и потенциальным направлением;
-    либо None, если триггеров нет/ошибка.
-    """
     client: BybitClient = app.bot_data["bybit"]
 
-    # параллельно дернем три запроса
     k_task = asyncio.create_task(client.fetch_kline(symbol, interval="5", limit=max(60, cfg.vol_sma_period + 5)))
     oi_task = asyncio.create_task(client.fetch_open_interest(symbol, interval="5min", limit=6))
     liq_task = asyncio.create_task(client.fetch_liquidations(symbol, limit=50))
@@ -417,7 +389,7 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     # --- KLINE ---
     k_ok = (k or {}).get("retCode") == 0
     k_list = ((k or {}).get("result") or {}).get("list") or []
-    k_list = list(reversed(k_list))  # Bybit часто отдает от старых к новым — перевернём
+    k_list = list(reversed(k_list))  # к новым в конец
     chg = vol_mult = atr_val = body = last_close = 0.0
     if k_ok and len(k_list) >= max(3, cfg.vol_sma_period + 1):
         try:
@@ -437,7 +409,7 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             pass
     logger.info(f"[kline] {symbol}: chg={_fmt_pct(chg)} volx={vol_mult:.2f} atr={atr_val:.6f} body={body:.6f}")
 
-    # --- OPEN INTEREST ---  (ИСПРАВЛЕНО: парсим словари v5)
+    # --- OPEN INTEREST ---
     oi_ok = (oi or {}).get("retCode") == 0
     oi_list = ((oi or {}).get("result") or {}).get("list") or []
     oi_d = 0.0
@@ -445,11 +417,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     if oi_ok and len(oi_list) >= 2:
         try:
             def _oi_val(item: Any) -> float:
-                # v5 обычный формат — словарь {"openInterest": "...", "timestamp": "..."}
                 if isinstance(item, dict):
                     v = item.get("openInterest") or item.get("value") or item.get("open_interest") or item.get("oi")
                     return float(v or 0)
-                # совместимость на случай массивов [ts, value]
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
                     return float(item[1] or 0)
                 return 0.0
@@ -471,7 +441,6 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     for it in lq_list:
         try:
             liq_events += 1
-            # Обычно 'value' — USDT-номинал; если нет — будет 0. Это ок.
             liq_notional += float(it.get("value", 0) or 0)
             s = (it.get("side") or "").lower()
             if s == "buy":
@@ -483,84 +452,97 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
     dom = "long>short" if side_long > side_short else ("short>long" if side_short > side_long else "balanced")
     logger.info(f"[liquidation] {symbol}: events={liq_events} notional≈{liq_notional:.0f} side={dom}")
 
-    # --- БАЗОВЫЙ ТРИГГЕР (как было) ---
     if not cfg.analysis_enabled:
         return None
 
+    # --- УСЛОВИЯ ---
     cond_vol = vol_mult >= cfg.vol_mult
-    cond_body = body >= cfg.body_atr_mult * atr_val if atr_val > 0 else False
-    cond_oi = (chg > 0 and oi_d > 0) or (chg < 0 and oi_d < 0)
-    cond_liq = liq_events >= 1
+    cond_body = atr_val > 0 and (body >= cfg.body_atr_mult * atr_val)
+    # мягкий OI: либо совпал знак, либо почти плоский
+    cond_oi_soft = (chg * oi_d >= 0) or (abs(oi_d) <= cfg.oi_flat_tolerance)
 
-    # Доп. отладка условий — видно при LOG_LEVEL=DEBUG
-    logger.debug(f"[triggers] {symbol}: cond_vol={cond_vol} cond_body={cond_body} cond_oi={cond_oi} cond_liq={cond_liq}")
-
-    if cond_vol and cond_body and cond_oi and cond_liq and last_close > 0:
+    # БАЗОВЫЙ СЕТАП (ликвидации больше НЕ обязательны)
+    if cond_vol and cond_body and cond_oi_soft and last_close > 0:
         side = "LONG" if chg > 0 else "SHORT"
-
         sl_dist = max(1e-6, cfg.body_atr_mult * atr_val)
-        rr = 2.0 + max(0.0, min(1.0, vol_mult - cfg.vol_mult)) * 0.5  # чуть разбросать R/R
+        rr = 2.0 + max(0.0, min(1.0, vol_mult - cfg.vol_mult)) * 0.4
         tp_dist = rr * sl_dist
-
+        entry = last_close
         if side == "LONG":
-            entry = last_close
             sl = entry - sl_dist
             tp = entry + tp_dist
         else:
-            entry = last_close
             sl = entry + sl_dist
             tp = entry - tp_dist
-
-        prob = 0.60 + min(0.22, 0.04 * max(0.0, vol_mult - cfg.vol_mult) + (0.04 if cond_oi else 0.0))
-
+        prob = 0.58 + min(0.20, 0.05 * max(0.0, vol_mult - cfg.vol_mult) + (0.02 if cond_oi_soft else 0.0))
         return {
-            "symbol": symbol,
-            "side": side,
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "rr": rr,
-            "prob": prob,
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.82),
         }
 
-    # --- ДОБАВЛЕНО: LIQUIDATION SHOCK → REVERSAL ---
-    # Идея: после крупной односторонней волны ликвидаций ждём разворот цены в противоположную сторону.
-    # Требования: достаточный «шок», согласованный переворот на последней свече и минимальный объём.
+    # ДОП.СЕТАП: «СИЛЬНЫЙ ОБЪЁМ» — без OI/ликвидаций
+    if (vol_mult >= cfg.vol_mult_strong) and (body >= max(0.5 * cfg.body_atr_mult * atr_val, 0.35 * atr_val)) and last_close > 0:
+        side = "LONG" if chg >= 0 else "SHORT"
+        sl_dist = max(1e-6, 0.9 * cfg.body_atr_mult * atr_val)
+        rr = 2.0 + 0.2 * max(0.0, vol_mult - cfg.vol_mult_strong)
+        tp_dist = rr * sl_dist
+        entry = last_close
+        if side == "LONG":
+            sl = entry - sl_dist
+            tp = entry + tp_dist
+        else:
+            sl = entry + sl_dist
+            tp = entry - tp_dist
+        prob = 0.55 + min(0.20, 0.06 * max(0.0, vol_mult - cfg.vol_mult_strong))
+        return {
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.80),
+        }
+
+    # ДОП.СЕТАП: «спайк OI» (небольшой) + тело свечи
+    if (abs(oi_d) >= cfg.oi_spike_min) and (vol_mult >= 1.05) and (body >= 0.35 * atr_val) and last_close > 0:
+        side = "LONG" if oi_d > 0 else ("SHORT" if oi_d < 0 else ("LONG" if chg > 0 else "SHORT"))
+        sl_dist = max(1e-6, 0.9 * cfg.body_atr_mult * atr_val)
+        rr = 2.0
+        tp_dist = rr * sl_dist
+        entry = last_close
+        if side == "LONG":
+            sl = entry - sl_dist
+            tp = entry + tp_dist
+        else:
+            sl = entry + sl_dist
+            tp = entry - tp_dist
+        prob = 0.56 + min(0.18, 0.04 * (abs(oi_d) / cfg.oi_spike_min - 1.0))
+        return {
+            "symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.80),
+        }
+
+    # --- РЕВЕРС ПО ЛИКВИДАЦИЯМ (как было, мягкие пороги уже встроены) ---
     if cfg.liq_enable_reversal and last_close > 0 and atr_val > 0:
-        # ↓ точечная правка: мягче критерии «шока»
         liq_shock = (
             (liq_events >= cfg.liq_events_min)
             or (liq_notional >= cfg.liq_notional_min)
             or (liq_events >= 3)
             or (liq_notional >= 0.6 * cfg.liq_notional_min)
         )
-
         expected_side: Optional[str] = None
         if side_short > side_long:
-            expected_side = "LONG"   # больше sell-ликвидов → ищем отскок вверх
+            expected_side = "LONG"
         elif side_long > side_short:
-            expected_side = "SHORT"  # больше buy-ликвидов → ждём разворот вниз
+            expected_side = "SHORT"
 
-        # ↓ точечная правка: порог тела свечи 0.4 вместо 0.5
         rev_ok = False
         if expected_side == "LONG":
             rev_ok = (chg > 0) and (body >= 0.4 * cfg.body_atr_mult * atr_val)
         elif expected_side == "SHORT":
             rev_ok = (chg < 0) and (body >= 0.4 * cfg.body_atr_mult * atr_val)
 
-        # ↓ точечная правка: по умолчанию требуем vol_mult >= 1.05 (можно поднять через ENV)
         vol_ok = vol_mult >= cfg.liq_vol_mult_min
-
         logger.info(f"[liq-reversal] {symbol}: shock={liq_shock} expect={expected_side or '-'} rev_ok={rev_ok} vol_ok={vol_ok}")
 
         if liq_shock and expected_side and rev_ok and vol_ok:
             side = expected_side
-
-            # тот же калькулятор SL/TP, но R/R чуть поднимем, т.к. это отдельный сетап
-            sl_dist = max(1e-6, 0.8 * cfg.body_atr_mult * atr_val)  # чуть ближе стоп для реверса
+            sl_dist = max(1e-6, 0.8 * cfg.body_atr_mult * atr_val)
             rr = 2.2 + min(0.6, 0.2 * max(0.0, vol_mult - cfg.liq_vol_mult_min))
             tp_dist = rr * sl_dist
-
             entry = last_close
             if side == "LONG":
                 sl = entry - sl_dist
@@ -568,19 +550,8 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             else:
                 sl = entry + sl_dist
                 tp = entry - tp_dist
-
-            # вероятность — базовая + бонус за шок ликвидаций
             prob = 0.62 + min(0.20, 0.03 * max(0, liq_events - 3) + 0.00001 * max(0.0, liq_notional - 0.6 * cfg.liq_notional_min))
-
-            return {
-                "symbol": symbol,
-                "side": side,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "rr": rr,
-                "prob": min(prob, 0.85),
-            }
+            return {"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl, "rr": rr, "prob": min(prob, 0.85)}
 
     return None
 
@@ -594,7 +565,6 @@ def _format_signal(sig: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     rr = sig["rr"]
     prob = sig["prob"]
 
-    # проценты к тейку/стопу
     tp_pct = (tp - entry) / entry if sig["side"] == "LONG" else (entry - tp) / entry
     sl_pct = (entry - sl) / entry if sig["side"] == "LONG" else (sl - entry) / entry
 
@@ -636,23 +606,18 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not st.total:
             await build_universe(app, cfg)
 
-        # ✅ FIX: корректная ротация — обходим всю вселенную по батчам размера analysis_batch_size
         if st.sample_active:
             batches = max(1, (st.active + cfg.analysis_batch_size - 1) // max(1, cfg.analysis_batch_size))
             st.batch = (st.batch + 1) % batches
 
-        # --- МИНИ-АНАЛИЗ БАТЧА ---
         sent_now = 0
         if cfg.analysis_enabled and st.sample_active:
             batch_syms = _pick_batch_symbols(st.sample_active, st.batch, max(1, cfg.analysis_batch_size))
-
-            # параллельно анализируем символы
             results = await asyncio.gather(
                 *[_analyze_symbol(app, cfg, s) for s in batch_syms],
                 return_exceptions=True
             )
 
-            # анти-дубли (TTL и cooldown)
             sent_map: Dict[str, float] = app.bot_data.setdefault("sent_signals", {})
             now_ts = datetime.utcnow().timestamp()
 
@@ -662,9 +627,7 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 last_ts = sent_map.get(sym, 0.0)
                 if now_ts - last_ts < cfg.signal_cooldown_sec:
-                    continue  # рано
-
-                # внутри TTL — не повторяем
+                    continue
                 if now_ts - last_ts < cfg.signal_ttl_min * 60:
                     continue
 
@@ -673,7 +636,7 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 sent_map[sym] = now_ts
                 sent_now += 1
                 if sent_now >= 2:
-                    break  # на один проход — максимум 2 сигнала
+                    break
 
         logger.info(
             f"scan: candidates={st.active} sent={sent_now} active={st.active} batch#{st.batch}"
@@ -683,7 +646,6 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.sleep(0)
 
 
-# keepalive — периодический само-пинг, чтобы Render не засыпал
 async def job_keepalive(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     cfg: Config = app.bot_data["cfg"]
@@ -769,7 +731,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"SELF_PING={cfg.self_ping} KEEPALIVE_SEC={cfg.self_ping_interval_sec}\n"
         f"ANALYSIS_ENABLED={cfg.analysis_enabled} BATCH_SIZE={cfg.analysis_batch_size}\n"
         f"SIGNAL_TTL_MIN={cfg.signal_ttl_min} SIGNAL_COOLDOWN_SEC={cfg.signal_cooldown_sec}\n"
-        f"VOL_SMA_PERIOD={cfg.vol_sma_period} VOL_MULT={cfg.vol_mult} ATR_PERIOD={cfg.atr_period} BODY_ATR_MULT={cfg.body_atr_mult}\n"
+        f"VOL_SMA_PERIOD={cfg.vol_sma_period} VOL_MULT={cfg.vol_mult} VOL_MULT_STRONG={cfg.vol_mult_strong} "
+        f"ATR_PERIOD={cfg.atr_period} BODY_ATR_MULT={cfg.body_atr_mult} OI_FLAT_TOL={cfg.oi_flat_tolerance} OI_SPIKE_MIN={cfg.oi_spike_min}\n"
         f"LIQ_REVERSAL_ENABLED={cfg.liq_enable_reversal} LIQ_EVENTS_MIN={cfg.liq_events_min} LIQ_NOTIONAL_MIN={cfg.liq_notional_min} "
         f"LIQ_REVERSAL_LOOKBACK={cfg.liq_reversal_lookback} LIQ_VOL_MULT_MIN={cfg.liq_vol_mult_min}\n"
         f"PUBLIC_URL={cfg.public_url or '-'} PORT={cfg.port}\n"
@@ -792,7 +755,6 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
     try:
         jq = app.job_queue
 
-        # перенос ограничителей в job_kwargs (совместимо с PTB 21.x)
         job_scan_obj = jq.run_repeating(
             job_scan,
             interval=cfg.scan_interval_sec,
@@ -818,10 +780,7 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
                 job_kwargs={"misfire_grace_time": cfg.self_ping_interval_sec, "coalesce": True},
             )
 
-        jobs_map: Dict[str, Any] = {
-            "scan": job_scan_obj,
-            "heartbeat": job_hb_obj,
-        }
+        jobs_map: Dict[str, Any] = {"scan": job_scan_obj, "heartbeat": job_hb_obj}
         if job_ka_obj:
             jobs_map["keepalive"] = job_ka_obj
 
@@ -836,18 +795,16 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# MAIN — явный lifecycle
+# MAIN
 # -----------------------------------------------------------------------------
 async def main_async() -> None:
     cfg = Config.load()
 
-    # 1) health-сервер для быстрого аптайма на Render
     try:
         asyncio.create_task(start_health_server(cfg.port))
     except Exception:
         logger.exception("health server failed to start")
 
-    # 2) Telegram app
     application = Application.builder().token(cfg.telegram_token).build()
     application.bot_data["cfg"] = cfg
     application.bot_data["universe_state"] = UniverseState()
@@ -863,7 +820,6 @@ async def main_async() -> None:
             "[cfg] ONLY_CHANNEL=1, но среди PRIMARY_RECIPIENTS нет ID канала (отрицательного chat_id)."
         )
 
-    # 3) Хэндлеры
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("universe", cmd_universe))
     application.add_handler(CommandHandler("status", cmd_status))
@@ -872,21 +828,17 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("diag", cmd_debug))
     application.add_handler(CommandHandler("diagnostics", cmd_debug))
 
-    # 4) Удаляем вебхук перед polling
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         logger.exception("delete_webhook failed")
 
     try:
-        # --- ИНИЦИАЛИЗАЦИЯ/СТАРТ ---
         await application.initialize()
         await application.start()
 
-        # тёплый старт и задания запускаем ПОСЛЕ старта приложения
         application.create_task(_warmup_and_schedule(application, cfg), name="warmup")
 
-        # --- ЗАПУСК POLLING ---
         try:
             await application.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -896,12 +848,10 @@ async def main_async() -> None:
             logger.error("Another instance is polling (Conflict). Exiting this one.")
             return
 
-        # --- ОЖИДАНИЕ ---
         stop_forever = asyncio.Event()
         await stop_forever.wait()
 
     finally:
-        # --- КОРРЕКТНАЯ ОСТАНОВКА ---
         try:
             if application.updater:
                 await application.updater.stop()
@@ -915,7 +865,6 @@ async def main_async() -> None:
             await application.shutdown()
         except Exception:
             pass
-        # Закрываем Bybit-сессию
         try:
             client: BybitClient = application.bot_data["bybit"]
             await client.close()
