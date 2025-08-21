@@ -636,10 +636,10 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not st.total:
             await build_universe(app, cfg)
 
-        # вращаем batch-счётчик как раньше — чтобы не мешать существующей логике
+        # ✅ FIX: корректная ротация — обходим всю вселенную по батчам размера analysis_batch_size
         if st.sample_active:
-            # на всякий увеличим модуль от количества "частей" (3 для красоты)
-            st.batch = (st.batch + 1) % max(1, (st.active // 10) or 1)
+            batches = max(1, (st.active + cfg.analysis_batch_size - 1) // max(1, cfg.analysis_batch_size))
+            st.batch = (st.batch + 1) % batches
 
         # --- МИНИ-АНАЛИЗ БАТЧА ---
         sent_now = 0
@@ -648,7 +648,7 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # параллельно анализируем символы
             results = await asyncio.gather(
-                *[ _analyze_symbol(app, cfg, s) for s in batch_syms ],
+                *[_analyze_symbol(app, cfg, s) for s in batch_syms],
                 return_exceptions=True
             )
 
