@@ -192,15 +192,17 @@ class Config:
 
 
 # -----------------------------------------------------------------------------
-# BYBIT КЛИЕНТ
+# BYBIT КЛИЕНТ (УЛУЧШЕННАЯ ВЕРСИЯ)
 # -----------------------------------------------------------------------------
 class BybitClient:
     def __init__(self, base: str = "https://api.bybit.com") -> None:
         self.base = base
         self._session: Optional[aiohttp.ClientSession] = None
+        self.retry_attempts = 3
+        self.retry_delay = 1
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
+        if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15)
             )
@@ -214,45 +216,61 @@ class BybitClient:
                 pass
             self._session = None
 
-    async def fetch_linear_symbols(self) -> List[str]:
+    async def _request_with_retry(self, url: str) -> Optional[Dict[str, Any]]:
         session = await self._ensure_session()
+        
+        for attempt in range(self.retry_attempts):
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.warning(f"Attempt {attempt + 1} failed with status {resp.status}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
+            
+            if attempt < self.retry_attempts - 1:
+                await asyncio.sleep(self.retry_delay * (attempt + 1))
+        
+        return None
+
+    async def fetch_linear_symbols(self) -> List[str]:
         url = f"{self.base}/v5/market/instruments-info?category=linear"
         out: List[str] = []
         cursor = None
+        
         for _ in range(5):
             u = url if not cursor else f"{url}&cursor={cursor}"
-            async with session.get(u) as resp:
-                data = await resp.json()
-            if data.get("retCode") != 0:
+            data = await self._request_with_retry(u)
+            
+            if not data or data.get("retCode") != 0:
                 break
+                
             list_ = (data.get("result") or {}).get("list") or []
             for it in list_:
                 sym = it.get("symbol")
                 if sym and sym.endswith("USDT"):
                     out.append(sym)
+                    
             cursor = (data.get("result") or {}).get("nextPageCursor")
             if not cursor:
                 break
-            await asyncio.sleep(0)
+                
+            await asyncio.sleep(0.1)
+            
         return sorted(set(out))
 
     async def fetch_kline(self, symbol: str, interval: str = "5", limit: int = 200) -> Dict[str, Any]:
-        session = await self._ensure_session()
         url = f"{self.base}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
-        async with session.get(url) as resp:
-            return await resp.json()
+        return await self._request_with_retry(url) or {}
 
     async def fetch_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> Dict[str, Any]:
-        session = await self._ensure_session()
         url = f"{self.base}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
-        async with session.get(url) as resp:
-            return await resp.json()
+        return await self._request_with_retry(url) or {}
 
     async def fetch_liquidations(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
-        session = await self._ensure_session()
         url = f"{self.base}/v5/market/liquidation?category=linear&symbol={symbol}&limit={limit}"
-        async with session.get(url) as resp:
-            return await resp.json()
+        return await self._request_with_retry(url) or {}
 
 
 # -----------------------------------------------------------------------------
@@ -284,20 +302,25 @@ async def build_universe(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# HEALTH-СЕРВЕР
+# HEALTH-СЕРВЕР (ИЗМЕНЕНО ДЛЯ RENDER)
 # -----------------------------------------------------------------------------
-async def start_health_server(port: int) -> None:
+async def health_handler(request):
+    return web.Response(text="OK")
+
+async def start_health_server(port: int):
+    """Запуск health-сервера для Render"""
     app = web.Application()
-
-    async def health(_):
-        return web.Response(text="ok")
-
-    app.router.add_get("/health", health)
+    app.router.add_get('/health', health_handler)
+    app.router.add_get('/', health_handler)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"[health] listening on :{port} (/health)")
+    
+    logger.info(f"Health server started on port {port}")
+    return runner
 
 
 # -----------------------------------------------------------------------------
@@ -407,7 +430,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             chg = (c2 - c1) / c1 if c1 else 0.0
         except Exception:
             pass
-    logger.info(f"[kline] {symbol}: chg={_fmt_pct(chg)} volx={vol_mult:.2f} atr={atr_val:.6f} body={body:.6f}")
+    
+    # Изменено с INFO на DEBUG для уменьшения логов
+    logger.debug(f"[kline] {symbol}: chg={_fmt_pct(chg)} volx={vol_mult:.2f} atr={atr_val:.6f} body={body:.6f}")
 
     # --- OPEN INTEREST ---
     oi_ok = (oi or {}).get("retCode") == 0
@@ -430,7 +455,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
         except Exception:
             oi_d = 0.0
             oi_last = 0.0
-    logger.info(f"[open-interest] {symbol}: d_5min={_fmt_pct(oi_d)} last={oi_last:.3f}")
+    
+    # Изменено с INFO на DEBUG для уменьшения логов
+    logger.debug(f"[open-interest] {symbol}: d_5min={_fmt_pct(oi_d)} last={oi_last:.3f}")
 
     # --- LIQUIDATIONS ---
     lq_ok = (lq or {}).get("retCode") == 0
@@ -450,7 +477,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
         except Exception:
             pass
     dom = "long>short" if side_long > side_short else ("short>long" if side_short > side_long else "balanced")
-    logger.info(f"[liquidation] {symbol}: events={liq_events} notional≈{liq_notional:.0f} side={dom}")
+    
+    # Изменено с INFO на DEBUG для уменьшения логов
+    logger.debug(f"[liquidation] {symbol}: events={liq_events} notional≈{liq_notional:.0f} side={dom}")
 
     if not cfg.analysis_enabled:
         return None
@@ -548,7 +577,9 @@ async def _analyze_symbol(app: Application, cfg: Config, symbol: str) -> Optiona
             rev_ok = (chg < 0) and (body >= 0.4 * cfg.body_atr_mult * atr_val)
 
         vol_ok = vol_mult >= cfg.liq_vol_mult_min
-        logger.info(f"[liq-reversal] {symbol}: shock={liq_shock} expect={expected_side or '-'} rev_ok={rev_ok} vol_ok={vol_ok}")
+        
+        # Изменено с INFO на DEBUG для уменьшения логов
+        logger.debug(f"[liq-reversal] {symbol}: shock={liq_shock} expect={expected_side or '-'} rev_ok={rev_ok} vol_ok={vol_ok}")
 
         if liq_shock and expected_side and rev_ok and vol_ok:
             side = expected_side
@@ -644,9 +675,21 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             sent_map: Dict[str, float] = app.bot_data.setdefault("sent_signals", {})
             now_ts = datetime.utcnow().timestamp()
+            
+            # Очистка устаревших сигналов (раз в 10 сканирований)
+            if st.batch % 10 == 0:
+                ttl_sec = cfg.signal_ttl_min * 60 + cfg.signal_cooldown_sec
+                expired = [sym for sym, ts in sent_map.items() if now_ts - ts > ttl_sec]
+                for sym in expired:
+                    del sent_map[sym]
+                if expired:
+                    logger.info(f"Cleaned up {len(expired)} expired signals")
 
             for sym, res in zip(batch_syms, results):
-                if isinstance(res, Exception) or not res:
+                if isinstance(res, Exception):
+                    logger.error(f"Error analyzing {sym}: {res}")
+                    continue
+                if not res:
                     continue
 
                 # --- анти-спам (ttl/cooldown) ---
@@ -693,9 +736,9 @@ async def job_keepalive(context: ContextTypes.DEFAULT_TYPE) -> None:
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.get(url) as r:
                 await r.text()
-        logger.info(f"[keepalive] ping {url} ✓")
+        logger.debug(f"[keepalive] ping {url} ✓")
     except Exception:
-        logger.exception(f"[keepalive] ping {url} failed")
+        logger.warning(f"[keepalive] ping {url} failed")
 
 
 # -----------------------------------------------------------------------------
@@ -833,16 +876,12 @@ async def _warmup_and_schedule(app: Application, cfg: Config) -> None:
 
 
 # -----------------------------------------------------------------------------
-# MAIN
+# MAIN (ОБНОВЛЕННАЯ ВЕРСИЯ ДЛЯ RENDER)
 # -----------------------------------------------------------------------------
 async def main_async() -> None:
     cfg = Config.load()
 
-    try:
-        asyncio.create_task(start_health_server(cfg.port))
-    except Exception:
-        logger.exception("health server failed to start")
-
+    # Инициализация приложения бота
     application = Application.builder().token(cfg.telegram_token).build()
     application.bot_data["cfg"] = cfg
     application.bot_data["universe_state"] = UniverseState()
@@ -867,47 +906,44 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("diagnostics", cmd_debug))
 
     try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        logger.exception("delete_webhook failed")
-
-    try:
+        # Запуск health-сервера для Render
+        health_runner = await start_health_server(cfg.port)
+        
+        # Инициализация бота
         await application.initialize()
         await application.start()
+        await application.bot.delete_webhook(drop_pending_updates=True)
 
+        # Запуск планировщика задач
         application.create_task(_warmup_and_schedule(application, cfg), name="warmup")
 
+        # Бесконечный цикл для работы бота
+        stop_event = asyncio.Event()
+        
+        # Обработка остановки
         try:
-            await application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-        except Conflict:
-            logger.error("Another instance is polling (Conflict). Exiting this one.")
-            return
-
-        stop_forever = asyncio.Event()
-        await stop_forever.wait()
-
-    finally:
-        try:
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            logger.info("Bot stopped")
+        finally:
+            # Корректное завершение
+            if health_runner:
+                await health_runner.cleanup()
+                
             if application.updater:
                 await application.updater.stop()
-        except Exception:
-            pass
-        try:
+                
             await application.stop()
-        except Exception:
-            pass
-        try:
             await application.shutdown()
-        except Exception:
-            pass
-        try:
+            
             client: BybitClient = application.bot_data["bybit"]
             await client.close()
-        except Exception:
-            pass
+
+    except Conflict:
+        logger.error("Another instance is polling (Conflict). Exiting this one.")
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
 
 
 def main() -> None:
