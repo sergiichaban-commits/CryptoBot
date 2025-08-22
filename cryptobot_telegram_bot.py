@@ -100,10 +100,10 @@ class Config:
         self.only_channel: bool = kw.get("only_channel", True)
         self.startup_delay_sec: int = kw.get("startup_delay_sec", 5)
         self.first_scan_delay_sec: int = kw.get("first_scan_delay_sec", 10)
-        self.heartbeat_sec: int = kw.get("heartbeat_sec", 900)
+        self.heartbeat_sec: int = kw.get("heartbeat_sec", 3600)  # 1 час вместо 900
 
         # интервал сканирования
-        self.scan_interval_sec: int = kw.get("scan_interval_sec", 30)
+        self.scan_interval_sec: int = kw.get("scan_interval_sec", 60)  # 60 вместо 30
 
         # Параметры «вселенной»
         self.universe_top_n: int = kw.get("universe_top_n", 30)
@@ -115,22 +115,22 @@ class Config:
         # Keepalive (само-пинг)
         self.public_url: Optional[str] = kw.get("public_url")
         self.self_ping: bool = kw.get("self_ping", True)
-        self.self_ping_interval_sec: int = kw.get("self_ping_interval_sec", 780)  # ~13 мин
+        self.self_ping_interval_sec: int = kw.get("self_ping_interval_sec", 1800)  # 30 мин
 
         # Аналитика/сигналы
         self.analysis_enabled: bool = kw.get("analysis_enabled", True)
-        self.analysis_batch_size: int = kw.get("analysis_batch_size", 5)  # ↑ было 3
+        self.analysis_batch_size: int = kw.get("analysis_batch_size", 5)
         self.signal_ttl_min: int = kw.get("signal_ttl_min", 12)
         self.signal_cooldown_sec: int = kw.get("signal_cooldown_sec", 600)
 
-        # Пороговые параметры анализа (мягче дефолты)
+        # Пороговые параметры анализа
         self.vol_sma_period: int = kw.get("vol_sma_period", 20)
-        self.vol_mult: float = kw.get("vol_mult", 1.15)               # ↓ было 2.0
-        self.vol_mult_strong: float = kw.get("vol_mult_strong", 1.60) # новый порог для «сильного объёма»
+        self.vol_mult: float = kw.get("vol_mult", 2.0)  # Более строгий фильтр
+        self.vol_mult_strong: float = kw.get("vol_mult_strong", 3.0)  # Более строгий фильтр
         self.atr_period: int = kw.get("atr_period", 14)
-        self.body_atr_mult: float = kw.get("body_atr_mult", 0.45)     # ↓ было 0.60
-        self.oi_flat_tolerance: float = kw.get("oi_flat_tolerance", 0.002)  # 0.2% — допускаем «плоский» OI
-        self.oi_spike_min: float = kw.get("oi_spike_min", 0.003)            # 0.3% — слабый спайк OI
+        self.body_atr_mult: float = kw.get("body_atr_mult", 0.6)  # Более строгий фильтр
+        self.oi_flat_tolerance: float = kw.get("oi_flat_tolerance", 0.002)
+        self.oi_spike_min: float = kw.get("oi_spike_min", 0.003)
 
         # параметры «шока ликвидаций» и реверс-сценария
         self.liq_enable_reversal: bool = kw.get("liq_enable_reversal", True)
@@ -138,6 +138,10 @@ class Config:
         self.liq_notional_min: float = kw.get("liq_notional_min", 25000.0)
         self.liq_reversal_lookback: int = kw.get("liq_reversal_lookback", 3)
         self.liq_vol_mult_min: float = kw.get("liq_vol_mult_min", 1.05)
+
+        # Фильтры сигналов
+        self.min_probability: float = kw.get("min_probability", 0.7)  # 70%
+        self.min_profit_pct: float = kw.get("min_profit_pct", 0.01)  # 1%
 
     @staticmethod
     def load() -> "Config":
@@ -157,9 +161,9 @@ class Config:
             only_channel=_env_bool("ONLY_CHANNEL", True),
             startup_delay_sec=_env_int("STARTUP_DELAY_SEC", 5),
             first_scan_delay_sec=_env_int("FIRST_SCAN_DELAY_SEC", 10),
-            heartbeat_sec=_env_int("HEARTBEAT_SEC", 900),
+            heartbeat_sec=_env_int("HEARTBEAT_SEC", 3600),  # 1 час
 
-            scan_interval_sec=_env_int("SCAN_INTERVAL_SEC", 30),
+            scan_interval_sec=_env_int("SCAN_INTERVAL_SEC", 60),  # 60 секунд
 
             universe_top_n=_env_int("UNIVERSE_TOP_N", 30),
             ws_symbols_max=_env_int("WS_SYMBOLS_MAX", 60),
@@ -168,7 +172,7 @@ class Config:
 
             public_url=pub_url,
             self_ping=_env_bool("SELF_PING", True),
-            self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 780),
+            self_ping_interval_sec=_env_int("KEEPALIVE_SEC", 1800),  # 30 минут
 
             analysis_enabled=_env_bool("ANALYSIS_ENABLED", True),
             analysis_batch_size=_env_int("ANALYSIS_BATCH_SIZE", 5),
@@ -176,10 +180,10 @@ class Config:
             signal_cooldown_sec=_env_int("SIGNAL_COOLDOWN_SEC", 600),
 
             vol_sma_period=_env_int("VOL_SMA_PERIOD", 20),
-            vol_mult=_env_float("VOL_MULT", 1.15),
-            vol_mult_strong=_env_float("VOL_MULT_STRONG", 1.60),
+            vol_mult=_env_float("VOL_MULT", 2.0),
+            vol_mult_strong=_env_float("VOL_MULT_STRONG", 3.0),
             atr_period=_env_int("ATR_PERIOD", 14),
-            body_atr_mult=_env_float("BODY_ATR_MULT", 0.45),
+            body_atr_mult=_env_float("BODY_ATR_MULT", 0.6),
             oi_flat_tolerance=_env_float("OI_FLAT_TOLERANCE", 0.002),
             oi_spike_min=_env_float("OI_SPIKE_MIN", 0.003),
 
@@ -188,6 +192,9 @@ class Config:
             liq_notional_min=_env_float("LIQ_NOTIONAL_MIN", 25000.0),
             liq_reversal_lookback=_env_int("LIQ_REVERSAL_LOOKBACK", 3),
             liq_vol_mult_min=_env_float("LIQ_VOL_MULT_MIN", 1.05),
+
+            min_probability=_env_float("MIN_PROBABILITY", 0.7),
+            min_profit_pct=_env_float("MIN_PROFIT_PCT", 0.01),
         )
 
 
@@ -200,6 +207,7 @@ class BybitClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self.retry_attempts = 3
         self.retry_delay = 1
+        self.symbol_blacklist = set()  # Черный список символов с ошибками
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -224,6 +232,14 @@ class BybitClient:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    elif resp.status == 404:
+                        # Добавляем символ в черный список
+                        symbol_match = re.search(r'symbol=([A-Z0-9]+)', url)
+                        if symbol_match:
+                            symbol = symbol_match.group(1)
+                            self.symbol_blacklist.add(symbol)
+                            logger.warning(f"Symbol {symbol} added to blacklist (404)")
+                        return None
                     else:
                         logger.warning(f"Attempt {attempt + 1} failed with status {resp.status}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -249,7 +265,7 @@ class BybitClient:
             list_ = (data.get("result") or {}).get("list") or []
             for it in list_:
                 sym = it.get("symbol")
-                if sym and sym.endswith("USDT"):
+                if sym and sym.endswith("USDT") and sym not in self.symbol_blacklist:
                     out.append(sym)
                     
             cursor = (data.get("result") or {}).get("nextPageCursor")
@@ -261,14 +277,20 @@ class BybitClient:
         return sorted(set(out))
 
     async def fetch_kline(self, symbol: str, interval: str = "5", limit: int = 200) -> Dict[str, Any]:
+        if symbol in self.symbol_blacklist:
+            return {}
         url = f"{self.base}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
         return await self._request_with_retry(url) or {}
 
     async def fetch_open_interest(self, symbol: str, interval: str = "5min", limit: int = 6) -> Dict[str, Any]:
+        if symbol in self.symbol_blacklist:
+            return {}
         url = f"{self.base}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
         return await self._request_with_retry(url) or {}
 
     async def fetch_liquidations(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
+        if symbol in self.symbol_blacklist:
+            return {}
         url = f"{self.base}/v5/market/liquidation?category=linear&symbol={symbol}&limit={limit}"
         return await self._request_with_retry(url) or {}
 
@@ -685,6 +707,8 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if expired:
                     logger.info(f"Cleaned up {len(expired)} expired signals")
 
+            # Собираем и сортируем сигналы по вероятности
+            valid_signals = []
             for sym, res in zip(batch_syms, results):
                 if isinstance(res, Exception):
                     logger.error(f"Error analyzing {sym}: {res}")
@@ -700,23 +724,30 @@ async def job_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                     continue
 
                 # --- новые ФИЛЬТРЫ по требованию ---
-                # 1) Вероятность >= 70%
-                if res.get("prob", 0.0) < 0.70:
-                    logger.info(f"[filter] skip {sym}: prob<{0.70}")
+                # 1) Вероятность >= min_probability
+                if res.get("prob", 0.0) < cfg.min_probability:
+                    logger.info(f"[filter] skip {sym}: prob<{cfg.min_probability}")
                     continue
-                # 2) Потенциальная прибыль (до тейка) >= 1%
+                # 2) Потенциальная прибыль (до тейка) >= min_profit_pct
                 entry = res["entry"]
                 tp = res["tp"]
                 tp_pct = (tp - entry) / entry if res["side"] == "LONG" else (entry - tp) / entry
-                if tp_pct < 0.01:
-                    logger.info(f"[filter] skip {sym}: tp_pct<{0.01:.2%} (actual {tp_pct:.2%})")
+                if tp_pct < cfg.min_profit_pct:
+                    logger.info(f"[filter] skip {sym}: tp_pct<{cfg.min_profit_pct:.2%} (actual {tp_pct:.2%})")
                     continue
 
+                valid_signals.append((res['prob'], res, sym))
+
+            # Сортируем сигналы по вероятности (по убыванию)
+            valid_signals.sort(key=lambda x: x[0], reverse=True)
+
+            # Отправляем сигналы в порядке убывания вероятности
+            for prob, res, sym in valid_signals:
                 text, kb = _format_signal(res)
-                await notify(app, text, reply_markup=kb)  # kb == None (кнопка Bybit убрана)
+                await notify(app, text, reply_markup=kb)
                 sent_map[sym] = now_ts
                 sent_now += 1
-                if sent_now >= 2:
+                if sent_now >= 2:  # Максимум 2 сигнала за раз
                     break
 
         logger.info(
@@ -816,6 +847,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ATR_PERIOD={cfg.atr_period} BODY_ATR_MULT={cfg.body_atr_mult} OI_FLAT_TOL={cfg.oi_flat_tolerance} OI_SPIKE_MIN={cfg.oi_spike_min}\n"
         f"LIQ_REVERSAL_ENABLED={cfg.liq_enable_reversal} LIQ_EVENTS_MIN={cfg.liq_events_min} LIQ_NOTIONAL_MIN={cfg.liq_notional_min} "
         f"LIQ_REVERSAL_LOOKBACK={cfg.liq_reversal_lookback} LIQ_VOL_MULT_MIN={cfg.liq_vol_mult_min}\n"
+        f"MIN_PROBABILITY={cfg.min_probability} MIN_PROFIT_PCT={cfg.min_profit_pct}\n"
         f"PUBLIC_URL={cfg.public_url or '-'} PORT={cfg.port}\n"
         f"universe total={st.total} active={st.active} ws_topics={st.ws_topics} batch#{st.batch}\n"
     )
