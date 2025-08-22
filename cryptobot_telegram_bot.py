@@ -8,6 +8,7 @@ CryptoBot — Telegram сканер сигналов Bybit USDT perpetual
 - Удалена кнопка-переход на Bybit (InlineKeyboardButton/Markup не используется)
 - В сообщении сигнала добавлены "Текущая цена" и "Обоснование"
 - Снижен объём ротации монет через переменную ANALYSIS_BATCH_SIZE
+- FIX: создание aiohttp.ClientSession перенесено в on_startup (исправлен RuntimeError: no running event loop на Python 3.13)
 """
 
 from __future__ import annotations
@@ -17,17 +18,15 @@ import json
 import logging
 import math
 import os
-import random
 import re
-import signal
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
+import contextlib
 
 # ---------------------------------------------------------------------
 # Пороговые значения фильтра сигналов (переопределяются через ENV)
@@ -100,7 +99,7 @@ class Config:
     # Аналитика
     analysis_batch_size: int
 
-    # Фильтры (вынесены в ENV, но с дефолтами)
+    # Фильтры (ENV с дефолтами)
     tp_min_pct: float
     prob_min: float
 
@@ -110,7 +109,6 @@ class Config:
         if not token:
             raise RuntimeError("TELEGRAM_TOKEN не задан")
 
-        # кому слать: список id через запятую
         def _parse_ids(name: str) -> List[int]:
             raw = _env_str(name, "") or ""
             ids: List[int] = []
@@ -123,7 +121,7 @@ class Config:
                     pass
             return ids
 
-        cfg = Config(
+        return Config(
             token=token,
             log_level=_env_str("LOG_LEVEL", "INFO"),
             public_url=_env_str("RENDER_EXTERNAL_URL") or _env_str("PUBLIC_URL"),
@@ -140,7 +138,6 @@ class Config:
             tp_min_pct=_env_float("TP_MIN_PCT", TP_MIN_PCT),
             prob_min=_env_float("PROB_MIN", PROB_MIN),
         )
-        return cfg
 
 
 # ---------------------------------------------------------------------
@@ -173,7 +170,6 @@ class Bybit:
         self.http = session
 
     async def tickers(self) -> List[Dict[str, Any]]:
-        # линейные перпетуалы
         url = f"{self.base}/v5/market/tickers?category=linear"
         async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             r.raise_for_status()
@@ -351,8 +347,8 @@ async def job_scan(app: web.Application) -> None:
 
         # --- фильтры ---
         # 1) Вероятность
-        if res.get("prob", 0.0) < PROB_MIN:
-            logger.info(f"[filter] skip {sym}: prob<{PROB_MIN:.2f}")
+        if res.get("prob", 0.0) < cfg.prob_min:
+            logger.info(f"[filter] skip {sym}: prob<{cfg.prob_min:.2f}")
             continue
 
         # 2) Минимальный ожидаемый профит (до тейка)
@@ -360,8 +356,8 @@ async def job_scan(app: web.Application) -> None:
         tp = float(res["tp"])
         side = res["side"]
         tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
-        if tp_pct < TP_MIN_PCT:
-            logger.info(f"[filter] skip {sym}: tp<{TP_MIN_PCT:.2%}")
+        if tp_pct < cfg.tp_min_pct:
+            logger.info(f"[filter] skip {sym}: tp<{cfg.tp_min_pct:.2%}")
             continue
 
         # прошёл фильтр
@@ -372,7 +368,6 @@ async def job_scan(app: web.Application) -> None:
     if not signals:
         return
 
-    # отправляем всем primary_recipients
     for _sig, text in signals:
         for chat_id in cfg.primary_recipients:
             try:
@@ -389,7 +384,7 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "uptime_sec": int(time.monotonic() - app["start_ts"]),
+            "uptime_sec": int(time.monotonic() - app.get("start_ts", time.monotonic())),
             "time": now_utc().isoformat(),
             "tp_min_pct": app["cfg"].tp_min_pct,
             "prob_min": app["cfg"].prob_min,
@@ -429,12 +424,16 @@ async def on_startup(app: web.Application) -> None:
     app["start_ts"] = time.monotonic()
     logger.info("startup...")
 
-    # запуск периодических задач
+    # Создаём HTTP-сессию и клиенты ТОЛЬКО внутри запущенного event loop
+    http = aiohttp.ClientSession()
+    app["http"] = http
+    app["bybit"] = Bybit(cfg.bybit_base, http)
+    app["tg"] = Tg(cfg.token, http)
+
     loop = asyncio.get_event_loop()
 
     async def _scan_loop() -> None:
         await asyncio.sleep(cfg.first_scan_delay_sec)
-        i = 0
         while True:
             t0 = time.perf_counter()
             try:
@@ -442,7 +441,6 @@ async def on_startup(app: web.Application) -> None:
             except Exception as e:
                 logger.exception(f"job_scan: {e}")
             dt = time.perf_counter() - t0
-            i += 1
             logger.info(
                 f'Job "job_scan (trigger: interval[0:00:{cfg.scan_interval_sec:02d}], next run at: '
                 f'{(now_utc() + timedelta(seconds=cfg.scan_interval_sec)).strftime("%Y-%m-%d %H:%M:%S")} UTC)" executed successfully'
@@ -471,35 +469,31 @@ async def on_startup(app: web.Application) -> None:
 
 
 async def on_cleanup(app: web.Application) -> None:
+    # останавливаем фоновые задачи
     for key in ("scan_task", "keepalive_task", "heartbeat_task"):
         task: Optional[asyncio.Task] = app.get(key)
         if task:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+    # закрываем HTTP-сессию
+    http: Optional[aiohttp.ClientSession] = app.get("http")
+    if http and not http.closed:
+        await http.close()
 
 
 # ---------------------------------------------------------------------
 # MAIN / web
 # ---------------------------------------------------------------------
-import contextlib
-
 def make_app(cfg: Config) -> web.Application:
     app = web.Application()
     app["cfg"] = cfg
 
-    http = aiohttp.ClientSession()
-    app["http"] = http
-    app["bybit"] = Bybit(cfg.bybit_base, http)
-    app["tg"] = Tg(cfg.token, http)
-
+    # Роуты
     app.router.add_get("/health", handle_health)
+
+    # Жизненный цикл
     app.on_startup.append(on_startup)
-
-    async def _close_http(app_: web.Application) -> None:
-        await app_["http"].close()
-
-    app.on_cleanup.append(_close_http)
     app.on_cleanup.append(on_cleanup)
     return app
 
@@ -511,7 +505,7 @@ def main() -> None:
     logger.info(
         "cfg: "
         f"public_url={cfg.public_url} | "
-        f"scan_interval={cfg.scan_interval_sec}s | "
+        f"scan_interval=12s | "
         f"batch={cfg.analysis_batch_size} | "
         f"tp_min={cfg.tp_min_pct:.2%} | "
         f"prob_min={cfg.prob_min:.0%}"
