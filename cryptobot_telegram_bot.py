@@ -2,15 +2,11 @@
 """
 Cryptobot — Telegram сигналы с Bybit V5 WebSocket (реакция ~ секунды)
 
-Главные отличия:
-- Только один REST-вызов на старте (список тикеров) — дальше чистый WebSocket.
-- Подписки: tickers.{SYMBOL}, kline.1.{SYMBOL}, liquidation.{SYMBOL} (опц.).
-- Надёжный reconnect + ping; журнал «жив» (watchdog) каждые 60 сек.
-- Минимум ENV: достаточно TELEGRAM_TOKEN. Остальное уже задано в коде.
-
-Заметка:
-- Если Render даёт ощущение «тишины», теперь лог watchdog появляется раз в минуту.
-- Ликвидации по REST полностью удалены (раньше давали 404 и забивали логи).
+Изменения:
+- Динамический TP: от ATR с коэффициентом по силе свечи (body/ATR) + буст от ликвидаций.
+- Ограничители: TP_MIN_PCT (низ) и TP_MAX_PCT (верх). По умолчанию 1%..4%.
+- Стоп подбирается под RR ≈ 1:1.6.
+- Фикс обработчика liquidation.* (пропуск не-dict элементов), чтобы не было падений.
 """
 
 from __future__ import annotations
@@ -37,20 +33,21 @@ DEFAULT_BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 DEFAULT_LOG_LEVEL = "INFO"
 
 # Выбор и фильтры
-DEFAULT_ACTIVE_SYMBOLS = 30            # сколько топ-символов подписывать
-DEFAULT_PROB_MIN = 0.65                # минимальная «вероятность» для отправки
-DEFAULT_TP_MIN_PCT = 0.010             # минимальный тейк-профит (1%)
-DEFAULT_ATR_PERIOD = 14                # ATR по минутным свечам
-DEFAULT_BODY_ATR_MULT = 0.6            # сила тела свечи относительно ATR
-DEFAULT_VOL_SMA_PERIOD = 20            # среднее по объёму (свечам)
-DEFAULT_VOL_MULT = 2.0                 # «объём x2 от среднего» как триггер
-DEFAULT_SIGNAL_COOLDOWN_SEC = 60       # антиспам на одно направление
+DEFAULT_ACTIVE_SYMBOLS = 30             # сколько топ-символов подписывать
+DEFAULT_PROB_MIN = 0.65                 # минимальная «вероятность» для отправки
+DEFAULT_TP_MIN_PCT = 0.010              # минимальный тейк-профит (1%)
+DEFAULT_TP_MAX_PCT = 0.040              # максимальный тейк-профит (4%) — можно поменять ENV: TP_MAX_PCT
+DEFAULT_ATR_PERIOD = 14                 # ATR по минутным свечам
+DEFAULT_BODY_ATR_MULT = 0.6             # порог «сильной» свечи: тело/ATR
+DEFAULT_VOL_SMA_PERIOD = 20             # среднее по объёму (свечам)
+DEFAULT_VOL_MULT = 2.0                  # «объём x2 от среднего» как триггер
+DEFAULT_SIGNAL_COOLDOWN_SEC = 60        # антиспам на одно направление
 
 # Телеметрия / веб
-DEFAULT_HEARTBEAT_SEC = 15 * 60        # телеграм «я жив»
-DEFAULT_KEEPALIVE_SEC = 13 * 60        # пинг публичного URL
-DEFAULT_WATCHDOG_SEC = 60              # строка «жив» в лог раз в 60с
-DEFAULT_FIRST_DELAY_SEC = 3            # быстрый старт
+DEFAULT_HEARTBEAT_SEC = 15 * 60         # телеграм «я жив»
+DEFAULT_KEEPALIVE_SEC = 13 * 60         # пинг публичного URL
+DEFAULT_WATCHDOG_SEC = 60               # строка «жив» в лог раз в 60с
+DEFAULT_FIRST_DELAY_SEC = 3             # быстрый старт
 DEFAULT_PORT = 10000
 
 # Роутинг по умолчанию (можно переопределить через ENV)
@@ -122,6 +119,7 @@ class Config:
     active_symbols: int = DEFAULT_ACTIVE_SYMBOLS
     prob_min: float = DEFAULT_PROB_MIN
     tp_min_pct: float = DEFAULT_TP_MIN_PCT
+    tp_max_pct: float = DEFAULT_TP_MAX_PCT
     atr_period: int = DEFAULT_ATR_PERIOD
     body_atr_mult: float = DEFAULT_BODY_ATR_MULT
     vol_sma_period: int = DEFAULT_VOL_SMA_PERIOD
@@ -164,6 +162,7 @@ class Config:
             active_symbols=_env_int("ACTIVE_SYMBOLS", DEFAULT_ACTIVE_SYMBOLS),
             prob_min=_env_float("PROB_MIN", DEFAULT_PROB_MIN),
             tp_min_pct=_env_float("TP_MIN_PCT", DEFAULT_TP_MIN_PCT),
+            tp_max_pct=_env_float("TP_MAX_PCT", DEFAULT_TP_MAX_PCT),
             atr_period=_env_int("ATR_PERIOD", DEFAULT_ATR_PERIOD),
             body_atr_mult=_env_float("BODY_ATR_MULT", DEFAULT_BODY_ATR_MULT),
             vol_sma_period=_env_int("VOL_SMA_PERIOD", DEFAULT_VOL_SMA_PERIOD),
@@ -312,7 +311,8 @@ class MarketState:
         for p in points:
             o = float(p["open"]); h = float(p["high"]); l = float(p["low"]); c = float(p["close"])
             v = float(p.get("volume") or p.get("turnover") or 0.0)
-            if not buf or c != buf[-1][3]:  # не дублировать
+            # фиксируем только изменения/закрытия (не дублируем одно и то же)
+            if not buf or c != buf[-1][3]:
                 buf.append((o, h, l, c, v))
                 if len(buf) > self.kline_maxlen:
                     buf.pop(0)
@@ -377,29 +377,47 @@ class SignalEngine:
         v_sma = self._sma(vols, self.cfg.vol_sma_period)
         vol_ok = (v_sma > 0.0) and (v > self.cfg.vol_mult * v_sma)
 
-        # простая логика направления: сильное тело + объём
+        # Направление по телу свечи с объёмом
         side: Optional[str] = None
         if body_ratio >= self.cfg.body_atr_mult and vol_ok:
             side = "LONG" if c > o else "SHORT"
-
         if not side:
             return None
 
-        # базовый таргет/стоп от ATR
+        # ---- ДИНАМИЧЕСКИЙ TP ----
+        # Базовый мультипликатор по силе импульса (body/ATR):
+        # чем сильнее свеча над порогом, тем больше k_atr (но ограничиваем).
+        k_atr = 1.0 + min(1.0, max(0.0, body_ratio - self.cfg.body_atr_mult) * 0.8)
+        # Буст от ликвидаций (если их >=3 за 60с, добавим 10% к k_atr)
+        liq_cnt = self._recent_liq_count(sym, 60)
+        if liq_cnt >= 3:
+            k_atr *= 1.10
+
+        # Переводим ATR в проценты цены
+        atr_pct = atr / max(1e-9, c)
+
+        # Итоговая целевая доля до TP
+        tp_pct_dyn = k_atr * atr_pct
+        # Клапаны: минимум/максимум
+        tp_pct = min(self.cfg.tp_max_pct, max(self.cfg.tp_min_pct, tp_pct_dyn))
+
+        # RR: берём стоп так, чтобы RR ≈ 1:1.6 (можно варьировать)
+        rr_target = 1.6
+        sl_pct = max(0.002, tp_pct / rr_target)  # минимум 0.2% как предохранитель
+
         entry = c
         if side == "LONG":
-            tp = entry * (1.0 + max(self.cfg.tp_min_pct, 0.5 * atr / max(1e-9, entry)))
-            sl = entry - 1.5 * atr
+            tp = entry * (1.0 + tp_pct)
+            sl = entry * (1.0 - sl_pct)
         else:
-            tp = entry * (1.0 - max(self.cfg.tp_min_pct, 0.5 * atr / max(1e-9, entry)))
-            sl = entry + 1.5 * atr
+            tp = entry * (1.0 - tp_pct)
+            sl = entry * (1.0 + sl_pct)
 
         # «вероятность» — эвристика: тело, объём, и (опц.) всплеск ликвидаций
         prob = 0.5
         prob += min(0.3, (body_ratio - self.cfg.body_atr_mult) * 0.2) if body_ratio > self.cfg.body_atr_mult else 0
         if vol_ok:
             prob += 0.15
-        liq_cnt = self._recent_liq_count(sym, 60)
         if liq_cnt >= 3:
             prob += 0.05
 
@@ -422,6 +440,9 @@ class SignalEngine:
             "prob": float(prob),
             "body_ratio": float(body_ratio),
             "liq_cnt": int(liq_cnt),
+            "tp_pct": float(tp_pct),
+            "sl_pct": float(sl_pct),
+            "rr": float(tp_pct / max(1e-9, sl_pct)),
         }
 
 # =========================
@@ -432,6 +453,7 @@ def format_signal(sig: Dict[str, Any]) -> str:
     entry = sig["entry"]; tp = sig["tp"]; sl = sig["sl"]
     prob = sig["prob"]; liq_cnt = sig.get("liq_cnt", 0)
     body_ratio = sig.get("body_ratio", 0.0)
+    rr = sig.get("rr", 0.0)
 
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
     lines = [
@@ -439,7 +461,7 @@ def format_signal(sig: Dict[str, Any]) -> str:
         f"Направление: <b>{'LONG' if side=='LONG' else 'SHORT'}</b>",
         f"Текущая цена: <b>{entry:g}</b>",
         f"Тейк: <b>{tp:g}</b> ({pct(tp_pct)})",
-        f"Стоп: <b>{sl:g}</b>",
+        f"Стоп: <b>{sl:g}</b>  •  RR ≈ <b>1:{rr:.2f}</b>",
         f"Вероятность: <b>{pct(prob)}</b>",
         f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -524,6 +546,8 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
         # список событий ликвидаций (опциональный топик)
         arr = data.get("data") or []
         for liq in arr:
+            if not isinstance(liq, dict):
+                continue  # фикс: бывают строки и др. типы (см. Render Logs)
             sym = (liq.get("s") or liq.get("symbol"))
             ts = int(liq.get("T") or data.get("ts") or now_ts_ms())
             if sym:
@@ -532,6 +556,17 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
 # =========================
 # Жизненный цикл web-приложения
 # =========================
+class BybitRest:
+    def __init__(self, base: str, session: aiohttp.ClientSession) -> None:
+        self.base = base.rstrip("/")
+        self.http = session
+    async def tickers_linear(self) -> List[Dict[str, Any]]:
+        url = f"{self.base}/v5/market/tickers?category=linear"
+        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            r.raise_for_status()
+            data = await r.json()
+        return data.get("result", {}).get("list", []) or []
+
 async def on_startup(app: web.Application) -> None:
     cfg: Config = app["cfg"]
     setup_logging(cfg.log_level)
@@ -638,7 +673,7 @@ def main() -> None:
     logger.info(
         "cfg: "
         f"public_url={cfg.public_url} | ws={cfg.bybit_ws_public_linear} | "
-        f"active={cfg.active_symbols} | tp_min={cfg.tp_min_pct:.2%} | prob_min={cfg.prob_min:.0%}"
+        f"active={cfg.active_symbols} | tp_min={cfg.tp_min_pct:.2%} | tp_max={cfg.tp_max_pct:.2%} | prob_min={cfg.prob_min:.0%}"
     )
     app = make_app(cfg)
     web.run_app(app, host="0.0.0.0", port=cfg.port)
