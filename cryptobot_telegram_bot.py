@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-CryptoBot — Telegram сканер сигналов (Bybit V5, WebSocket, ~5s реакция)
+Cryptobot — Telegram сигналы с Bybit V5 WebSocket (реакция ~ секунды)
 
-Что нового в этой версии:
-- Переход на Bybit WebSocket V5 (public/linear) вместо REST-поллинга — задержка ≈100–500мс
-- Подписка на: tickers.{symbol}, kline.1.{symbol}, allLiquidation.{symbol}
-- Безопасный и быстрый движок сигналов на событиях (без cron/джобов)
-- Надёжный авто‑reconnect и ping каждые 20s (рекомендация Bybit)
-- Минимизация Render окружения: большинство параметров заданы в коде с возможностью override через ENV
-- REST теперь используется только один раз на старте — чтобы выбрать топ‑символы по обороту
+Главные отличия:
+- Только один REST-вызов на старте (список тикеров) — дальше чистый WebSocket.
+- Подписки: tickers.{SYMBOL}, kline.1.{SYMBOL}, liquidation.{SYMBOL} (опц.).
+- Надёжный reconnect + ping; журнал «жив» (watchdog) каждые 60 сек.
+- Минимум ENV: достаточно TELEGRAM_TOKEN. Остальное уже задано в коде.
 
-ПРИМЕЧАНИЕ
-- В качестве источника символов используется REST /v5/market/tickers?category=linear ровно один раз на старте
-  для выбора топ N активов по turnover24h. Дальше — только WebSocket.
-- Ликвидации берём из ws‑топика allLiquidation.{symbol} (старый REST /v5/market/liquidation отсутствует/меняется).
+Заметка:
+- Если Render даёт ощущение «тишины», теперь лог watchdog появляется раз в минуту.
+- Ликвидации по REST полностью удалены (раньше давали 404 и забивали логи).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,40 +23,43 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
 
 # =========================
-# Константы/дефолты (можно переопределить ENV)
+# Константы/дефолты
 # =========================
 DEFAULT_BYBIT_REST = "https://api.bybit.com"
 DEFAULT_BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 DEFAULT_LOG_LEVEL = "INFO"
 
-# Логика сигналов/фильтры (дефолты можно ослабить под себя)
-DEFAULT_ACTIVE_SYMBOLS = 30               # сколько топ‑символов подписывать
-DEFAULT_PROB_MIN = 0.65                   # минимальная условная "вероятность"
-DEFAULT_TP_MIN_PCT = 0.010                # минимум тейк‑профита (1%)
-DEFAULT_ATR_PERIOD = 14                   # по 1m kline
-DEFAULT_BODY_ATR_MULT = 0.6               # "сила" свечи (реальное тело/ATR)
-DEFAULT_VOL_SMA_PERIOD = 20               # скользящее по объёму (клайны)
-DEFAULT_VOL_MULT = 2.0                    # во сколько раз объём больше среднего
-DEFAULT_SIGNAL_COOLDOWN_SEC = 60          # антиспам по одному направлению
-DEFAULT_HEARTBEAT_SEC = 15 * 60           # сообщение в канал "я жив"
-DEFAULT_KEEPALIVE_SEC = 13 * 60           # self‑ping хостинга
-DEFAULT_FIRST_DELAY_SEC = 3               # быстрый старт
+# Выбор и фильтры
+DEFAULT_ACTIVE_SYMBOLS = 30            # сколько топ-символов подписывать
+DEFAULT_PROB_MIN = 0.65                # минимальная «вероятность» для отправки
+DEFAULT_TP_MIN_PCT = 0.010             # минимальный тейк-профит (1%)
+DEFAULT_ATR_PERIOD = 14                # ATR по минутным свечам
+DEFAULT_BODY_ATR_MULT = 0.6            # сила тела свечи относительно ATR
+DEFAULT_VOL_SMA_PERIOD = 20            # среднее по объёму (свечам)
+DEFAULT_VOL_MULT = 2.0                 # «объём x2 от среднего» как триггер
+DEFAULT_SIGNAL_COOLDOWN_SEC = 60       # антиспам на одно направление
+
+# Телеметрия / веб
+DEFAULT_HEARTBEAT_SEC = 15 * 60        # телеграм «я жив»
+DEFAULT_KEEPALIVE_SEC = 13 * 60        # пинг публичного URL
+DEFAULT_WATCHDOG_SEC = 60              # строка «жив» в лог раз в 60с
+DEFAULT_FIRST_DELAY_SEC = 3            # быстрый старт
 DEFAULT_PORT = 10000
 
-# Роутинг (заданы дефолты, при желании можно переопределить через ENV)
-DEFAULT_PRIMARY_RECIPIENTS = [-1002870952333]   # id канала(ов) с сигналами
+# Роутинг по умолчанию (можно переопределить через ENV)
+DEFAULT_PRIMARY_RECIPIENTS = [-1002870952333]   # твой канал
 DEFAULT_ALLOWED_CHAT_IDS = [533232884, -1002870952333]
-DEFAULT_ONLY_CHANNEL = True  # если True — слать только в каналы из PRIMARY_RECIPIENTS
+DEFAULT_ONLY_CHANNEL = True
 
 # =========================
-# Утилиты
+# Вспомогательные
 # =========================
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
@@ -96,7 +97,7 @@ def now_ts_ms() -> int:
 # =========================
 @dataclass
 class Config:
-    # Telegram/infra
+    # Telegram / инфраструктура
     token: str
     log_level: str = DEFAULT_LOG_LEVEL
     public_url: Optional[str] = None
@@ -105,6 +106,7 @@ class Config:
     # Таймеры
     keepalive_sec: int = DEFAULT_KEEPALIVE_SEC
     heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC
+    watchdog_sec: int = DEFAULT_WATCHDOG_SEC
     first_delay_sec: int = DEFAULT_FIRST_DELAY_SEC
 
     # Роутинг
@@ -139,7 +141,8 @@ class Config:
             ids: List[int] = []
             for s in raw.replace(";", ",").split(","):
                 s = s.strip()
-                if not s: continue
+                if not s:
+                    continue
                 with contextlib.suppress(Exception):
                     ids.append(int(s))
             return ids or list(default_ids)
@@ -151,6 +154,7 @@ class Config:
             port=_env_int("PORT", DEFAULT_PORT),
             keepalive_sec=_env_int("KEEPALIVE_SEC", DEFAULT_KEEPALIVE_SEC),
             heartbeat_sec=_env_int("HEARTBEAT_SEC", DEFAULT_HEARTBEAT_SEC),
+            watchdog_sec=_env_int("WATCHDOG_SEC", DEFAULT_WATCHDOG_SEC),
             first_delay_sec=_env_int("FIRST_SCAN_DELAY_SEC", DEFAULT_FIRST_DELAY_SEC),
             primary_recipients=_ids("PRIMARY_RECIPIENTS", DEFAULT_PRIMARY_RECIPIENTS),
             allowed_chat_ids=_ids("ALLOWED_CHAT_IDS", DEFAULT_ALLOWED_CHAT_IDS),
@@ -219,7 +223,6 @@ class BybitWS:
         self.http = session
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._subs: List[str] = []
-        self._task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
         self.on_message: Optional[callable] = None  # async def on_message(msg: dict)
 
@@ -227,11 +230,9 @@ class BybitWS:
         if self.ws and not self.ws.closed:
             return
         logger.info(f"WS connecting: {self.url}")
-        self.ws = await self.http.ws_connect(self.url, heartbeat=25)  # aiohttp heartbeat -> ping/pong at transport level
-        # Дополнительно — собственный ping по рекомендации Bybit (каждые 20s)
+        self.ws = await self.http.ws_connect(self.url, heartbeat=25)  # ping/pong транспортного уровня
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.create_task(self._ping_loop())
-        # Подписываемся повторно после реконнекта
         if self._subs:
             await self.subscribe(self._subs)
 
@@ -241,12 +242,13 @@ class BybitWS:
                 await asyncio.sleep(20)
                 if not self.ws or self.ws.closed:
                     continue
+                # пользовательский ping Bybit
                 await self.ws.send_json({"op": "ping"})
             except Exception as e:
                 logger.warning(f"WS ping error: {e}")
 
     async def subscribe(self, args: List[str]) -> None:
-        # накапливаем список подписок для auto-resubscribe
+        # запоминаем для auto-resubscribe
         for a in args:
             if a not in self._subs:
                 self._subs.append(a)
@@ -266,8 +268,8 @@ class BybitWS:
                     data = json.loads(msg.data)
                 except Exception:
                     continue
-                if "success" in data and data.get("op") in {"subscribe", "ping"}:
-                    # ack
+                # игнорируем ACK/служебные
+                if data.get("op") in {"subscribe", "ping", "pong"} or "success" in data:
                     continue
                 if self.on_message:
                     try:
@@ -276,7 +278,7 @@ class BybitWS:
                         logger.exception(f"on_message error: {e}")
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 break
-        # try to reconnect
+        # reconnect
         await asyncio.sleep(2)
         with contextlib.suppress(Exception):
             await self.connect()
@@ -284,200 +286,168 @@ class BybitWS:
             await self.run()
 
 # =========================
-# Буферы рын.данных для сигналов
+# Состояние рынка
 # =========================
 class MarketState:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.tickers: Dict[str, Dict[str, Any]] = {}    # last ticker per symbol
-        self.oi_prev: Dict[str, float] = {}             # предыдущий openInterest
-        self.liq_events: Dict[str, List[int]] = {}      # timestamps(ms) последних ликвидаций
-        self.kline: Dict[str, List[Tuple[float,float,float,float,float]]] = {}  # [ (o,h,l,c,vol) ] max ~300
+        self.tickers: Dict[str, Dict[str, Any]] = {}
+        self.kline: Dict[str, List[Tuple[float, float, float, float, float]]] = {}  # [(o,h,l,c,vol)]
         self.kline_maxlen = 300
+        self.liq_events: Dict[str, List[int]] = {}   # timestamps ms
+        self.last_ws_msg_ts: int = now_ts_ms()
+
+        # антиспам: когда в последний раз слали по направлению
+        self.cooldown: Dict[Tuple[str, str], int] = {}  # (sym, side) -> ts
 
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
         if not sym:
             return
         self.tickers[sym] = d
+        self.last_ws_msg_ts = now_ts_ms()
+
+    def note_kline(self, sym: str, points: List[Dict[str, Any]]) -> None:
+        buf = self.kline.setdefault(sym, [])
+        for p in points:
+            o = float(p["open"]); h = float(p["high"]); l = float(p["low"]); c = float(p["close"])
+            v = float(p.get("volume") or p.get("turnover") or 0.0)
+            if not buf or c != buf[-1][3]:  # не дублировать
+                buf.append((o, h, l, c, v))
+                if len(buf) > self.kline_maxlen:
+                    buf.pop(0)
+        self.last_ws_msg_ts = now_ts_ms()
 
     def note_liq(self, sym: str, ts_ms: int) -> None:
         arr = self.liq_events.setdefault(sym, [])
         arr.append(ts_ms)
-        # чистим > 5 мин
+        # держим только 5 мин
         cutoff = now_ts_ms() - 5 * 60 * 1000
         while arr and arr[0] < cutoff:
             arr.pop(0)
-
-    def note_kline(self, sym: str, points: List[Dict[str, Any]]) -> None:
-        buf = self.kline.setdefault(sym, [])
-        # добавляем в порядке прихода
-        for p in points:
-            o = float(p["open"]); h = float(p["high"]); l = float(p["low"]); c = float(p["close"])
-            v = float(p.get("volume") or p.get("turnover") or 0.0)
-            # если confirm=false — обновляем последнюю свечу; если true — фиксируем новую
-            if p.get("confirm") is False and buf:
-                buf[-1] = (o,h,l,c,v)
-            else:
-                buf.append((o,h,l,c,v))
-                if len(buf) > self.kline_maxlen:
-                    del buf[0:len(buf)-self.kline_maxlen]
-
-    def last_close(self, sym: str) -> Optional[float]:
-        arr = self.kline.get(sym)
-        return arr[-1][3] if arr else None
-
-    def atr(self, sym: str, period: int) -> Optional[float]:
-        arr = self.kline.get(sym)
-        if not arr or len(arr) < period + 1:
-            return None
-        trs: List[float] = []
-        prev_c = arr[0][3]
-        for o,h,l,c,v in arr[1:period+1]:
-            tr = max(h-l, abs(h-prev_c), abs(l-prev_c))
-            trs.append(tr)
-            prev_c = c
-        return sum(trs)/len(trs) if trs else None
-
-    def vol_sma(self, sym: str, period: int) -> Optional[float]:
-        arr = self.kline.get(sym)
-        if not arr or len(arr) < period:
-            return None
-        vols = [x[4] for x in arr[-period:]]
-        return sum(vols)/len(vols) if vols else None
-
-    def liq_burst(self, sym: str, window_sec: int = 60) -> int:
-        arr = self.liq_events.get(sym, [])
-        if not arr:
-            return 0
-        cutoff = now_ts_ms() - window_sec * 1000
-        # количество событий за окно
-        n = 0
-        for t in reversed(arr):
-            if t < cutoff:
-                break
-            n += 1
-        return n
+        self.last_ws_msg_ts = now_ts_ms()
 
 # =========================
-# Генерация сигналов
+# Движок сигналов
 # =========================
 class SignalEngine:
     def __init__(self, cfg: Config, mkt: MarketState) -> None:
         self.cfg = cfg
         self.mkt = mkt
-        self.cooldown: Dict[Tuple[str,str], float] = {}  # (sym, side) -> last_ts
 
-    def _can_emit(self, sym: str, side: str) -> bool:
-        key = (sym, side)
-        t = time.time()
-        last = self.cooldown.get(key, 0.0)
-        if t - last < self.cfg.signal_cooldown_sec:
-            return False
-        self.cooldown[key] = t
-        return True
+    @staticmethod
+    def _atr(rows: List[Tuple[float, float, float, float, float]], period: int) -> float:
+        if len(rows) < period + 1:
+            return 0.0
+        trs: List[float] = []
+        for i in range(1, period + 1):
+            _, h, l, c, _ = rows[-i]
+            _, _, _, prev_c, _ = rows[-i - 1]
+            tr = max(h - l, abs(h - prev_c), abs(prev_c - l))
+            trs.append(tr)
+        return sum(trs) / period if trs else 0.0
 
-    def _probability(self, sym: str, side: str, atr_val: Optional[float], body_ratio: float, oi_delta: float, liq_cnt: int) -> float:
-        # Простая эвристика в диапазоне [0..1]
-        score = 0.0
-        score += max(0.0, min(1.0, body_ratio)) * 0.4
-        score += max(0.0, min(1.0, abs(oi_delta))) * 0.3
-        score += max(0.0, min(1.0, liq_cnt / 5.0)) * 0.3  # 5+ ликвидаций за 60с = насыщено
-        return max(0.0, min(1.0, score))
+    @staticmethod
+    def _sma(values: List[float], period: int) -> float:
+        if len(values) < period:
+            return 0.0
+        return sum(values[-period:]) / period
+
+    def _recent_liq_count(self, sym: str, window_sec: int = 60) -> int:
+        arr = self.mkt.liq_events.get(sym) or []
+        if not arr:
+            return 0
+        cutoff = now_ts_ms() - window_sec * 1000
+        return sum(1 for t in arr if t >= cutoff)
 
     def on_kline_closed(self, sym: str) -> Optional[Dict[str, Any]]:
-        # При закрытии 1m свечи оцениваем сигнал
-        k = self.mkt.kline.get(sym)
-        if not k or len(k) < max(self.cfg.atr_period, self.cfg.vol_sma_period) + 2:
+        rows = self.mkt.kline.get(sym) or []
+        if len(rows) < max(self.cfg.atr_period + 1, self.cfg.vol_sma_period):
             return None
 
-        close = k[-1][3]; prev_close = k[-2][3]
-        chg = (close - prev_close) / prev_close if prev_close else 0.0
-
-        atr_val = self.mkt.atr(sym, self.cfg.atr_period)
-        if not atr_val or atr_val <= 0:
+        o, h, l, c, v = rows[-1]
+        atr = self._atr(rows, self.cfg.atr_period) or 0.0
+        if atr <= 0.0:
             return None
 
-        real_body = abs(close - k[-1][0])  # |close - open|
-        body_ratio = min(2.0, real_body / atr_val)  # cap
+        body = abs(c - o)
+        body_ratio = body / atr
 
-        vol = k[-1][4]
-        vol_sma = self.mkt.vol_sma(sym, self.cfg.vol_sma_period) or 0.0
-        big_vol = vol > self.cfg.vol_mult * vol_sma if vol_sma > 0 else False
+        vols = [x[4] for x in rows]
+        v_sma = self._sma(vols, self.cfg.vol_sma_period)
+        vol_ok = (v_sma > 0.0) and (v > self.cfg.vol_mult * v_sma)
 
-        tkr = self.mkt.tickers.get(sym, {})
-        oi_raw = float(tkr.get("openInterest") or 0.0)
-        prev_oi = self.mkt.oi_prev.get(sym, oi_raw)
-        oi_delta = 0.0
-        if prev_oi > 0:
-            oi_delta = (oi_raw - prev_oi) / prev_oi
-        self.mkt.oi_prev[sym] = oi_raw
+        # простая логика направления: сильное тело + объём
+        side: Optional[str] = None
+        if body_ratio >= self.cfg.body_atr_mult and vol_ok:
+            side = "LONG" if c > o else "SHORT"
 
-        liq_cnt = self.mkt.liq_burst(sym, window_sec=60)
-
-        # Условия входа:
-        # 1) сильная свеча относительно ATR, 2) объём выше среднего, 3) OI меняется, 4) optionally ликвидации
-        if body_ratio < self.cfg.body_atr_mult:
-            return None
-        if not big_vol:
+        if not side:
             return None
 
-        side = "LONG" if chg > 0 else "SHORT"
-        if not self._can_emit(sym, side):
-            return None
-
-        # Цели/стоп (минимум по tp_min_pct)
-        entry = close
-        tp_pct = max(self.cfg.tp_min_pct, min(0.03, 0.5 * abs(chg) + 0.5 * (atr_val / entry)))  # 1%..3%
-        sl_pct = tp_pct * 0.6
-
+        # базовый таргет/стоп от ATR
+        entry = c
         if side == "LONG":
-            tp = entry * (1.0 + tp_pct)
-            sl = entry * (1.0 - sl_pct)
+            tp = entry * (1.0 + max(self.cfg.tp_min_pct, 0.5 * atr / max(1e-9, entry)))
+            sl = entry - 1.5 * atr
         else:
-            tp = entry * (1.0 - tp_pct)
-            sl = entry * (1.0 + sl_pct)
+            tp = entry * (1.0 - max(self.cfg.tp_min_pct, 0.5 * atr / max(1e-9, entry)))
+            sl = entry + 1.5 * atr
 
-        prob = self._probability(sym, side, atr_val, body_ratio, oi_delta, liq_cnt)
+        # «вероятность» — эвристика: тело, объём, и (опц.) всплеск ликвидаций
+        prob = 0.5
+        prob += min(0.3, (body_ratio - self.cfg.body_atr_mult) * 0.2) if body_ratio > self.cfg.body_atr_mult else 0
+        if vol_ok:
+            prob += 0.15
+        liq_cnt = self._recent_liq_count(sym, 60)
+        if liq_cnt >= 3:
+            prob += 0.05
+
+        # антиспам по направлению
+        key = (sym, side)
+        last_ts = self.mkt.cooldown.get(key, 0)
+        if now_ts_ms() - last_ts < self.cfg.signal_cooldown_sec * 1000:
+            return None
+
         if prob < self.cfg.prob_min:
             return None
 
+        self.mkt.cooldown[key] = now_ts_ms()
         return {
             "symbol": sym,
             "side": side,
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "prob": prob,
-            "atr": atr_val,
-            "body_ratio": body_ratio,
-            "oi_delta": oi_delta,
-            "liq_cnt": liq_cnt,
+            "entry": float(entry),
+            "tp": float(tp),
+            "sl": float(sl),
+            "prob": float(prob),
+            "body_ratio": float(body_ratio),
+            "liq_cnt": int(liq_cnt),
         }
 
 # =========================
-# Форматирование сообщения
+# Формат сообщения
 # =========================
 def format_signal(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]; side = sig["side"]
     entry = sig["entry"]; tp = sig["tp"]; sl = sig["sl"]
     prob = sig["prob"]; liq_cnt = sig.get("liq_cnt", 0)
-    body_ratio = sig.get("body_ratio", 0.0); oi_delta = sig.get("oi_delta", 0.0)
+    body_ratio = sig.get("body_ratio", 0.0)
 
+    tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
     lines = [
         f"⚡️ <b>Сигнал по {sym}</b>",
         f"Направление: <b>{'LONG' if side=='LONG' else 'SHORT'}</b>",
         f"Текущая цена: <b>{entry:g}</b>",
-        f"Тейк: <b>{tp:g}</b> ({pct((tp-entry)/entry if side=='LONG' else (entry-tp)/entry)})",
+        f"Тейк: <b>{tp:g}</b> ({pct(tp_pct)})",
         f"Стоп: <b>{sl:g}</b>",
-        f"Вероятность: <b>{prob:.0%}</b>",
-        f"Обоснование: тело/ATR={body_ratio:.2f}; ΔOI={oi_delta:+.2%}; ликвидаций(60с)={liq_cnt}",
+        f"Вероятность: <b>{pct(prob)}</b>",
+        f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     return "\n".join(lines)
 
 # =========================
-# Приложение
+# Приложение: фоновые циклы
 # =========================
 async def keepalive_loop(app: web.Application) -> None:
     cfg: Config = app["cfg"]
@@ -500,7 +470,7 @@ async def heartbeat_loop(app: web.Application) -> None:
     while True:
         try:
             await asyncio.sleep(cfg.heartbeat_sec)
-            text = f"✅ Cryptobot активен • подписки WS • символов: {len(app['symbols'])}"
+            text = f"✅ Cryptobot активен • WS подписки • символов: {len(app.get('symbols', []))}"
             for chat_id in cfg.primary_recipients:
                 await tg.send(chat_id, text)
         except asyncio.CancelledError:
@@ -508,7 +478,20 @@ async def heartbeat_loop(app: web.Application) -> None:
         except Exception as e:
             logger.warning(f"heartbeat error: {e}")
 
-# Основной обработчик ws‑сообщений
+async def watchdog_loop(app: web.Application) -> None:
+    cfg: Config = app["cfg"]
+    mkt: MarketState = app["mkt"]
+    while True:
+        try:
+            await asyncio.sleep(cfg.watchdog_sec)
+            ago = (now_ts_ms() - mkt.last_ws_msg_ts) / 1000.0
+            logger.info(f"[watchdog] alive; last WS msg {ago:.1f}s ago; symbols={len(app.get('symbols', []))}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"watchdog error: {e}")
+
+# Основной обработчик WS-сообщений
 async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     mkt: MarketState = app["mkt"]
     eng: SignalEngine = app["engine"]
@@ -523,23 +506,22 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
 
     elif topic.startswith("kline.1."):
         payload = data.get("data") or []
-        # data — список, confirm=false/true
         if payload:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             mkt.note_kline(sym, payload)
-            # если свеча закрыта — оцениваем
+            # оцениваем сигналы на закрытии свечи
             if any(x.get("confirm") for x in payload):
                 sig = eng.on_kline_closed(sym)
                 if sig:
                     text = format_signal(sig)
-                    # роутинг
-                    chats = cfg.primary_recipients if cfg.only_channel else cfg.allowed_chat_ids or cfg.primary_recipients
+                    chats = cfg.primary_recipients if cfg.only_channel else (cfg.allowed_chat_ids or cfg.primary_recipients)
                     for chat_id in chats:
                         with contextlib.suppress(Exception):
                             await tg.send(chat_id, text)
                             logger.info(f"signal sent: {sym} {sig['side']}")
-    elif topic.startswith("allLiquidation."):
-        # Содержит список событий ликвидаций
+
+    elif topic.startswith("liquidation."):
+        # список событий ликвидаций (опциональный топик)
         arr = data.get("data") or []
         for liq in arr:
             sym = (liq.get("s") or liq.get("symbol"))
@@ -547,19 +529,21 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             if sym:
                 mkt.note_liq(sym, ts)
 
+# =========================
+# Жизненный цикл web-приложения
+# =========================
 async def on_startup(app: web.Application) -> None:
     cfg: Config = app["cfg"]
     setup_logging(cfg.log_level)
-    logger.info("startup...")
+    logger.info("startup.")
 
     http = aiohttp.ClientSession()
     app["http"] = http
     app["tg"] = Tg(cfg.token, http)
     rest = BybitRest(cfg.bybit_rest, http)
 
-    # Выбираем топ‑символы по обороту (24h)
+    # Выбор топ-символов по обороту (24h)
     tickers = await rest.tickers_linear()
-    # отфильтровываем только USDT perpetual (на всякий случай)
     cands: List[Tuple[str, float]] = []
     for t in tickers:
         sym = t.get("symbol")
@@ -572,38 +556,42 @@ async def on_startup(app: web.Application) -> None:
     cands.sort(key=lambda x: x[1], reverse=True)
     symbols = [s for s, _ in cands[: cfg.active_symbols]]
     if not symbols:
-        # fallback на набор по умолчанию
+        # запасной набор
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "TONUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT"][: cfg.active_symbols]
     app["symbols"] = symbols
     logger.info(f"symbols: {symbols}")
 
-    # Маркет‑состояние и движок
+    # Состояние и движок
     mkt = MarketState(cfg); app["mkt"] = mkt
     engine = SignalEngine(cfg, mkt); app["engine"] = engine
 
     # WebSocket
     ws = BybitWS(cfg.bybit_ws_public_linear, http)
     app["ws"] = ws
+
     async def _on_msg(msg: Dict[str, Any]) -> None:
         await ws_on_message(app, msg)
+
     ws.on_message = _on_msg
     await ws.connect()
 
     # Подписки
-    args = []
+    args: List[str] = []
     for s in symbols:
         args.append(f"tickers.{s}")
         args.append(f"kline.1.{s}")
-        args.append(f"allLiquidation.{s}")
+        # опционально: подключим ликвидации (не критично для работы)
+        args.append(f"liquidation.{s}")
     await ws.subscribe(args)
 
-    # Запускаем чтение сокета и служебные циклы
+    # Запускаем чтение сокета и фоновые циклы
     app["ws_task"] = asyncio.create_task(ws.run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["hb_task"] = asyncio.create_task(heartbeat_loop(app))
+    app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
 
 async def on_cleanup(app: web.Application) -> None:
-    for key in ("ws_task", "keepalive_task", "hb_task"):
+    for key in ("ws_task", "keepalive_task", "hb_task", "watchdog_task"):
         task = app.get(key)
         if task:
             task.cancel()
@@ -617,13 +605,22 @@ async def on_cleanup(app: web.Application) -> None:
         await http.close()
 
 # =========================
-# HTTP сервер (healthz)
+# HTTP (healthz)
 # =========================
 async def handle_health(request: web.Request) -> web.Response:
     app = request.app
     t0 = app.get("start_ts") or time.monotonic()
     uptime = time.monotonic() - t0
-    return web.json_response({"ok": True, "uptime_sec": int(uptime), "symbols": app.get("symbols", [])})
+    mkt: MarketState = app.get("mkt")  # может быть ещё не создан
+    last_msg_age = None
+    if mkt:
+        last_msg_age = int((now_ts_ms() - mkt.last_ws_msg_ts) / 1000)
+    return web.json_response({
+        "ok": True,
+        "uptime_sec": int(uptime),
+        "symbols": app.get("symbols", []),
+        "last_ws_msg_age_sec": last_msg_age,
+    })
 
 def make_app(cfg: Config) -> web.Application:
     app = web.Application()
