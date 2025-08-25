@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Cryptobot — Telegram сигналы (Bybit V5 WebSocket, SMC-lite) + командный интерфейс
+Cryptobot — Telegram сигналы (Bybit V5 WebSocket) + SMC-lite
+Режим INTRADAY_SCALP для коротких сделок (горизонт ~1–2 часа)
 
-Что добавлено в этой версии:
-- Обработчик Telegram-команд через long-polling (getUpdates) без вебхука.
-- Команды: /ping, /status, /diag, /jobs, /universe, /help
-- Ответы приходят только от чатов из ALLOWED_CHAT_IDS (и каналов из PRIMARY_RECIPIENTS).
+Что нового:
+- INTRADAY_SCALP: короче цели (0.4–3%), мягче фильтры, TP ограничен «таймбоксом» (ожидаемым движением за N минут от 1m-ATR).
+- Сигнал допускается при >=1 SMC-факте (BOS или свип; FVG — опционально).
+- RR порог 1:1.2, антиспам 20с. В сообщении указывается «Горизонт: ~до N мин».
 
-Остальное:
-- WebSocket V5 (public/linear): tickers, kline.1, kline.5, liquidation (опц.)
-- Быстрый движок сигналов на закрытии 1m, SMC-lite (BOS/CHOCH, свип, FVG, простой OB)
-- TP/SL: структурные цели + ATR-клапаны; RR ≥ 1:1.5
-- Нужен только TELEGRAM_TOKEN; все прочие параметры — в коде ниже.
+Остальное (WS, команды, структура SMC) — как было.
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,41 +27,61 @@ import aiohttp
 from aiohttp import web
 
 # =========================
-# Жёстко заданные параметры (меняются прямо здесь)
+# Жёстко заданные параметры
 # =========================
 BYBIT_REST = "https://api.bybit.com"
 BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 LOG_LEVEL = "INFO"
 
-# Символы и фильтры
-ACTIVE_SYMBOLS = 30                # подписываем топ N USDT-перпетуалов
-PROB_MIN = 0.58                    # минимум «вероятности» (эвристика)
-TP_MIN_PCT = 0.010                 # TP нижний зажим (1%)
-TP_MAX_PCT = 0.060                 # TP верхний зажим (6%)
-ATR_PERIOD_1M = 14                 # ATR по 1m
-BODY_ATR_MULT = 0.55                # порог «сильной» свечи: тело/ATR
-VOL_SMA_PERIOD = 20                # SMA по объёму (1m)
-VOL_MULT = 1.5                     # всплеск объёма >= 2x SMA
-SIGNAL_COOLDOWN_SEC = 30           # антиспам по направлению
+# --- РЕЖИМ КОРОТКИХ СДЕЛОК ---
+INTRADAY_SCALP = True           # включён скальп-мод для горизонта ~1–2 часа
+TIMEBOX_MINUTES = 120           # целимся закрывать идею в пределах N минут
+TIMEBOX_FACTOR = 0.35           # доля от суммарной 1m-ATR за N минут (эмпирика для «направленного» хода)
 
-# SMC-параметры
-SWING_FRAC = 2                     # фрактал для свингов (2 — классика)
-USE_FVG = True                     # требовать FVG (3-свечная «чистая» зона)
-USE_SWEEP = True                   # искать свип ликвидности перед входом
-RR_TARGET = 1.4                    # минимальный RR для допуска сигнала
-USE_5M_FILTER = True               # фильтр по 5m структуре (не торгуем против явного тренда 5м)
-ALIGN_5M_STRICT = False            # если True — требовать BOS на 5m в сторону сделки
+# Символы и фильтры
+ACTIVE_SYMBOLS = 30
+# Базовые (будут «переписаны» скальп-настройками ниже, если INTRADAY_SCALP=True)
+PROB_MIN = 0.58
+TP_MIN_PCT = 0.010
+TP_MAX_PCT = 0.060
+ATR_PERIOD_1M = 14
+BODY_ATR_MULT = 0.55
+VOL_SMA_PERIOD = 20
+VOL_MULT = 1.5
+SIGNAL_COOLDOWN_SEC = 30
+
+# SMC
+SWING_FRAC = 2
+USE_FVG = True          # в скальпе FVG становится «опциональным» (см. ниже)
+USE_SWEEP = True
+RR_TARGET = 1.4
+USE_5M_FILTER = True
+ALIGN_5M_STRICT = False
+BOS_FRESH_BARS = 5       # BOS должен быть свежим (последние N свечей), чтобы сетап был «тактическим»
 
 # Телеметрия / веб
-HEARTBEAT_SEC = 60 * 60            # ⬅️ телеграм «я жив» теперь раз в 60 минут
-KEEPALIVE_SEC = 13 * 60            # пинг публичного URL
-WATCHDOG_SEC = 60                  # строка «жив» в лог раз в 60s
-PORT = 10000                       # web порт
+HEARTBEAT_SEC = 60 * 60
+KEEPALIVE_SEC = 13 * 60
+WATCHDOG_SEC = 60
+PORT = 10000
 
-# Роутинг по умолчанию (куда слать сигналы; кто может писать боту)
-PRIMARY_RECIPIENTS = [-1002870952333]     # канал(ы) для сигналов
-ALLOWED_CHAT_IDS = [533232884, -1002870952333]  # кто может использовать команды
-ONLY_CHANNEL = True                        # если True — сигналы только в PRIMARY_RECIPIENTS
+# Роутинг / доступ
+PRIMARY_RECIPIENTS = [-1002870952333]
+ALLOWED_CHAT_IDS = [533232884, -1002870952333]
+ONLY_CHANNEL = True
+
+# -------------------------
+# Скальп-настройки (переписывают базовые)
+# -------------------------
+if INTRADAY_SCALP:
+    PROB_MIN = 0.55           # мягче, чтобы сетапов было больше
+    TP_MIN_PCT = 0.004        # 0.4%
+    TP_MAX_PCT = 0.030        # 3.0% — «потолок» для короткой идеи
+    BODY_ATR_MULT = 0.50
+    VOL_MULT = 1.3
+    RR_TARGET = 1.2
+    SIGNAL_COOLDOWN_SEC = 20
+    # 5m фильтр оставляем нестрогим: блокируем только явные противотрендовые входы без BOS на 5m
 
 # =========================
 # Утилиты
@@ -83,7 +99,7 @@ def setup_logging(level: str) -> None:
 logger = logging.getLogger("cryptobot")
 
 # =========================
-# Telegram
+# Telegram API
 # =========================
 class Tg:
     def __init__(self, token: str, session: aiohttp.ClientSession) -> None:
@@ -186,7 +202,7 @@ class BybitWS:
             await self.run()
 
 # =========================
-# Рыночное состояние (1m и 5m)
+# Рыночное состояние
 # =========================
 class MarketState:
     def __init__(self) -> None:
@@ -196,7 +212,7 @@ class MarketState:
         self.kline_maxlen = 600
         self.liq_events: Dict[str, List[int]] = {}
         self.last_ws_msg_ts: int = now_ts_ms()
-        self.cooldown: Dict[Tuple[str,str], int] = {}  # (sym, side) -> ts
+        self.cooldown: Dict[Tuple[str,str], int] = {}
 
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
@@ -227,7 +243,7 @@ class MarketState:
         self.last_ws_msg_ts = now_ts_ms()
 
 # =========================
-# SMC-утилиты
+# Индикативные функции (ATR/SMA/SMC)
 # =========================
 def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
     if len(rows) < period + 1:
@@ -259,33 +275,46 @@ def find_swings(rows: List[Tuple[float,float,float,float,float]], frac: int = SW
             sl.append(i)
     return sh, sl
 
-def last_swing_price(rows, idxs, kind: str) -> Optional[float]:
+def last_swing_price(rows: List[Tuple[float,float,float,float,float]], idxs: List[int], kind: str) -> Optional[float]:
     if not idxs:
         return None
     i = idxs[-1]
     return rows[i][1] if kind == "H" else rows[i][2]
 
-def bos_choch(rows, sh, sl) -> Tuple[str, bool, bool]:
+def bos_choch(rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int]) -> Tuple[str, bool, bool, Optional[int], Optional[int]]:
+    """
+    Возвращает: (trend, bos_up, bos_down, idx_bos_up, idx_bos_down)
+    BOS считается, если закрытие превысило/пробило последний swing H/L.
+    """
     if len(rows) < 3 or (not sh and not sl):
-        return "RANGE", False, False
+        return "RANGE", False, False, None, None
     c = rows[-1][3]
     bos_up = False; bos_dn = False
-    last_h = last_swing_price(rows, sh, "H")
-    last_l = last_swing_price(rows, sl, "L")
-    if last_h is not None and c > last_h: bos_up = True
-    if last_l is not None and c < last_l: bos_dn = True
-    if bos_up and not bos_dn: trend = "UP"
-    elif bos_dn and not bos_up: trend = "DOWN"
-    else: trend = "UP" if rows[-1][3] > rows[-3][3] else ("DOWN" if rows[-1][3] < rows[-3][3] else "RANGE")
-    return trend, bos_up, bos_dn
+    bos_up_idx = None; bos_dn_idx = None
+    # последние swing H/L
+    if sh:
+        last_h_idx = sh[-1]; last_h = rows[last_h_idx][1]
+        if c > last_h:
+            bos_up = True; bos_up_idx = len(rows)-1
+    if sl:
+        last_l_idx = sl[-1]; last_l = rows[last_l_idx][2]
+        if c < last_l:
+            bos_dn = True; bos_dn_idx = len(rows)-1
+    if bos_up and not bos_dn:
+        trend = "UP"
+    elif bos_dn and not bos_up:
+        trend = "DOWN"
+    else:
+        trend = "UP" if rows[-1][3] > rows[-3][3] else ("DOWN" if rows[-1][3] < rows[-3][3] else "RANGE")
+    return trend, bos_up, bos_dn, bos_up_idx, bos_dn_idx
 
-def has_fvg(rows, bullish: bool) -> bool:
+def has_fvg(rows: List[Tuple[float,float,float,float,float]], bullish: bool) -> bool:
     if len(rows) < 3: return False
     h2 = rows[-3][1]; l2 = rows[-3][2]
     h0 = rows[-1][1]; l0 = rows[-1][2]
     return (l0 > h2) if bullish else (h0 < l2)
 
-def swept_liquidity(rows, sh, sl, side: str) -> bool:
+def swept_liquidity(rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int], side: str) -> bool:
     if side == "LONG":
         if not sl: return False
         key = rows[sl[-1]][2]
@@ -297,7 +326,7 @@ def swept_liquidity(rows, sh, sl, side: str) -> bool:
         high = rows[-1][1]; close = rows[-1][3]
         return (high > key) and (close < key)
 
-def simple_ob(rows, side: str, body_atr_thr: float, atr_val: float) -> Optional[Tuple[float,float]]:
+def simple_ob(rows: List[Tuple[float,float,float,float,float]], side: str, body_atr_thr: float, atr_val: float) -> Optional[Tuple[float,float]]:
     if len(rows) < 3 or atr_val <= 0: return None
     o,h,l,c,_ = rows[-1]
     body = abs(c - o)
@@ -324,7 +353,7 @@ class Engine:
         p += min(0.1, 0.03 * max(0, confluence-1))
         return max(0.0, min(0.99, p))
 
-    def _nearest_opposite_swing_tp(self, rows, sh, sl, side: str, entry: float) -> Optional[float]:
+    def _nearest_opposite_swing_tp(self, rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int], side: str, entry: float) -> Optional[float]:
         if side == "LONG":
             for i in reversed(sh):
                 ph = rows[i][1]
@@ -358,63 +387,98 @@ class Engine:
         if body_ratio < BODY_ATR_MULT or not vol_ok:
             return None
 
+        # --- SMC на 1m ---
         SH1, SL1 = find_swings(rows1, SWING_FRAC)
-        trend1, bos_up, bos_dn = bos_choch(rows1, SH1, SL1)
+        trend1, bos_up, bos_dn, bos_up_idx, bos_dn_idx = bos_choch(rows1, SH1, SL1)
 
-        confluence = 0
+        smc_hits = 0
         side: Optional[str] = None
         if c > o:
             side = "LONG"
-            if bos_up: confluence += 1
-            if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "LONG"): confluence += 1
-            if USE_FVG and has_fvg(rows1, bullish=True): confluence += 1
+            if bos_up and (bos_up_idx is None or bos_up_idx >= len(rows1) - BOS_FRESH_BARS): smc_hits += 1
+            if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "LONG"): smc_hits += 1
+            if USE_FVG and has_fvg(rows1, bullish=True): smc_hits += 1
         else:
             side = "SHORT"
-            if bos_dn: confluence += 1
-            if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): confluence += 1
-            if USE_FVG and has_fvg(rows1, bullish=False): confluence += 1
+            if bos_dn and (bos_dn_idx is None or bos_dn_idx >= len(rows1) - BOS_FRESH_BARS): smc_hits += 1
+            if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): smc_hits += 1
+            if USE_FVG and has_fvg(rows1, bullish=False): smc_hits += 1
 
+        # Для скальпа требуем хотя бы 1 подтверждение структуры (BOS или свип; FVG — в помощь)
+        if smc_hits == 0:
+            return None
+
+        # OB-зона (для SL подсказки)
         ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
 
+        # --- Фильтр 5m (нестрогий) ---
         if USE_5M_FILTER:
             rows5 = self.mkt.kline["5"].get(sym) or []
             if len(rows5) >= ATR_PERIOD_1M + 3:
                 SH5, SL5 = find_swings(rows5, SWING_FRAC)
-                trend5, bos5_up, bos5_dn = bos_choch(rows5, SH5, SL5)
+                trend5, bos5_up, bos5_dn, _, _ = bos_choch(rows5, SH5, SL5)
                 if side == "LONG":
-                    if ALIGN_5M_STRICT and not bos5_up: return None
-                    if trend5 == "DOWN" and not bos5_up: return None
+                    # Блокируем явный 5m DOWN без свежего BOS вверх
+                    if trend5 == "DOWN" and not bos5_up:
+                        return None
                 else:
-                    if ALIGN_5M_STRICT and not bos5_dn: return None
-                    if trend5 == "UP" and not bos5_dn: return None
+                    if trend5 == "UP" and not bos5_dn:
+                        return None
 
+        # --- Вероятность ---
         liq_cnt = sum(1 for t in self.mkt.liq_events.get(sym, []) if t >= now_ts_ms() - 60_000)
-        prob = self._probability(body_ratio, vol_ok, liq_cnt, confluence)
-        if prob < PROB_MIN: return None
+        prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits)
+        if prob < PROB_MIN:
+            return None
 
         entry = c
+
+        # --- Целеполагание: структурная цель + «таймбокс» ---
         tp_struct = self._nearest_opposite_swing_tp(rows1, SH1, SL1, side, entry)
         tp_pct_struct = abs(tp_struct - entry) / entry if tp_struct else 0.0
+
+        # Минимальный «атровый» TP (бэкап)
         tp_pct_atr = max(TP_MIN_PCT, 0.6 * atr1 / max(1e-9, entry))
-        tp_pct = max(tp_pct_struct, tp_pct_atr)
+
+        # «Временной» TP: сколько движения разумно ждать за TIMEBOX_MINUTES при текущей ATR
+        atr_pct_1m = atr1 / max(1e-9, entry)
+        tp_pct_timebox = atr_pct_1m * TIMEBOX_MINUTES * TIMEBOX_FACTOR  # направленный ход как доля от сумм TR
+
+        # Итоговый TP%: берём МИНИМУМ из (структурной дистанции, таймбокс-лимита), но не ниже «атрового» минимума
+        tp_pct = max(tp_pct_atr, min(tp_pct_struct if tp_pct_struct > 0 else TP_MAX_PCT, tp_pct_timebox))
         tp_pct = max(TP_MIN_PCT, min(TP_MAX_PCT, tp_pct))
 
+        # --- SL: по структуре (с поправкой на ATR) ---
         if side == "LONG":
-            sl_struct = (rows1[SL1[-1]][2] - 0.1 * atr1) if (USE_SWEEP and SL1) else ((ob[0] - 0.05 * atr1) if ob else (l - 0.2 * atr1))
-            sl = sl_struct
+            if USE_SWEEP and SL1:
+                sl = rows1[SL1[-1]][2] - 0.1 * atr1
+            elif ob:
+                sl = ob[0] - 0.05 * atr1
+            else:
+                sl = l - 0.2 * atr1
             tp = entry * (1.0 + tp_pct)
         else:
-            sl_struct = (rows1[SH1[-1]][1] + 0.1 * atr1) if (USE_SWEEP and SH1) else ((ob[1] + 0.05 * atr1) if ob else (h + 0.2 * atr1))
-            sl = sl_struct
+            if USE_SWEEP and SH1:
+                sl = rows1[SH1[-1]][1] + 0.1 * atr1
+            elif ob:
+                sl = ob[1] + 0.05 * atr1
+            else:
+                sl = h + 0.2 * atr1
             tp = entry * (1.0 - tp_pct)
 
+        # --- RR контроль ---
         rr = self._validate_rr(entry, tp, sl, side)
         if rr < RR_TARGET:
-            tp = entry * (1.0 + (TP_MAX_PCT if side == "LONG" else -TP_MAX_PCT))
+            # Попробуем подтянуть TP в пределах потолка
+            if side == "LONG":
+                tp = entry * (1.0 + min(TP_MAX_PCT, tp_pct_timebox))
+            else:
+                tp = entry * (1.0 - min(TP_MAX_PCT, tp_pct_timebox))
             rr = self._validate_rr(entry, tp, sl, side)
             if rr < RR_TARGET:
                 return None
 
+        # антиспам
         key = (sym, side)
         last_ts = self.mkt.cooldown.get(key, 0)
         if now_ts_ms() - last_ts < SIGNAL_COOLDOWN_SEC * 1000:
@@ -424,11 +488,11 @@ class Engine:
         return {
             "symbol": sym, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl),
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
-            "liq_cnt": int(liq_cnt), "rr": float(rr), "confluence": int(confluence),
+            "liq_cnt": int(liq_cnt), "rr": float(rr), "confluence": int(smc_hits),
         }
 
 # =========================
-# Форматирование сообщения
+# Формат сообщения
 # =========================
 def format_signal(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]; side = sig["side"]
@@ -436,7 +500,8 @@ def format_signal(sig: Dict[str, Any]) -> str:
     prob = sig["prob"]; liq_cnt = sig.get("liq_cnt", 0)
     body_ratio = sig.get("body_ratio", 0.0); rr = sig.get("rr", 0.0); con = sig.get("confluence", 0)
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
-    return "\n".join([
+    horizon = TIMEBOX_MINUTES if INTRADAY_SCALP else 0
+    lines = [
         f"⚡️ <b>Сигнал по {sym}</b>",
         f"Направление: <b>{'LONG' if side=='LONG' else 'SHORT'}</b>",
         f"Текущая цена: <b>{entry:g}</b>",
@@ -445,10 +510,13 @@ def format_signal(sig: Dict[str, Any]) -> str:
         f"Вероятность: <b>{pct(prob)}</b>  •  SMC-конфлюэнс: <b>{con}</b>",
         f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
-    ])
+    ]
+    if INTRADAY_SCALP:
+        lines.insert(3, f"Горизонт идеи: ~до <b>{horizon} мин</b>")
+    return "\n".join(lines)
 
 # =========================
-# Командный интерфейс (Telegram)
+# Командный интерфейс
 # =========================
 async def tg_updates_loop(app: web.Application) -> None:
     tg: Tg = app["tg"]
@@ -467,12 +535,11 @@ async def tg_updates_loop(app: web.Application) -> None:
                 text = msg.get("text") or ""
                 if not isinstance(chat_id, int) or not text.startswith("/"):
                     continue
-                # допускаем команды только от разрешённых чатов
                 if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS:
                     continue
                 cmd = text.split()[0].lower()
                 if cmd == "/help":
-                    await tg.send(chat_id, "Доступные команды:\n/universe — список символов\n/ping — проверка связи\n/status — краткий статус\n/jobs — фоновые задачи\n/diag — диагностика движка\n/debug — alias для /diag")
+                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика\n/mode — режим анализа")
                 elif cmd == "/universe":
                     syms = app.get("symbols", [])
                     await tg.send(chat_id, "Подписаны символы:\n" + ", ".join(syms))
@@ -481,21 +548,23 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
-                    cfg = f"prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
+                    cfg = f"mode={'SCALP' if INTRADAY_SCALP else 'DEFAULT'}, prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\nCfg: {cfg}")
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
                     k1 = sum(len(mkt.kline['1'].get(s, [])) for s in syms)
                     k5 = sum(len(mkt.kline['5'].get(s, [])) for s in syms)
-                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)} keys")
+                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}")
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
                     tasks = {k: (not app[k].done()) if app.get(k) else False for k in ["ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"]}
                     await tg.send(chat_id, "Jobs:\n"
                                      f"WS connected: {ws_alive}\n" +
                                      "\n".join(f"{k}: {'running' if v else 'stopped'}" for k,v in tasks.items()))
+                elif cmd == "/mode":
+                    await tg.send(chat_id, f"Режим: {'SCALP (1–2 часа)' if INTRADAY_SCALP else 'DEFAULT'}; TP=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}]")
                 else:
-                    await tg.send(chat_id, "Неизвестная команда. Команды: /help")
+                    await tg.send(chat_id, "Неизвестная команда. /help")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -503,7 +572,7 @@ async def tg_updates_loop(app: web.Application) -> None:
             await asyncio.sleep(2)
 
 # =========================
-# Фоновые циклы (keepalive/heartbeat/watchdog)
+# Фоновые циклы
 # =========================
 async def keepalive_loop(app: web.Application) -> None:
     public_url: Optional[str] = app["public_url"]
@@ -652,7 +721,7 @@ async def on_startup(app: web.Application) -> None:
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["hb_task"] = asyncio.create_task(heartbeat_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
-    app["tg_updates_task"] = asyncio.create_task(tg_updates_loop(app))  # <— командный интерфейс
+    app["tg_updates_task"] = asyncio.create_task(tg_updates_loop(app))
 
 async def on_cleanup(app: web.Application) -> None:
     for key in ("ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"):
@@ -681,7 +750,8 @@ def main() -> None:
     setup_logging(LOG_LEVEL)
     logger.info(
         f"cfg: ws={BYBIT_WS_PUBLIC_LINEAR} | active={ACTIVE_SYMBOLS} | "
-        f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | prob_min={PROB_MIN:.0%} | rr≥{RR_TARGET:.2f}"
+        f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | prob_min={PROB_MIN:.0%} | rr≥{RR_TARGET:.2f} | "
+        f"mode={'SCALP' if INTRADAY_SCALP else 'DEFAULT'}"
     )
     app = make_app()
     web.run_app(app, host="0.0.0.0", port=PORT)
