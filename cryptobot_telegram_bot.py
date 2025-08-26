@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Cryptobot — Telegram сигналы (Bybit V5 WebSocket) + SMC-lite
-Режим INTRADAY_SCALP для коротких сделок (горизонт ~1–2 часа)
-
-Что нового:
-- INTRADAY_SCALP: короче цели (0.4–3%), мягче фильтры, TP ограничен «таймбоксом» (ожидаемым движением за N минут от 1m-ATR).
-- Сигнал допускается при >=1 SMC-факте (BOS или свип; FVG — опционально).
-- RR порог 1:1.2, антиспам 20с. В сообщении указывается «Горизонт: ~до N мин».
-
-Остальное (WS, команды, структура SMC) — как было.
+Cryptobot — Telegram сигналы (Bybit V5 WebSocket) + SMC-lite + Momentum
+Фокус: короткие сделки (горизонт ~1–2 часа), больше сигналов в вялом рынке.
 """
 
 from __future__ import annotations
@@ -17,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import os
 import time
 from datetime import datetime, timezone
@@ -34,30 +26,39 @@ BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 LOG_LEVEL = "INFO"
 
 # --- РЕЖИМ КОРОТКИХ СДЕЛОК ---
-INTRADAY_SCALP = True           # включён скальп-мод для горизонта ~1–2 часа
-TIMEBOX_MINUTES = 120           # целимся закрывать идею в пределах N минут
-TIMEBOX_FACTOR = 0.35           # доля от суммарной 1m-ATR за N минут (эмпирика для «направленного» хода)
+INTRADAY_SCALP = True           # приоритет: закрыть идею в 1–2 часа
+TIMEBOX_MINUTES = 90            # целевой горизонт
+TIMEBOX_FACTOR = 0.50           # доля от суммы 1m-ATR за горизонт (эмпирика направл. хода)
 
 # Символы и фильтры
-ACTIVE_SYMBOLS = 30
-# Базовые (будут «переписаны» скальп-настройками ниже, если INTRADAY_SCALP=True)
-PROB_MIN = 0.58
-TP_MIN_PCT = 0.010
-TP_MAX_PCT = 0.060
+ACTIVE_SYMBOLS = 40             # расширим вселенную, чтобы чаще ловить импульс
+# Базовые (переписываются ниже)
+PROB_MIN = 0.50
+TP_MIN_PCT = 0.004              # 0.4%
+TP_MAX_PCT = 0.025              # максимум 2.5% — краткая идея
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.55
+BODY_ATR_MULT = 0.45            # минимум «силы свечи»
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.5
-SIGNAL_COOLDOWN_SEC = 30
+VOL_MULT = 1.20                 # объём ≥ 1.2 × SMA
+SIGNAL_COOLDOWN_SEC = 15
 
 # SMC
 SWING_FRAC = 2
-USE_FVG = True          # в скальпе FVG становится «опциональным» (см. ниже)
+USE_FVG = True
 USE_SWEEP = True
-RR_TARGET = 1.4
-USE_5M_FILTER = True
+RR_TARGET = 1.10                # чуть мягче, чтобы больше сетапов проходило
+USE_5M_FILTER = False           # отключаем фильтр по 5m (слишком часто душит сетапы)
 ALIGN_5M_STRICT = False
-BOS_FRESH_BARS = 5       # BOS должен быть свежим (последние N свечей), чтобы сетап был «тактическим»
+BOS_FRESH_BARS = 8              # «свежесть» BOS для тактических ходов
+
+# Momentum-триггер (альтернатива SMC)
+MOMENTUM_N_BARS = 3             # импульс за последние N закрытых 1m свечей
+MOMENTUM_MIN_PCT = 0.004        # ≥0.4% за N баров
+BODY_ATR_MOMO = 0.65            # или одна «мощная» свеча ≥ 0.65×ATR
+MOMENTUM_PROB_BONUS = 0.08      # прибавка к вероятности при mom-условии
+
+# Диагностика
+DEBUG_SIGNALS = True            # аккуратно логируем причины «почти-отсевов»
 
 # Телеметрия / веб
 HEARTBEAT_SEC = 60 * 60
@@ -69,19 +70,6 @@ PORT = 10000
 PRIMARY_RECIPIENTS = [-1002870952333]
 ALLOWED_CHAT_IDS = [533232884, -1002870952333]
 ONLY_CHANNEL = True
-
-# -------------------------
-# Скальп-настройки (переписывают базовые)
-# -------------------------
-if INTRADAY_SCALP:
-    PROB_MIN = 0.55           # мягче, чтобы сетапов было больше
-    TP_MIN_PCT = 0.004        # 0.4%
-    TP_MAX_PCT = 0.030        # 3.0% — «потолок» для короткой идеи
-    BODY_ATR_MULT = 0.50
-    VOL_MULT = 1.3
-    RR_TARGET = 1.2
-    SIGNAL_COOLDOWN_SEC = 20
-    # 5m фильтр оставляем нестрогим: блокируем только явные противотрендовые входы без BOS на 5m
 
 # =========================
 # Утилиты
@@ -207,7 +195,6 @@ class BybitWS:
 class MarketState:
     def __init__(self) -> None:
         self.tickers: Dict[str, Dict[str, Any]] = {}
-        # kline по таймфреймам: {"1": {sym: [(o,h,l,c,v), ...]}, "5": { ... }}
         self.kline: Dict[str, Dict[str, List[Tuple[float,float,float,float,float]]]] = {"1": {}, "5": {}}
         self.kline_maxlen = 600
         self.liq_events: Dict[str, List[int]] = {}
@@ -216,8 +203,7 @@ class MarketState:
 
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
-        if not sym:
-            return
+        if not sym: return
         self.tickers[sym] = d
         self.last_ws_msg_ts = now_ts_ms()
 
@@ -243,98 +229,77 @@ class MarketState:
         self.last_ws_msg_ts = now_ts_ms()
 
 # =========================
-# Индикативные функции (ATR/SMA/SMC)
+# Индикаторы / SMC
 # =========================
 def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
-    if len(rows) < period + 1:
-        return 0.0
+    if len(rows) < period + 1: return 0.0
     trs: List[float] = []
     for i in range(1, period+1):
         _,h,l,c,_ = rows[-i]
-        _,_,_,prev_c,_ = rows[-i-1]
-        tr = max(h-l, abs(h - prev_c), abs(prev_c - l))
+        _,_,_,pc,_ = rows[-i-1]
+        tr = max(h-l, abs(h - pc), abs(pc - l))
         trs.append(tr)
     return sum(trs)/period if trs else 0.0
 
 def sma(vals: List[float], period: int) -> float:
-    if len(vals) < period or period <= 0:
-        return 0.0
+    if len(vals) < period or period <= 0: return 0.0
     return sum(vals[-period:]) / period
 
 def find_swings(rows: List[Tuple[float,float,float,float,float]], frac: int = SWING_FRAC) -> Tuple[List[int], List[int]]:
-    n = len(rows)
-    sh: List[int] = []
-    sl: List[int] = []
+    n = len(rows); sh: List[int] = []; sl: List[int] = []
     for i in range(frac, n - frac):
         h = rows[i][1]; l = rows[i][2]
-        highs = [rows[j][1] for j in range(i-frac, i+frac+1)]
-        lows  = [rows[j][2] for j in range(i-frac, i+frac+1)]
-        if h == max(highs) and highs.count(h) == 1:
-            sh.append(i)
-        if l == min(lows) and lows.count(l) == 1:
-            sl.append(i)
+        hs = [rows[j][1] for j in range(i-frac, i+frac+1)]
+        ls = [rows[j][2] for j in range(i-frac, i+frac+1)]
+        if h == max(hs) and hs.count(h) == 1: sh.append(i)
+        if l == min(ls) and ls.count(l) == 1: sl.append(i)
     return sh, sl
 
-def last_swing_price(rows: List[Tuple[float,float,float,float,float]], idxs: List[int], kind: str) -> Optional[float]:
-    if not idxs:
-        return None
+def last_swing_price(rows, idxs, kind: str) -> Optional[float]:
+    if not idxs: return None
     i = idxs[-1]
     return rows[i][1] if kind == "H" else rows[i][2]
 
-def bos_choch(rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int]) -> Tuple[str, bool, bool, Optional[int], Optional[int]]:
-    """
-    Возвращает: (trend, bos_up, bos_down, idx_bos_up, idx_bos_down)
-    BOS считается, если закрытие превысило/пробило последний swing H/L.
-    """
-    if len(rows) < 3 or (not sh and not sl):
-        return "RANGE", False, False, None, None
+def bos_choch(rows, sh, sl) -> Tuple[str, bool, bool, Optional[int], Optional[int]]:
+    if len(rows) < 3 or (not sh and not sl): return "RANGE", False, False, None, None
     c = rows[-1][3]
-    bos_up = False; bos_dn = False
-    bos_up_idx = None; bos_dn_idx = None
-    # последние swing H/L
+    bos_up = bos_dn = False; bos_up_idx = bos_dn_idx = None
     if sh:
-        last_h_idx = sh[-1]; last_h = rows[last_h_idx][1]
-        if c > last_h:
-            bos_up = True; bos_up_idx = len(rows)-1
+        idx = sh[-1]; ifh = rows[idx][1]
+        if c > ifh: bos_up, bos_up_idx = True, len(rows)-1
     if sl:
-        last_l_idx = sl[-1]; last_l = rows[last_l_idx][2]
-        if c < last_l:
-            bos_dn = True; bos_dn_idx = len(rows)-1
-    if bos_up and not bos_dn:
-        trend = "UP"
-    elif bos_dn and not bos_up:
-        trend = "DOWN"
-    else:
-        trend = "UP" if rows[-1][3] > rows[-3][3] else ("DOWN" if rows[-1][3] < rows[-3][3] else "RANGE")
+        idx = sl[-1]; ifl = rows[idx][2]
+        if c < ifl: bos_dn, bos_dn_idx = True, len(rows)-1
+    if bos_up and not bos_dn: trend = "UP"
+    elif bos_dn and not bos_up: trend = "DOWN"
+    else: trend = "UP" if rows[-1][3] > rows[-3][3] else ("DOWN" if rows[-1][3] < rows[-3][3] else "RANGE")
     return trend, bos_up, bos_dn, bos_up_idx, bos_dn_idx
 
-def has_fvg(rows: List[Tuple[float,float,float,float,float]], bullish: bool) -> bool:
+def has_fvg(rows, bullish: bool) -> bool:
     if len(rows) < 3: return False
     h2 = rows[-3][1]; l2 = rows[-3][2]
     h0 = rows[-1][1]; l0 = rows[-1][2]
     return (l0 > h2) if bullish else (h0 < l2)
 
-def swept_liquidity(rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int], side: str) -> bool:
+def swept_liquidity(rows, sh, sl, side: str) -> bool:
     if side == "LONG":
         if not sl: return False
-        key = rows[sl[-1]][2]
-        low = rows[-1][2]; close = rows[-1][3]
+        key = rows[sl[-1]][2]; low = rows[-1][2]; close = rows[-1][3]
         return (low < key) and (close > key)
     else:
         if not sh: return False
-        key = rows[sh[-1]][1]
-        high = rows[-1][1]; close = rows[-1][3]
+        key = rows[sh[-1]][1]; high = rows[-1][1]; close = rows[-1][3]
         return (high > key) and (close < key)
 
-def simple_ob(rows: List[Tuple[float,float,float,float,float]], side: str, body_atr_thr: float, atr_val: float) -> Optional[Tuple[float,float]]:
+def simple_ob(rows, side: str, body_atr_thr: float, atr_val: float) -> Optional[Tuple[float,float]]:
     if len(rows) < 3 or atr_val <= 0: return None
     o,h,l,c,_ = rows[-1]
     body = abs(c - o)
     if body < body_atr_thr * atr_val: return None
     for i in range(len(rows)-2, max(-1, len(rows)-8), -1):
         o2,h2,l2,c2,_ = rows[i]
-        is_opposite = (c2 < o2) if side == "LONG" else (c2 > o2)
-        if is_opposite:
+        opposite = (c2 < o2) if side == "LONG" else (c2 > o2)
+        if opposite:
             return (l2, max(o2, c2)) if side == "LONG" else (min(o2, c2), h2)
     return None
 
@@ -345,15 +310,16 @@ class Engine:
     def __init__(self, mkt: MarketState) -> None:
         self.mkt = mkt
 
-    def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int) -> float:
+    def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool) -> float:
         p = 0.45
-        p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.2)
-        if vol_ok: p += 0.15
+        p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
+        if vol_ok: p += 0.12
         if liq_cnt >= 3: p += 0.05
-        p += min(0.1, 0.03 * max(0, confluence-1))
+        p += min(0.12, 0.04 * max(0, confluence-1))
+        if mom_ok: p += MOMENTUM_PROB_BONUS
         return max(0.0, min(0.99, p))
 
-    def _nearest_opposite_swing_tp(self, rows: List[Tuple[float,float,float,float,float]], sh: List[int], sl: List[int], side: str, entry: float) -> Optional[float]:
+    def _nearest_opposite_swing_tp(self, rows, sh, sl, side: str, entry: float) -> Optional[float]:
         if side == "LONG":
             for i in reversed(sh):
                 ph = rows[i][1]
@@ -387,9 +353,9 @@ class Engine:
         if body_ratio < BODY_ATR_MULT or not vol_ok:
             return None
 
-        # --- SMC на 1m ---
+        # --- SMC (1m) ---
         SH1, SL1 = find_swings(rows1, SWING_FRAC)
-        trend1, bos_up, bos_dn, bos_up_idx, bos_dn_idx = bos_choch(rows1, SH1, SL1)
+        _, bos_up, bos_dn, bos_up_idx, bos_dn_idx = bos_choch(rows1, SH1, SL1)
 
         smc_hits = 0
         side: Optional[str] = None
@@ -404,78 +370,71 @@ class Engine:
             if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): smc_hits += 1
             if USE_FVG and has_fvg(rows1, bullish=False): smc_hits += 1
 
-        # Для скальпа требуем хотя бы 1 подтверждение структуры (BOS или свип; FVG — в помощь)
-        if smc_hits == 0:
+        # --- Momentum (альтернативный триггер) ---
+        mom_ok = False
+        if len(rows1) > MOMENTUM_N_BARS:
+            c_prev = rows1[-MOMENTUM_N_BARS][3]
+            ret = (c - c_prev) / max(1e-9, c_prev)
+            strong_bar = body_ratio >= BODY_ATR_MOMO
+            if abs(ret) >= MOMENTUM_MIN_PCT or strong_bar:
+                mom_ok = True
+                # если SMC не определил сторону, берём по знаку импульса
+                if smc_hits == 0:
+                    side = "LONG" if ret > 0 else "SHORT"
+
+        # Требуем хотя бы «что-то»: SMC ≥1 ИЛИ моментум
+        if smc_hits == 0 and not mom_ok:
             return None
 
-        # OB-зона (для SL подсказки)
-        ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
-
-        # --- Фильтр 5m (нестрогий) ---
-        if USE_5M_FILTER:
-            rows5 = self.mkt.kline["5"].get(sym) or []
-            if len(rows5) >= ATR_PERIOD_1M + 3:
-                SH5, SL5 = find_swings(rows5, SWING_FRAC)
-                trend5, bos5_up, bos5_dn, _, _ = bos_choch(rows5, SH5, SL5)
-                if side == "LONG":
-                    # Блокируем явный 5m DOWN без свежего BOS вверх
-                    if trend5 == "DOWN" and not bos5_up:
-                        return None
-                else:
-                    if trend5 == "UP" and not bos5_dn:
-                        return None
-
-        # --- Вероятность ---
+        # Вероятность
         liq_cnt = sum(1 for t in self.mkt.liq_events.get(sym, []) if t >= now_ts_ms() - 60_000)
-        prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits)
+        prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits, mom_ok)
         if prob < PROB_MIN:
+            if DEBUG_SIGNALS and (prob >= PROB_MIN - 0.08):
+                logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{PROB_MIN:.2f})"
+                            f" bodyATR={body_ratio:.2f} volOK={vol_ok} smc={smc_hits} mom={mom_ok}")
             return None
 
         entry = c
 
-        # --- Целеполагание: структурная цель + «таймбокс» ---
+        # Целеполагание: структурная цель + «таймбокс»
         tp_struct = self._nearest_opposite_swing_tp(rows1, SH1, SL1, side, entry)
         tp_pct_struct = abs(tp_struct - entry) / entry if tp_struct else 0.0
-
-        # Минимальный «атровый» TP (бэкап)
+        atr_pct_1m = atr1 / max(1e-9, entry)
+        tp_pct_timebox = atr_pct_1m * TIMEBOX_MINUTES * TIMEBOX_FACTOR
         tp_pct_atr = max(TP_MIN_PCT, 0.6 * atr1 / max(1e-9, entry))
 
-        # «Временной» TP: сколько движения разумно ждать за TIMEBOX_MINUTES при текущей ATR
-        atr_pct_1m = atr1 / max(1e-9, entry)
-        tp_pct_timebox = atr_pct_1m * TIMEBOX_MINUTES * TIMEBOX_FACTOR  # направленный ход как доля от сумм TR
-
-        # Итоговый TP%: берём МИНИМУМ из (структурной дистанции, таймбокс-лимита), но не ниже «атрового» минимума
         tp_pct = max(tp_pct_atr, min(tp_pct_struct if tp_pct_struct > 0 else TP_MAX_PCT, tp_pct_timebox))
         tp_pct = max(TP_MIN_PCT, min(TP_MAX_PCT, tp_pct))
 
-        # --- SL: по структуре (с поправкой на ATR) ---
+        # SL по структуре
         if side == "LONG":
             if USE_SWEEP and SL1:
-                sl = rows1[SL1[-1]][2] - 0.1 * atr1
-            elif ob:
-                sl = ob[0] - 0.05 * atr1
+                sl = rows1[SL1[-1]][2] - 0.10 * atr1
             else:
-                sl = l - 0.2 * atr1
+                ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
+                sl = (ob[0] - 0.05 * atr1) if ob else (l - 0.20 * atr1)
             tp = entry * (1.0 + tp_pct)
         else:
             if USE_SWEEP and SH1:
-                sl = rows1[SH1[-1]][1] + 0.1 * atr1
-            elif ob:
-                sl = ob[1] + 0.05 * atr1
+                sl = rows1[SH1[-1]][1] + 0.10 * atr1
             else:
-                sl = h + 0.2 * atr1
+                ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
+                sl = (ob[1] + 0.05 * atr1) if ob else (h + 0.20 * atr1)
             tp = entry * (1.0 - tp_pct)
 
-        # --- RR контроль ---
         rr = self._validate_rr(entry, tp, sl, side)
         if rr < RR_TARGET:
-            # Попробуем подтянуть TP в пределах потолка
+            # подтянем TP в пределах timebox потолка
             if side == "LONG":
                 tp = entry * (1.0 + min(TP_MAX_PCT, tp_pct_timebox))
             else:
                 tp = entry * (1.0 - min(TP_MAX_PCT, tp_pct_timebox))
             rr = self._validate_rr(entry, tp, sl, side)
             if rr < RR_TARGET:
+                if DEBUG_SIGNALS:
+                    logger.info(f"[signal:reject] {sym} side={side} rr={rr:.2f} (<{RR_TARGET:.2f})"
+                                f" tp_pct={tp_pct:.3f} timebox={tp_pct_timebox:.3f}")
                 return None
 
         # антиспам
@@ -488,7 +447,7 @@ class Engine:
         return {
             "symbol": sym, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl),
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
-            "liq_cnt": int(liq_cnt), "rr": float(rr), "confluence": int(smc_hits),
+            "liq_cnt": int(liq_cnt), "rr": float(rr), "confluence": int(max(smc_hits, 1) + (1 if mom_ok else 0)),
         }
 
 # =========================
@@ -500,28 +459,24 @@ def format_signal(sig: Dict[str, Any]) -> str:
     prob = sig["prob"]; liq_cnt = sig.get("liq_cnt", 0)
     body_ratio = sig.get("body_ratio", 0.0); rr = sig.get("rr", 0.0); con = sig.get("confluence", 0)
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
-    horizon = TIMEBOX_MINUTES if INTRADAY_SCALP else 0
     lines = [
         f"⚡️ <b>Сигнал по {sym}</b>",
         f"Направление: <b>{'LONG' if side=='LONG' else 'SHORT'}</b>",
+        f"Горизонт идеи: ~до <b>{TIMEBOX_MINUTES} мин</b>",
         f"Текущая цена: <b>{entry:g}</b>",
         f"Тейк: <b>{tp:g}</b> ({pct(tp_pct)})",
         f"Стоп: <b>{sl:g}</b>  •  RR ≈ <b>1:{rr:.2f}</b>",
-        f"Вероятность: <b>{pct(prob)}</b>  •  SMC-конфлюэнс: <b>{con}</b>",
+        f"Вероятность: <b>{pct(prob)}</b>  •  Конфлюэнс: <b>{con}</b>",
         f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
-    if INTRADAY_SCALP:
-        lines.insert(3, f"Горизонт идеи: ~до <b>{horizon} мин</b>")
     return "\n".join(lines)
 
 # =========================
-# Командный интерфейс
+# Командный интерфейс (Telegram)
 # =========================
 async def tg_updates_loop(app: web.Application) -> None:
-    tg: Tg = app["tg"]
-    mkt: MarketState = app["mkt"]
-    ws: BybitWS = app["ws"]
+    tg: Tg = app["tg"]; mkt: MarketState = app["mkt"]; ws: BybitWS = app["ws"]
     offset: Optional[int] = None
     while True:
         try:
@@ -530,25 +485,21 @@ async def tg_updates_loop(app: web.Application) -> None:
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("channel_post")
                 if not msg: continue
-                chat = msg.get("chat", {})
-                chat_id = chat.get("id")
+                chat = msg.get("chat", {}); chat_id = chat.get("id")
                 text = msg.get("text") or ""
-                if not isinstance(chat_id, int) or not text.startswith("/"):
-                    continue
-                if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS:
-                    continue
+                if not isinstance(chat_id, int) or not text.startswith("/"): continue
+                if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS: continue
                 cmd = text.split()[0].lower()
                 if cmd == "/help":
-                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика\n/mode — режим анализа")
+                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика")
                 elif cmd == "/universe":
-                    syms = app.get("symbols", [])
-                    await tg.send(chat_id, "Подписаны символы:\n" + ", ".join(syms))
+                    await tg.send(chat_id, "Подписаны символы:\n" + ", ".join(app.get("symbols", [])))
                 elif cmd == "/ping":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
-                    cfg = f"mode={'SCALP' if INTRADAY_SCALP else 'DEFAULT'}, prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
+                    cfg = f"mode={'SCALP+MOMO' if INTRADAY_SCALP else 'DEFAULT'}, prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\nCfg: {cfg}")
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
@@ -557,12 +508,11 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}")
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
-                    tasks = {k: (not app[k].done()) if app.get(k) else False for k in ["ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"]}
+                    tasks = {k: (not app[k].done()) if app.get(k) else False for k in
+                             ["ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"]}
                     await tg.send(chat_id, "Jobs:\n"
                                      f"WS connected: {ws_alive}\n" +
                                      "\n".join(f"{k}: {'running' if v else 'stopped'}" for k,v in tasks.items()))
-                elif cmd == "/mode":
-                    await tg.send(chat_id, f"Режим: {'SCALP (1–2 часа)' if INTRADAY_SCALP else 'DEFAULT'}; TP=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}]")
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /help")
         except asyncio.CancelledError:
@@ -575,10 +525,8 @@ async def tg_updates_loop(app: web.Application) -> None:
 # Фоновые циклы
 # =========================
 async def keepalive_loop(app: web.Application) -> None:
-    public_url: Optional[str] = app["public_url"]
-    http: aiohttp.ClientSession = app["http"]
-    if not public_url:
-        return
+    public_url: Optional[str] = app["public_url"]; http: aiohttp.ClientSession = app["http"]
+    if not public_url: return
     while True:
         try:
             await asyncio.sleep(KEEPALIVE_SEC)
@@ -618,15 +566,12 @@ async def watchdog_loop(app: web.Application) -> None:
 # WS message handler (сигналы)
 # =========================
 async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
-    mkt: MarketState = app["mkt"]
-    tg: Tg = app["tg"]
-    eng: Engine = app["engine"]
+    mkt: MarketState = app["mkt"]; tg: Tg = app["tg"]; eng: Engine = app["engine"]
 
     topic = data.get("topic") or ""
     if topic.startswith("tickers."):
         d = data.get("data") or {}
-        if isinstance(d, dict):
-            mkt.note_ticker(d)
+        if isinstance(d, dict): mkt.note_ticker(d)
 
     elif topic.startswith("kline.1."):
         payload = data.get("data") or []
@@ -655,8 +600,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             if not isinstance(liq, dict): continue
             sym = (liq.get("s") or liq.get("symbol"))
             ts = int(liq.get("T") or data.get("ts") or now_ts_ms())
-            if sym:
-                mkt.note_liq(sym, ts)
+            if sym: mkt.note_liq(sym, ts)
 
 # =========================
 # Web-приложение
@@ -751,7 +695,7 @@ def main() -> None:
     logger.info(
         f"cfg: ws={BYBIT_WS_PUBLIC_LINEAR} | active={ACTIVE_SYMBOLS} | "
         f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | prob_min={PROB_MIN:.0%} | rr≥{RR_TARGET:.2f} | "
-        f"mode={'SCALP' if INTRADAY_SCALP else 'DEFAULT'}"
+        f"mode={'SCALP+MOMO' if INTRADAY_SCALP else 'DEFAULT'}"
     )
     app = make_app()
     web.run_app(app, host="0.0.0.0", port=PORT)
