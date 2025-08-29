@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-SMC-lite v2: ретест OB/FVG + VWAP-якорь + анти-истощение + equal highs/lows guard
-Фокус: короткие сделки (горизонт ~1–2 часа), меньше мгновенных разворотов после сигнала.
+SMC-lite v2.1: pending на мягких порогах + адаптивное ослабление при тишине
+Фокус: короткие сделки (1–2 часа), но без «задушенных» сетапов.
 """
 
 from __future__ import annotations
@@ -27,19 +27,19 @@ BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 LOG_LEVEL = "INFO"
 
 # --- РЕЖИМ КОРОТКИХ СДЕЛОК ---
-INTRADAY_SCALP = True           # приоритет: закрыть идею в 1–2 часа
-TIMEBOX_MINUTES = 90            # целевой горизонт
-TIMEBOX_FACTOR = 0.50           # доля от суммы 1m-ATR за горизонт (эмпирика направл. хода)
+INTRADAY_SCALP = True
+TIMEBOX_MINUTES = 90
+TIMEBOX_FACTOR = 0.50
 
 # Символы и фильтры
-ACTIVE_SYMBOLS = 40
-PROB_MIN = 0.50
+ACTIVE_SYMBOLS = 60             # расширили вселенную
+PROB_MIN = 0.48                 # было 0.50
 TP_MIN_PCT = 0.004              # 0.4%
-TP_MAX_PCT = 0.025              # максимум 2.5% — краткая идея
+TP_MAX_PCT = 0.025              # 2.5%
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.45
+BODY_ATR_MULT = 0.40            # было 0.45
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.20
+VOL_MULT = 1.10                  # было 1.20
 SIGNAL_COOLDOWN_SEC = 15
 
 # SMC
@@ -47,31 +47,43 @@ SWING_FRAC = 2
 USE_FVG = True
 USE_SWEEP = True
 RR_TARGET = 1.10
-USE_5M_FILTER = True            # включаем, но мягко (см. ниже)
+USE_5M_FILTER = True            # мягкий (только «против явного тренда без ретеста»)
 ALIGN_5M_STRICT = False
 BOS_FRESH_BARS = 8
 
-# Momentum-триггер (подтверждение импульса)
+# Momentum
 MOMENTUM_N_BARS = 3
-MOMENTUM_MIN_PCT = 0.004        # ≥0.4% за N баров
-BODY_ATR_MOMO = 0.65
+MOMENTUM_MIN_PCT = 0.003        # было 0.004
+BODY_ATR_MOMO = 0.55            # было 0.65
 MOMENTUM_PROB_BONUS = 0.08
 
-# === Новые «анти-разворот» фильтры ===
-# Pending ретест
-PENDING_EXPIRE_BARS = 12        # сетап протухает через ~12 минут
-RETEST_WICK_PCT = 0.30          # минимальная доля хвоста (wick) при отбое от зоны
+# === «Анти-разворот» и pending ===
+PENDING_EXPIRE_BARS = 20        # было 12
+RETEST_WICK_PCT = 0.20          # было 0.30
+# Мягкие пороги для СОЗДАНИЯ pending (если бар не тянет на «чистый вход»)
+PENDING_BODY_ATR_MIN = 0.25
+PENDING_VOL_MULT_MIN = 0.95
+
 # VWAP
-VWAP_WINDOW = 60                # ~1 час по 1m
+VWAP_WINDOW = 60
 VWAP_SLOPE_BARS = 10
-VWAP_SLOPE_MIN = 0.0            # для LONG ждём slope >= 0; для SHORT slope <= 0
+VWAP_SLOPE_MIN = 0.0
+VWAP_TOLERANCE = 0.002          # ±0.2% допуска рядом с VWAP
+
 # Анти-истощение
 EXT_RUN_BARS = 5
 EXT_RUN_ATR_MULT = 2.2
-# Equal highs/lows
+
+# Equal highs/lows guard (применяем только для «чистых» входов; ретест не блочим)
 EQL_LOOKBACK = 30
-EQL_EPS_PCT = 0.0007            # что считаем «равными» уровнями
-EQL_PROX_PCT = 0.0015           # слишком близко — не торгуем в лоб (~0.15%)
+EQL_EPS_PCT = 0.0007
+EQL_PROX_PCT = 0.0015           # ~0.15%
+
+# Адаптивное ослабление, когда долго «тишина»
+ADAPTIVE_SILENCE_MINUTES = 180  # ≥3 часа
+ADAPT_BODY_ATR = 0.30
+ADAPT_VOL_MULT = 1.05
+ADAPT_PROB_MIN = 0.45
 
 # Диагностика
 DEBUG_SIGNALS = True
@@ -125,7 +137,7 @@ class Tg:
             return await r.json()
 
 # =========================
-# Bybit REST (стартер)
+# Bybit REST
 # =========================
 class BybitRest:
     def __init__(self, base: str, session: aiohttp.ClientSession) -> None:
@@ -148,7 +160,8 @@ class BybitWS:
         self.http = session
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._subs: List[str] = []
-        self._ping_task: Optional[asyncio.Task] = None
+        aelf = asyncio
+        self._ping_task: Optional[aelf.Task] = None
         self.on_message: Optional[callable] = None
 
     async def connect(self) -> None:
@@ -216,6 +229,7 @@ class MarketState:
         self.liq_events: Dict[str, List[int]] = {}
         self.last_ws_msg_ts: int = now_ts_ms()
         self.cooldown: Dict[Tuple[str,str], int] = {}
+        self.last_signal_sent_ts: int = 0   # для адаптива
 
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
@@ -245,7 +259,7 @@ class MarketState:
         self.last_ws_msg_ts = now_ts_ms()
 
 # =========================
-# Индикаторы / вспомогательные функции
+# Индикаторы / вспомогательные
 # =========================
 def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
     if len(rows) < period + 1: return 0.0
@@ -260,31 +274,6 @@ def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
 def sma(vals: List[float], period: int) -> float:
     if len(vals) < period or period <= 0: return 0.0
     return sum(vals[-period:]) / period
-
-def ema(vals: List[float], period: int) -> float:
-    if not vals or period <= 1 or len(vals) < period: return 0.0
-    k = 2.0 / (period + 1.0)
-    e = vals[-period]
-    for x in vals[-period+1:]:
-        e = x * k + e * (1 - k)
-    return e
-
-def rolling_vwap(rows: List[Tuple[float,float,float,float,float]], window: int) -> Tuple[float, float]:
-    # возвращает (vwap, slope_over_last_VWAP_SLOPE_BARS)
-    if len(rows) < max(window, VWAP_SLOPE_BARS+1): return 0.0, 0.0
-    tp = [(r[1] + r[2] + r[3]) / 3.0 for r in rows]
-    v  = [r[4] for r in rows]
-    tpw = sum(tp[-window+i] * v[-window+i] for i in range(window))
-    vw = sum(v[-window+i] for i in range(window)) or 1e-9
-    vwap_now = tpw / vw
-    # «склон»: разница VWAP N баров назад и сейчас
-    # грубая аппроксимация — используем цены вместо пересчёта VWAP на каждом шаге
-    # нам важен знак, а не точная величина
-    tpw2 = sum(tp[-window-VWAP_SLOPE_BARS+i] * v[-window-VWAP_SLOPE_BARS+i] for i in range(window))
-    vw2 = sum(v[-window-VWAP_SLOPE_BARS+i] for i in range(window)) or 1e-9
-    vwap_prev = tpw2 / vw2
-    slope = vwap_now - vwap_prev
-    return vwap_now, slope
 
 def find_swings(rows: List[Tuple[float,float,float,float,float]], frac: int = SWING_FRAC) -> Tuple[List[int], List[int]]:
     n = len(rows); sh: List[int] = []; sl: List[int] = []
@@ -312,14 +301,13 @@ def bos_choch(rows, sh, sl) -> Tuple[str, bool, bool, Optional[int], Optional[in
     return trend, bos_up, bos_dn, bos_up_idx, bos_dn_idx
 
 def has_fvg(rows, bullish: bool) -> Optional[Tuple[float,float]]:
-    # Возвращает границы FVG (low/high) если есть, иначе None
     if len(rows) < 3: return None
     h2 = rows[-3][1]; l2 = rows[-3][2]
     h0 = rows[-1][1]; l0 = rows[-1][2]
     if bullish and (l0 > h2):
-        return (h2, l0)   # зона ретеста для лонга
+        return (h2, l0)   # лонг-FVG
     if (not bullish) and (h0 < l2):
-        return (h0, l2)   # зона ретеста для шорта
+        return (h0, l2)   # шорт-FVG
     return None
 
 def swept_liquidity(rows, sh, sl, side: str) -> bool:
@@ -345,7 +333,6 @@ def simple_ob(rows, side: str, body_atr_thr: float, atr_val: float) -> Optional[
     return None
 
 def detect_equal_levels(rows: List[Tuple[float,float,float,float,float]], lookback:int, eps_pct:float, side:str) -> Optional[float]:
-    # Находит ближайший «кластер равных» High (для LONG) или Low (для SHORT) за lookback баров и возвращает уровень
     n = len(rows)
     if n < lookback + 1: return None
     levels = []
@@ -362,7 +349,6 @@ def detect_equal_levels(rows: List[Tuple[float,float,float,float,float]], lookba
             if abs(lows_sorted[i] - lows_sorted[i-1]) / max(1e-9, lows_sorted[i]) <= eps_pct:
                 levels.append((lows_sorted[i] + lows_sorted[i-1]) / 2.0)
     if not levels: return None
-    # ближайший к текущей цене
     price = rows[-1][3]
     levels.sort(key=lambda x: abs(x - price))
     return levels[0]
@@ -373,7 +359,7 @@ def detect_equal_levels(rows: List[Tuple[float,float,float,float,float]], lookba
 class Engine:
     def __init__(self, mkt: MarketState) -> None:
         self.mkt = mkt
-        self.pending: Dict[str, Dict[str, Any]] = {}  # sym -> {side, zone_lo, zone_hi, created_len, expire_len, context}
+        self.pending: Dict[str, Dict[str, Any]] = {}  # sym -> {...}
 
     def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool) -> float:
         p = 0.45
@@ -409,17 +395,17 @@ class Engine:
         move = abs(c1 - c0)
         return (move >= EXT_RUN_ATR_MULT * atr1), move/atr1
 
-    def _build_pending(self, sym:str, side:str, rows1, SH1, SL1, atr1:float) -> None:
-        # зона из OB приоритетно; если нет — из FVG; если нет — пропускаем pending
-        ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
+    def _build_pending(self, sym:str, side:str, rows1, atr1:float, prefer_ob_first:bool=True) -> None:
+        ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1) if prefer_ob_first else None
         if ob:
-            zone_lo, zone_hi = (ob[0], ob[1]) if side == "LONG" else (ob[0], ob[1])
+            zone_lo, zone_hi = ob[0], ob[1]
+            mode = "retest-OB"
         else:
             fvg = has_fvg(rows1, bullish=(side=="LONG"))
             if not fvg:
                 return
-            zone_lo, zone_hi = fvg if side == "LONG" else fvg  # уже корректные границы
-
+            zone_lo, zone_hi = fvg
+            mode = "retest-FVG"
         created_len = len(rows1)
         self.pending[sym] = {
             "side": side,
@@ -428,7 +414,7 @@ class Engine:
             "created_len": created_len,
             "expire_len": created_len + PENDING_EXPIRE_BARS,
             "atr": float(atr1),
-            "mode": "retest-OB" if ob else "retest-FVG",
+            "mode": mode,
         }
         if DEBUG_SIGNALS:
             logger.info(f"[pending:set] {sym} {side} zone=({zone_lo:.8g},{zone_hi:.8g}) exp@{created_len + PENDING_EXPIRE_BARS}")
@@ -446,13 +432,12 @@ class Engine:
         zone_lo = pend["zone_lo"]; zone_hi = pend["zone_hi"]
         o,h,l,c,v = rows1[-1]
         rng = max(1e-9, h - l)
-        # Условие ретеста: касание зоны и отбой (зелёная свеча для LONG / красная для SHORT) + хвост
         if side == "LONG":
             touched = (l <= zone_hi and h >= zone_lo)
-            rejection = (c > o) and ((o - l) / rng >= RETEST_WICK_PCT)  # нижний хвост ≥ порога
+            rejection = (c > o) and ((o - l) / rng >= RETEST_WICK_PCT)
         else:
             touched = (h >= zone_lo and l <= zone_hi)
-            rejection = (c < o) and ((h - o) / rng >= RETEST_WICK_PCT)  # верхний хвост ≥ порога
+            rejection = (c < o) and ((h - o) / rng >= RETEST_WICK_PCT)
         if touched and rejection:
             self.pending.pop(sym, None)
             return {"triggered": True, "entry_mode": pend["mode"]}
@@ -470,35 +455,41 @@ class Engine:
         body_ratio = body / atr1
         vols = [x[4] for x in rows1]
         v_sma = sma(vols, VOL_SMA_PERIOD)
-        vol_ok = v > VOL_MULT * v_sma if v_sma > 0 else False
-        if body_ratio < BODY_ATR_MULT or not vol_ok:
-            # даже pending триггер не даём, если свеча «пустая»
-            return None
+        vol_mult_ratio = (v / v_sma) if v_sma > 0 else 0.0
 
-        # VWAP фильтр
+        # Адаптив: если долго нет сигналов — ослабляем текущие пороги
+        silent_min = (now_ts_ms() - self.mkt.last_signal_sent_ts)/60000.0 if self.mkt.last_signal_sent_ts else 1e9
+        cur_body_thr = ADAPT_BODY_ATR if silent_min >= ADAPTIVE_SILENCE_MINUTES else BODY_ATR_MULT
+        cur_vol_mult_thr = ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT
+        cur_prob_min = ADAPT_PROB_MIN if silent_min >= ADAPTIVE_SILENCE_MINUTES else PROB_MIN
+
+        allow_clean = (body_ratio >= cur_body_thr) and (vol_mult_ratio >= cur_vol_mult_thr)
+        allow_pending = (body_ratio >= PENDING_BODY_ATR_MIN) or (vol_mult_ratio >= PENDING_VOL_MULT_MIN)
+
+        # VWAP фильтр (мягкий): если «против склона» и заметно по другую сторону VWAP — только через ретест
+        tp_price = (rows1[-1][1] + rows1[-1][2] + rows1[-1][3]) / 3.0
         vwap_now, vwap_slope = rolling_vwap(rows1, VWAP_WINDOW)
         if vwap_now == 0.0 and vwap_slope == 0.0:
             return None
+        price_rel_to_vwap = (tp_price - vwap_now) / max(1e-9, vwap_now)
 
         # SMC на 1m
         SH1, SL1 = find_swings(rows1, SWING_FRAC)
         _, bos_up, bos_dn, bos_up_idx, bos_dn_idx = bos_choch(rows1, SH1, SL1)
 
         smc_hits = 0
-        side: Optional[str] = None
         bullish_bar = c > o
+        side: Optional[str] = "LONG" if bullish_bar else "SHORT"
         if bullish_bar:
-            side = "LONG"
             if bos_up and (bos_up_idx is None or bos_up_idx >= len(rows1) - BOS_FRESH_BARS): smc_hits += 1
             if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "LONG"): smc_hits += 1
             if USE_FVG and has_fvg(rows1, bullish=True): smc_hits += 1
         else:
-            side = "SHORT"
             if bos_dn and (bos_dn_idx is None or bos_dn_idx >= len(rows1) - BOS_FRESH_BARS): smc_hits += 1
             if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): smc_hits += 1
             if USE_FVG and has_fvg(rows1, bullish=False): smc_hits += 1
 
-        # Momentum (поддержка импульса)
+        # Momentum
         mom_ok = False
         if len(rows1) > MOMENTUM_N_BARS:
             c_prev = rows1[-MOMENTUM_N_BARS][3]
@@ -509,75 +500,69 @@ class Engine:
                 if smc_hits == 0:
                     side = "LONG" if ret > 0 else "SHORT"
 
-        # Пытаемся сначала триггерить PENDING, если он есть
+        # Сначала — попытка триггера по pending
         pend_sig = self._check_pending_trigger(sym, rows1)
-        if pend_sig and pend_sig.get("triggered"):
-            entry_mode = pend_sig.get("entry_mode", "retest")
-        else:
-            entry_mode = None
+        entry_mode = pend_sig.get("entry_mode", "retest") if (pend_sig and pend_sig.get("triggered")) else None
 
-        # Контекст 5m (мягкий): против явного 5m-тренда — только через ретест+rejection
-        if USE_5M_FILTER:
+        # Контекст 5m (мягкий): против явного 5m — только через ретест
+        if USE_5M_FILTER and not entry_mode:
             rows5 = self.mkt.kline["5"].get(sym) or []
             if len(rows5) >= ATR_PERIOD_1M + 3:
                 SH5, SL5 = find_swings(rows5, SWING_FRAC)
                 trend5, bos5_up, bos5_dn, _, _ = bos_choch(rows5, SH5, SL5)
-                if side == "LONG" and trend5 == "DOWN" and not bos5_up and not entry_mode:
-                    # нет ретеста — не даём
-                    return None
-                if side == "SHORT" and trend5 == "UP" and not bos5_dn and not entry_mode:
-                    return None
+                if side == "LONG" and trend5 == "DOWN" and not bos5_up:
+                    allow_clean = False
+                if side == "SHORT" and trend5 == "UP" and not bos5_dn:
+                    allow_clean = False
 
-        # VWAP-якорь: для LONG желателен vwap_slope >= 0 и цена не слишком далеко ниже vwap
-        # для SHORT — наоборот
-        price_rel_to_vwap = (c - vwap_now) / max(1e-9, vwap_now)
-        if side == "LONG" and (vwap_slope < VWAP_SLOPE_MIN and price_rel_to_vwap < -0.001):
-            # против потока и ниже vwap — только ретест разрешаем
-            if not entry_mode:
-                # ставим pending и ждём retest
-                self._build_pending(sym, side, rows1, SH1, SL1, atr1)
-                return None
-        if side == "SHORT" and (vwap_slope > -VWAP_SLOPE_MIN and price_rel_to_vwap > 0.001):
-            if not entry_mode:
-                self._build_pending(sym, side, rows1, SH1, SL1, atr1)
-                return None
+        # VWAP guard (мягкий): если slope<0 и цена ниже VWAP больше, чем на допуск — не даём «clean», только pending
+        if side == "LONG" and (vwap_slope < VWAP_SLOPE_MIN and price_rel_to_vwap < -VWAP_TOLERANCE):
+            allow_clean = False
+        if side == "SHORT" and (vwap_slope > -VWAP_SLOPE_MIN and price_rel_to_vwap > VWAP_TOLERANCE):
+            allow_clean = False
 
-        # Анти-истощение: если «перебег» большой — не входить по пробою; ждём ретеста
-        ext, ext_mult = self._extended_run(rows1, atr1)
+        # Анти-истощение: большой «перебег» — только pending
+        ext, _ = self._extended_run(rows1, atr1)
         if ext and not entry_mode:
-            self._build_pending(sym, side, rows1, SH1, SL1, atr1)
-            return None
+            allow_clean = False
 
-        # Равные уровни впереди (близко) — отложим/откажем
-        eql = detect_equal_levels(rows1, EQL_LOOKBACK, EQL_EPS_PCT, side)
-        if eql is not None:
-            dist_pct = abs(eql - c) / max(1e-9, c)
-            if dist_pct <= EQL_PROX_PCT and not entry_mode:
-                # близкий уровень-сопротивление/поддержка — ждём ретеста, а не пробой
-                self._build_pending(sym, side, rows1, SH1, SL1, atr1)
+        # Равные уровни (только для clean)
+        if not entry_mode and allow_clean:
+            eql = detect_equal_levels(rows1, EQL_LOOKBACK, EQL_EPS_PCT, side)
+            if eql is not None:
+                dist_pct = abs(eql - c) / max(1e-9, c)
+                if dist_pct <= EQL_PROX_PCT:
+                    allow_clean = False
+
+        # Если ещё не в pending и есть смысл — поставим pending на мягких порогах
+        if not entry_mode and (smc_hits >= 1 or mom_ok):
+            if allow_clean:
+                # можно войти чисто — ничего не ставим, пройдём дальше
+                pass
+            elif allow_pending:
+                self._build_pending(sym, side, rows1, atr1)
+                return None
+            else:
+                # бар совсем «пустой» — пропустим
                 return None
 
-        # Если pending ещё не был и условий «ретеста» нет — создадим pending при наличии SMC/моментум
-        if not entry_mode and (smc_hits >= 1 or mom_ok):
-            self._build_pending(sym, side, rows1, SH1, SL1, atr1)
-            # ждём ретеста
-            return None
-
-        # Если дошли сюда — либо это ретест-триггер, либо редкий «чистый» проход всех фильтров
-        if smc_hits == 0 and not mom_ok:
+        # Если нет ни SMC, ни momentum, то и clean, и pending не даём
+        if smc_hits == 0 and not mom_ok and not entry_mode:
             return None
 
         # Вероятность
         liq_cnt = sum(1 for t in self.mkt.liq_events.get(sym, []) if t >= now_ts_ms() - 60_000)
+        vol_ok = (vol_mult_ratio >= cur_vol_mult_thr)
         prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits, mom_ok)
-        if prob < PROB_MIN:
-            if DEBUG_SIGNALS and (prob >= PROB_MIN - 0.08):
-                logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{PROB_MIN:.2f})"
-                            f" bodyATR={body_ratio:.2f} volOK={vol_ok} smc={smc_hits} mom={mom_ok}")
+        if prob < cur_prob_min:
+            if DEBUG_SIGNALS and (prob >= cur_prob_min - 0.08):
+                logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{cur_prob_min:.2f})"
+                            f" bodyATR={body_ratio:.2f} vol×SMA={vol_mult_ratio:.2f} smc={smc_hits} mom={mom_ok}")
             return None
 
+        # --- Постановка целей/стопов ---
         entry = c
-        # Целеполагание: структурная цель + «таймбокс»
+        SH1, SL1 = find_swings(rows1, SWING_FRAC)  # пересчёт, мог поменяться
         tp_struct = self._nearest_opposite_swing_tp(rows1, SH1, SL1, side, entry)
         tp_pct_struct = abs(tp_struct - entry) / entry if tp_struct else 0.0
         atr_pct_1m = atr1 / max(1e-9, entry)
@@ -586,20 +571,13 @@ class Engine:
         tp_pct = max(tp_pct_atr, min(tp_pct_struct if tp_pct_struct > 0 else TP_MAX_PCT, tp_pct_timebox))
         tp_pct = max(TP_MIN_PCT, min(TP_MAX_PCT, tp_pct))
 
-        # SL по структуре
         if side == "LONG":
             ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
-            if ob:
-                sl = ob[0] - 0.05 * atr1
-            else:
-                sl = l - 0.20 * atr1
+            sl = (ob[0] - 0.05 * atr1) if ob else (rows1[-1][2] - 0.20 * atr1)
             tp = entry * (1.0 + tp_pct)
         else:
             ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
-            if ob:
-                sl = ob[1] + 0.05 * atr1
-            else:
-                sl = h + 0.20 * atr1
+            sl = (ob[1] + 0.05 * atr1) if ob else (rows1[-1][1] + 0.20 * atr1)
             tp = entry * (1.0 - tp_pct)
 
         rr = self._validate_rr(entry, tp, sl, side)
@@ -627,7 +605,7 @@ class Engine:
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
             "liq_cnt": int(liq_cnt), "rr": float(rr),
             "confluence": int(max(smc_hits, 1) + (1 if mom_ok else 0)),
-            "entry_mode": entry_mode or ("clean-pass" if smc_hits >= 1 else "momo-pass"),
+            "entry_mode": entry_mode or ("clean-pass" if allow_clean else "momo-pass"),
         }
 
 # =========================
@@ -680,13 +658,13 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
-                    cfg = f"mode={'SCALP (retest+VWAP)' if INTRADAY_SCALP else 'DEFAULT'}, prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
+                    cfg = f"mode={'SCALP (retest+VWAP) adaptive' if INTRADAY_SCALP else 'DEFAULT'}, prob_min={PROB_MIN:.0%}, tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}], rr≥{RR_TARGET:.2f}, body/ATR≥{BODY_ATR_MULT}, vol≥{VOL_MULT}×SMA"
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\nCfg: {cfg}")
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
                     k1 = sum(len(mkt.kline['1'].get(s, [])) for s in syms)
                     k5 = sum(len(mkt.kline['5'].get(s, [])) for s in syms)
-                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}")
+                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}\nLast signal ts: {mkt.last_signal_sent_ts}")
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
                     tasks = {k: (not app[k].done()) if app.get(k) else False for k in
@@ -744,7 +722,7 @@ async def watchdog_loop(app: web.Application) -> None:
             logger.warning(f"watchdog error: {e}")
 
 # =========================
-# WS message handler (сигналы)
+# WS handler
 # =========================
 async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     mkt: MarketState = app["mkt"]; tg: Tg = app["tg"]; eng: Engine = app["engine"]
@@ -768,6 +746,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                         with contextlib.suppress(Exception):
                             await tg.send(chat_id, text)
                             logger.info(f"signal sent: {sym} {sig['side']}")
+                    mkt.last_signal_sent_ts = now_ts_ms()
 
     elif topic.startswith("kline.5."):
         payload = data.get("data") or []
@@ -876,7 +855,7 @@ def main() -> None:
     logger.info(
         f"cfg: ws={BYBIT_WS_PUBLIC_LINEAR} | active={ACTIVE_SYMBOLS} | "
         f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | prob_min={PROB_MIN:.0%} | rr≥{RR_TARGET:.2f} | "
-        f"mode={'SCALP (retest+VWAP)' if INTRADAY_SCALP else 'DEFAULT'}"
+        f"mode={'SCALP (retest+VWAP) adaptive' if INTRADAY_SCALP else 'DEFAULT'}"
     )
     app = make_app()
     web.run_app(app, host="0.0.0.0", port=PORT)
