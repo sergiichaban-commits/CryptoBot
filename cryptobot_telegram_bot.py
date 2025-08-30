@@ -275,6 +275,39 @@ def sma(vals: List[float], period: int) -> float:
     if len(vals) < period or period <= 0: return 0.0
     return sum(vals[-period:]) / period
 
+def ema(vals: List[float], period: int) -> float:
+    if not vals or period <= 1 or len(vals) < period: return 0.0
+    k = 2.0 / (period + 1.0)
+    e = vals[-period]
+    for x in vals[-period+1:]:
+        e = x * k + e * (1 - k)
+    return e
+
+def rolling_vwap(rows: List[Tuple[float,float,float,float,float]], window: int) -> Tuple[float, float]:
+    """
+    Прокатный VWAP по 1m: считаем типичную цену (H+L+C)/3, взвешиваем на volume.
+    Возвращаем (текущий VWAP за окно, «склон» — разница VWAP_now и VWAP, рассчитанного на окне, сдвинутом на VWAP_SLOPE_BARS назад).
+    """
+    n = len(rows)
+    need = max(window, VWAP_SLOPE_BARS + 1)
+    if n < need:
+        return 0.0, 0.0
+    tp = [(r[1] + r[2] + r[3]) / 3.0 for r in rows]
+    v  = [r[4] for r in rows]
+    # текущий VWAP по последним 'window' барам
+    tpw_now = sum(tp[-window+i] * v[-window+i] for i in range(window))
+    vw_now  = sum(v[-window+i] for i in range(window)) or 1e-9
+    vwap_now = tpw_now / vw_now
+    # «склон»: сравниваем с vwap такого же окна, но сдвинутого на VWAP_SLOPE_BARS назад
+    if n < window + VWAP_SLOPE_BARS:
+        return vwap_now, 0.0
+    start = n - window - VWAP_SLOPE_BARS
+    tpw_prev = sum(tp[start+i] * v[start+i] for i in range(window))
+    vw_prev  = sum(v[start+i] for i in range(window)) or 1e-9
+    vwap_prev = tpw_prev / vw_prev
+    slope = vwap_now - vwap_prev
+    return vwap_now, slope
+
 def find_swings(rows: List[Tuple[float,float,float,float,float]], frac: int = SWING_FRAC) -> Tuple[List[int], List[int]]:
     n = len(rows); sh: List[int] = []; sl: List[int] = []
     for i in range(frac, n - frac):
