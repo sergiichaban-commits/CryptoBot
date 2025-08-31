@@ -34,13 +34,14 @@ TIMEBOX_FACTOR = 0.50
 
 # Символы и фильтры (TURBO)
 ACTIVE_SYMBOLS = 80
-TP_MIN_PCT = 0.004              # 0.4%
+TP_MIN_PCT = 0.004              # 0.4% (внутренняя нижняя планка расчёта, не фильтр)
 TP_MAX_PCT = 0.020              # 2.0% — турбо-потолок для быстрых идей
+MIN_PROFIT_PCT = 0.010          # 1.0% — отправляем сигнал только если итоговый TP ≥ 1%
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.35            # было 0.40
+BODY_ATR_MULT = 0.35
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.05                 # было 1.10
-SIGNAL_COOLDOWN_SEC = 10        # было 15
+VOL_MULT = 1.05
+SIGNAL_COOLDOWN_SEC = 10
 
 # SMC
 SWING_FRAC = 2
@@ -53,8 +54,8 @@ BOS_FRESH_BARS = 8
 
 # Momentum (турбо)
 MOMENTUM_N_BARS = 3
-MOMENTUM_MIN_PCT = 0.0025       # было 0.003
-BODY_ATR_MOMO = 0.50            # было 0.55
+MOMENTUM_MIN_PCT = 0.0025
+BODY_ATR_MOMO = 0.50
 MOMENTUM_PROB_BONUS = 0.08
 
 # === «Анти-разворот» и pending ===
@@ -77,19 +78,17 @@ EXT_RUN_ATR_MULT = 2.2
 # Equal highs/lows guard (только для «clean» входов)
 EQL_LOOKBACK = 30
 EQL_EPS_PCT = 0.0007
-EQL_PROX_PCT = 0.0012           # ~0.12% (чуть мягче)
+EQL_PROX_PCT = 0.0012           # ~0.12%
 
 # === Фильтр по вероятности ===
-# ВАЖНО: p — «собственная» метрика (0..1) из конфига конъюнктуры; 70% здесь очень жёстко.
-# По умолчанию — профильные пороги по типам входа:
+# p — наша внутренняя метрика (0..1). 70% здесь весьма жёстко.
 PROB_THRESHOLDS = {
-    "retest-OB": 0.46,          # самый надёжный из наших — допускаем ниже
+    "retest-OB": 0.46,
     "retest-FVG": 0.50,
-    "clean-pass": 0.54,         # вход без ретеста — требуем выше
+    "clean-pass": 0.54,
     "momo-pass": 0.56,
     "default": 0.50
 }
-# Строгий режим «от 70%» — включи True, если действительно хочешь отсекать всё ниже ~0.70
 USE_PROB_70_STRICT = False
 PROB_THRESHOLDS_STRICT = {
     "retest-OB": 0.66,
@@ -98,11 +97,11 @@ PROB_THRESHOLDS_STRICT = {
     "momo-pass": 0.72,
     "default": 0.70
 }
-# Адаптив: если долго «тишина», временно смягчаем пороги на delta
-ADAPTIVE_SILENCE_MINUTES = 90   # было 180
+# Адаптив: если долго «тишина», временно смягчаем пороги
+ADAPTIVE_SILENCE_MINUTES = 90
 ADAPT_BODY_ATR = 0.28
 ADAPT_VOL_MULT = 1.02
-ADAPT_PROB_DELTA = -0.04        # минус 4 п.п. к порогу по вероятности
+ADAPT_PROB_DELTA = -0.04
 
 # Диагностика
 DEBUG_SIGNALS = True
@@ -579,7 +578,7 @@ class Engine:
         # Если ещё не в pending и есть смысл — поставим pending на мягких порогах
         if not entry_mode and (smc_hits >= 1 or mom_ok):
             if allow_clean:
-                pass  # пойдём как clean
+                pass  # clean
             elif allow_pending:
                 self._build_pending(sym, side, rows1, atr1)
                 return None
@@ -644,6 +643,13 @@ class Engine:
                                 f" tp_pct={tp_pct:.3f} timebox={tp_pct_timebox:.3f} entry_mode={entry_mode}")
                 return None
 
+        # >>> Новый финальный фильтр по прибыли
+        tp_pct_final = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
+        if tp_pct_final < MIN_PROFIT_PCT:
+            if DEBUG_SIGNALS:
+                logger.info(f"[signal:reject] {sym} side={side} tp_pct={tp_pct_final:.3f} (<{MIN_PROFIT_PCT:.3f})")
+            return None
+
         # антиспам
         key = (sym, side)
         last_ts = self.mkt.cooldown.get(key, 0)
@@ -677,6 +683,7 @@ def format_signal(sig: Dict[str, Any]) -> str:
         f"Тейк: <b>{tp:g}</b> ({pct(tp_pct)})",
         f"Стоп: <b>{sl:g}</b>  •  RR ≈ <b>1:{rr:.2f}</b>",
         f"Вероятность: <b>{pct(prob)}</b>  •  Конфлюэнс: <b>{con}</b>",
+        f"Фильтры: TP≥{pct(MIN_PROFIT_PCT)}; профиль вероятности={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}",
         f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
@@ -710,8 +717,9 @@ async def tg_updates_loop(app: web.Application) -> None:
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
                     mode = 'SCALP TURBO (retest+VWAP)'
-                    await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\nMode: {mode}\n"
-                                           f"Prob profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}")
+                    await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\n"
+                                           f"Mode: {mode}\nProb profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}\n"
+                                           f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}")
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
                     k1 = sum(len(mkt.kline['1'].get(s, [])) for s in syms)
@@ -907,6 +915,7 @@ def main() -> None:
     logger.info(
         f"cfg: ws={BYBIT_WS_PUBLIC_LINEAR} | active={ACTIVE_SYMBOLS} | "
         f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | rr≥{RR_TARGET:.2f} | "
+        f"min_tp_filter=≥{MIN_PROFIT_PCT:.1%} | "
         f"prob_profile={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'} | "
         f"mode=SCALP TURBO (retest+VWAP)"
     )
