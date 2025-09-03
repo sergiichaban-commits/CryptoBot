@@ -110,7 +110,8 @@ DEBUG_SIGNALS = True
 HEARTBEAT_SEC = 60 * 60
 KEEPALIVE_SEC = 13 * 60
 WATCHDOG_SEC = 60
-PORT = 10000
+# ВАЖНО: на Render слушаем порт, переданный платформой
+PORT = int(os.getenv("PORT", "10000"))
 
 # Роутинг / доступ
 PRIMARY_RECIPIENTS = [-1002870952333]
@@ -643,7 +644,7 @@ class Engine:
                                 f" tp_pct={tp_pct:.3f} timebox={tp_pct_timebox:.3f} entry_mode={entry_mode}")
                 return None
 
-        # >>> Новый финальный фильтр по прибыли
+        # Финальный фильтр по прибыли
         tp_pct_final = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
         if tp_pct_final < MIN_PROFIT_PCT:
             if DEBUG_SIGNALS:
@@ -923,4 +924,8 @@ def main() -> None:
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("FATAL: app crashed on startup")
+        raise
