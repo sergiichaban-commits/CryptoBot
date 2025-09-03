@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-SMC-lite v2.2 TURBO: ретест OB/FVG + VWAP-якорь + анти-истощение + equal highs/lows guard
-Гибкий фильтр вероятности (по типу входа) + опция STRICT 70%.
-Фокус: короткие сделки (1–2 часа), больше сигналов без сильной просадки качества.
+SMC-lite v2.3 TURBO: ретест OB/FVG + VWAP-якорь + анти-истощение + equal highs/lows guard
+Адаптив порогов через 30 минут тишины.
+Фокус: короткие сделки (1–2 часа). Фильтр прибыли: ≥1%.
 """
 
 from __future__ import annotations
@@ -35,12 +35,12 @@ TIMEBOX_FACTOR = 0.50
 # Символы и фильтры (TURBO)
 ACTIVE_SYMBOLS = 80
 TP_MIN_PCT = 0.004              # 0.4% (внутренняя нижняя планка расчёта, не фильтр)
-TP_MAX_PCT = 0.020              # 2.0% — турбо-потолок для быстрых идей
+TP_MAX_PCT = 0.025              # ↑ 2.5% — позволяем чуть длиннее тейк в пределах таймбокса
 MIN_PROFIT_PCT = 0.010          # 1.0% — отправляем сигнал только если итоговый TP ≥ 1%
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.35
+BODY_ATR_MULT = 0.30            # ↓ было 0.35 — больше «clean» сетапов проходит
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.05
+VOL_MULT = 1.00                 # ↓ было 1.05 — не режем тихие, но валидные минуты
 SIGNAL_COOLDOWN_SEC = 10
 
 # SMC
@@ -50,7 +50,7 @@ USE_SWEEP = True
 RR_TARGET = 1.10
 USE_5M_FILTER = True            # мягкий (против явного 5m — только pending/ретест)
 ALIGN_5M_STRICT = False
-BOS_FRESH_BARS = 8
+BOS_FRESH_BARS = 12             # ↑ допускаем чуть «старее» BOS/ChoCH
 
 # Momentum (турбо)
 MOMENTUM_N_BARS = 3
@@ -60,10 +60,10 @@ MOMENTUM_PROB_BONUS = 0.08
 
 # === «Анти-разворот» и pending ===
 PENDING_EXPIRE_BARS = 20
-RETEST_WICK_PCT = 0.20
+RETEST_WICK_PCT = 0.15          # ↓ легче подтвердить отбой
 # Мягкие пороги для СОЗДАНИЯ pending
-PENDING_BODY_ATR_MIN = 0.20
-PENDING_VOL_MULT_MIN = 0.90
+PENDING_BODY_ATR_MIN = 0.15     # ↓
+PENDING_VOL_MULT_MIN = 0.85     # ↓
 
 # VWAP
 VWAP_WINDOW = 60
@@ -81,7 +81,6 @@ EQL_EPS_PCT = 0.0007
 EQL_PROX_PCT = 0.0012           # ~0.12%
 
 # === Фильтр по вероятности ===
-# p — наша внутренняя метрика (0..1). 70% здесь весьма жёстко.
 PROB_THRESHOLDS = {
     "retest-OB": 0.46,
     "retest-FVG": 0.50,
@@ -97,11 +96,11 @@ PROB_THRESHOLDS_STRICT = {
     "momo-pass": 0.72,
     "default": 0.70
 }
-# Адаптив: если долго «тишина», временно смягчаем пороги
-ADAPTIVE_SILENCE_MINUTES = 90
-ADAPT_BODY_ATR = 0.28
-ADAPT_VOL_MULT = 1.02
-ADAPT_PROB_DELTA = -0.04
+# АДАПТИВ: если долго «тишина», временно смягчаем пороги
+ADAPTIVE_SILENCE_MINUTES = 30   # ↓ было 90
+ADAPT_BODY_ATR = 0.24           # ↓
+ADAPT_VOL_MULT = 0.98           # ↓
+ADAPT_PROB_DELTA = -0.08        # ↓ сильнее даём «зелёный»
 
 # Диагностика
 DEBUG_SIGNALS = True
@@ -110,8 +109,7 @@ DEBUG_SIGNALS = True
 HEARTBEAT_SEC = 60 * 60
 KEEPALIVE_SEC = 13 * 60
 WATCHDOG_SEC = 60
-# ВАЖНО: на Render слушаем порт, переданный платформой
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.getenv("PORT", "10000"))  # Render даёт PORT динамически
 
 # Роутинг / доступ
 PRIMARY_RECIPIENTS = [-1002870952333]
@@ -500,7 +498,7 @@ class Engine:
         v_sma = sma(vols, VOL_SMA_PERIOD)
         vol_mult_ratio = (v / v_sma) if v_sma > 0 else 0.0
 
-        # Адаптив: при тишине ≥ 90 мин — временно мягче пороги
+        # Адаптив: при тишине ≥ ADAPTIVE_SILENCE_MINUTES — мягче пороги
         silent_min = (now_ts_ms() - self.mkt.last_signal_sent_ts)/60000.0 if self.mkt.last_signal_sent_ts else 1e9
         cur_body_thr = ADAPT_BODY_ATR if silent_min >= ADAPTIVE_SILENCE_MINUTES else BODY_ATR_MULT
         cur_vol_mult_thr = ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT
@@ -590,7 +588,7 @@ class Engine:
         if smc_hits == 0 and not mom_ok and not entry_mode:
             return None
 
-        # Определяем тип входа для профиля вероятности (если ещё не определился)
+        # Тип входа для профиля вероятности
         if not entry_mode:
             entry_mode = "clean-pass" if allow_clean else ("momo-pass" if mom_ok else "clean-pass")
 
@@ -602,7 +600,7 @@ class Engine:
         base_profile = PROB_THRESHOLDS_STRICT if USE_PROB_70_STRICT else PROB_THRESHOLDS
         thr = base_profile.get(entry_mode, base_profile.get("default", 0.5))
         if silent_min >= ADAPTIVE_SILENCE_MINUTES:
-            thr = max(0.40, thr + ADAPT_PROB_DELTA)  # слегка мягче в тишине
+            thr = max(0.40, thr + ADAPT_PROB_DELTA)
 
         if prob < thr:
             if DEBUG_SIGNALS and (prob >= thr - 0.06):
