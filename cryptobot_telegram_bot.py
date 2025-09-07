@@ -35,12 +35,12 @@ TIMEBOX_FACTOR = 0.50
 # Символы и фильтры (TURBO)
 ACTIVE_SYMBOLS = 80
 TP_MIN_PCT = 0.004              # 0.4% (внутренняя нижняя планка расчёта, не фильтр)
-TP_MAX_PCT = 0.025              # ↑ 2.5% — позволяем чуть длиннее тейк в пределах таймбокса
+TP_MAX_PCT = 0.025              # 2.5% — позволяем чуть длиннее тейк в пределах таймбокса
 MIN_PROFIT_PCT = 0.010          # 1.0% — отправляем сигнал только если итоговый TP ≥ 1%
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.30            # ↓ было 0.35 — больше «clean» сетапов проходит
+BODY_ATR_MULT = 0.30            # более мягкий фильтр тела
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.00                 # ↓ было 1.05 — не режем тихие, но валидные минуты
+VOL_MULT = 1.00                 # более мягкий фильтр объёма
 SIGNAL_COOLDOWN_SEC = 10
 
 # SMC
@@ -50,7 +50,7 @@ USE_SWEEP = True
 RR_TARGET = 1.10
 USE_5M_FILTER = True            # мягкий (против явного 5m — только pending/ретест)
 ALIGN_5M_STRICT = False
-BOS_FRESH_BARS = 12             # ↑ допускаем чуть «старее» BOS/ChoCH
+BOS_FRESH_BARS = 12
 
 # Momentum (турбо)
 MOMENTUM_N_BARS = 3
@@ -60,10 +60,9 @@ MOMENTUM_PROB_BONUS = 0.08
 
 # === «Анти-разворот» и pending ===
 PENDING_EXPIRE_BARS = 20
-RETEST_WICK_PCT = 0.15          # ↓ легче подтвердить отбой
-# Мягкие пороги для СОЗДАНИЯ pending
-PENDING_BODY_ATR_MIN = 0.15     # ↓
-PENDING_VOL_MULT_MIN = 0.85     # ↓
+RETEST_WICK_PCT = 0.15
+PENDING_BODY_ATR_MIN = 0.15
+PENDING_VOL_MULT_MIN = 0.85
 
 # VWAP
 VWAP_WINDOW = 60
@@ -97,19 +96,20 @@ PROB_THRESHOLDS_STRICT = {
     "default": 0.70
 }
 # АДАПТИВ: если долго «тишина», временно смягчаем пороги
-ADAPTIVE_SILENCE_MINUTES = 30   # ↓ было 90
-ADAPT_BODY_ATR = 0.24           # ↓
-ADAPT_VOL_MULT = 0.98           # ↓
-ADAPT_PROB_DELTA = -0.08        # ↓ сильнее даём «зелёный»
+ADAPTIVE_SILENCE_MINUTES = 30
+ADAPT_BODY_ATR = 0.24
+ADAPT_VOL_MULT = 0.98
+ADAPT_PROB_DELTA = -0.08
 
 # Диагностика
 DEBUG_SIGNALS = True
 
 # Телеметрия / веб
-HEARTBEAT_SEC = 60 * 60
+HEARTBEAT_SEC = 60 * 60         # «проверка онлайн» раз в 60 минут
 KEEPALIVE_SEC = 13 * 60
 WATCHDOG_SEC = 60
-PORT = int(os.getenv("PORT", "10000"))  # Render даёт PORT динамически
+# ВАЖНО: на Render слушаем порт, который задаёт платформа
+PORT = int(os.getenv("PORT", "10000"))
 
 # Роутинг / доступ
 PRIMARY_RECIPIENTS = [-1002870952333]
@@ -403,7 +403,6 @@ class Engine:
         self.pending: Dict[str, Dict[str, Any]] = {}  # sym -> {...}
 
     def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool) -> float:
-        # Heuristic p in [0..1]
         p = 0.45
         p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
         if vol_ok: p += 0.12
@@ -707,7 +706,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                 if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS: continue
                 cmd = text.split()[0].lower()
                 if cmd == "/help":
-                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика")
+                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика\n/healthz — проверка здоровья сервиса")
                 elif cmd == "/universe":
                     await tg.send(chat_id, "Подписаны символы:\n" + ", ".join(app.get("symbols", [])))
                 elif cmd == "/ping":
@@ -731,6 +730,11 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, "Jobs:\n"
                                      f"WS connected: {ws_alive}\n" +
                                      "\n".join(f"{k}: {'running' if v else 'stopped'}" for k,v in tasks.items()))
+                elif cmd == "/healthz":
+                    t0 = app.get("start_ts") or time.monotonic()
+                    uptime = int(time.monotonic() - t0)
+                    last_age = int((now_ts_ms() - mkt.last_ws_msg_ts)/1000.0)
+                    await tg.send(chat_id, f"ok: true\nuptime_sec: {uptime}\nlast_ws_msg_age_sec: {last_age}\nsymbols: {len(app.get('symbols', []))}")
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /help")
         except asyncio.CancelledError:
