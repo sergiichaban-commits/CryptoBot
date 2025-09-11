@@ -459,7 +459,7 @@ class MarketState:
         self.tickers: Dict[str, Dict[str, Any]] = {}
         self.kline: Dict[str, Dict[str, List[Tuple[float,float,float,float,float]]]] = {"1": {}, "5": {}, "60": {}, "240": {}}
         self.kline_maxlen = 900
-               self.liq_events: Dict[str, List[int]] = {}
+        self.liq_events: Dict[str, List[int]] = {}
         self.last_ws_msg_ts: int = now_ts_ms()
         self.cooldown: Dict[Tuple[str,str], int] = {}
         self.last_signal_sent_ts: int = 0
@@ -652,7 +652,7 @@ class Engine:
             return {"triggered": True, "entry_mode": pend["mode"], "ob_zone": (zone_lo, zone_hi)}
         return None
 
-    # ---- Сигналы на закрытии 1m
+    # ---- Сигналы на закрытии 1м
     def on_kline_closed_1m(self, sym: str) -> Optional[Dict[str, Any]]:
         rows1 = self.mkt.kline["1"].get(sym) or []
         if len(rows1) < max(ATR_PERIOD_1M+3, VOL_SMA_PERIOD+3, VWAP_WINDOW+VWAP_SLOPE_BARS+2):
