@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-SMC-lite v2.3 TURBO: ретест OB/FVG + VWAP-якорь + анти-истощение + equal highs/lows guard
-Адаптив порогов через 30 минут тишины.
-Фокус: короткие сделки (1–2 часа). Фильтр прибыли: ≥1%.
+v3.1 — Futures SCALP anti-inversion
+  • Только ретесты (OB/FVG) и отбой от «своей» плотности — без чистых моментум-входов.
+  • Строгое согласование с трендом 5m; против тренда — лишь ретест.
+  • Строже стакан: OBI ≥ +0.05 / ≤ −0.05; спред ≤ q20 и ≤ cap.
+  • Анти-перегрев: ждём микро-откат ≥0.35×ATR(1m) от импульса.
+  • Кулдаун 30 секунд на символ+направление.
 """
 
 from __future__ import annotations
@@ -15,50 +18,50 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
 
 import aiohttp
 from aiohttp import web
 
 # =========================
-# Жёстко заданные параметры
+# Параметры
 # =========================
 BYBIT_REST = "https://api.bybit.com"
 BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
-LOG_LEVEL = "INFO"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # --- РЕЖИМ КОРОТКИХ СДЕЛОК ---
 INTRADAY_SCALP = True
 TIMEBOX_MINUTES = 90
 TIMEBOX_FACTOR = 0.50
 
-# Символы и фильтры (TURBO)
+# Символы и фильтры
 ACTIVE_SYMBOLS = 80
-TP_MIN_PCT = 0.004              # 0.4% (внутренняя нижняя планка расчёта, не фильтр)
-TP_MAX_PCT = 0.025              # 2.5% — позволяем чуть длиннее тейк в пределах таймбокса
-MIN_PROFIT_PCT = 0.010          # 1.0% — отправляем сигнал только если итоговый TP ≥ 1%
+TP_MIN_PCT = 0.004              # 0.4% (минимальный тейк)
+TP_MAX_PCT = 0.025              # 2.5% потолок
+MIN_PROFIT_PCT = 0.010          # ≥1% — фильтр публикации
 ATR_PERIOD_1M = 14
-BODY_ATR_MULT = 0.30            # более мягкий фильтр тела
+BODY_ATR_MULT = 0.30
 VOL_SMA_PERIOD = 20
-VOL_MULT = 1.00                 # более мягкий фильтр объёма
-SIGNAL_COOLDOWN_SEC = 10
+VOL_MULT = 1.00
+SIGNAL_COOLDOWN_SEC = 30        # было 10 → стало 30
 
-# SMC
+# SMC / уровни / тренд
 SWING_FRAC = 2
 USE_FVG = True
 USE_SWEEP = True
 RR_TARGET = 1.10
-USE_5M_FILTER = True            # мягкий (против явного 5m — только pending/ретест)
-ALIGN_5M_STRICT = False
+USE_5M_FILTER = True
+ALIGN_5M_STRICT = True          # строгий фильтр 5m
 BOS_FRESH_BARS = 12
 
-# Momentum (турбо)
+# Momentum выключен
 MOMENTUM_N_BARS = 3
 MOMENTUM_MIN_PCT = 0.0025
 BODY_ATR_MOMO = 0.50
 MOMENTUM_PROB_BONUS = 0.08
 
-# === «Анти-разворот» и pending ===
+# Pending/Retest
 PENDING_EXPIRE_BARS = 20
 RETEST_WICK_PCT = 0.15
 PENDING_BODY_ATR_MIN = 0.15
@@ -68,53 +71,76 @@ PENDING_VOL_MULT_MIN = 0.85
 VWAP_WINDOW = 60
 VWAP_SLOPE_BARS = 10
 VWAP_SLOPE_MIN = 0.0
-VWAP_TOLERANCE = 0.002          # ±0.2%
+VWAP_TOLERANCE = 0.002
+VWAP_STRICT = True
 
-# Анти-истощение
+# Анти-истощение и «микро-откат»
 EXT_RUN_BARS = 5
 EXT_RUN_ATR_MULT = 2.2
+MIN_PULLBACK_ATR = 0.35
 
-# Equal highs/lows guard (только для «clean» входов)
+# Equal highs/lows guard
 EQL_LOOKBACK = 30
 EQL_EPS_PCT = 0.0007
-EQL_PROX_PCT = 0.0012           # ~0.12%
+EQL_PROX_PCT = 0.0012
 
-# === Фильтр по вероятности ===
+# Вероятность (оставим профиль)
 PROB_THRESHOLDS = {
     "retest-OB": 0.46,
     "retest-FVG": 0.50,
-    "clean-pass": 0.54,
-    "momo-pass": 0.56,
+    "BounceDensity": 0.56,
     "default": 0.50
 }
 USE_PROB_70_STRICT = False
 PROB_THRESHOLDS_STRICT = {
     "retest-OB": 0.66,
     "retest-FVG": 0.68,
-    "clean-pass": 0.70,
-    "momo-pass": 0.72,
+    "BounceDensity": 0.70,
     "default": 0.70
 }
-# АДАПТИВ: если долго «тишина», временно смягчаем пороги
+# АДАПТИВ
 ADAPTIVE_SILENCE_MINUTES = 30
 ADAPT_BODY_ATR = 0.24
 ADAPT_VOL_MULT = 0.98
 ADAPT_PROB_DELTA = -0.08
 
-# Диагностика
-DEBUG_SIGNALS = True
+# Стакан/плотности
+LADDER_BPS_DEFAULT = 0.0004     # 4 bps = 0.04%
+LADDER_BPS_ALT = 0.0008         # для волатильных альтов
+ORDERBOOK_DEPTH_BINS = 5        # для OBI
+WALL_PCTL = 95                  # p95 ноушнл за lookback
+WALL_LOOKBACK_SEC = 30 * 60     # 30 минут
+SPREAD_TICKS_CAP = 8            # safety cap на спред в тиках
+SPREAD_Q = 0.20                 # квантиль «узкого» спреда
+OPPOSITE_WALL_NEAR_TICKS = 8    # встречная стена — запрет входа ближе этого
+OBI_MIN = {"LONG": 0.05, "SHORT": -0.05}
 
-# Телеметрия / веб
-HEARTBEAT_SEC = 60 * 60         # «проверка онлайн» раз в 60 минут
+# Фильтр котировок (динамический)
+UNIVERSE_REFRESH_SEC = 600
+TURNOVER_MIN_USD = 150_000_000.0
+CHANGE24H_MIN_ABS = 0.01        # ≥1%
+
+# Ядро рынков, которые всегда должны быть в подписках
+CORE_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "TONUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT",
+]
+
+# Диагностика/веб
+DEBUG_SIGNALS = True
+HEARTBEAT_SEC = 60 * 60
 KEEPALIVE_SEC = 13 * 60
 WATCHDOG_SEC = 60
-# ВАЖНО: на Render слушаем порт, который задаёт платформа
 PORT = int(os.getenv("PORT", "10000"))
 
-# Роутинг / доступ
+# Роутинг
 PRIMARY_RECIPIENTS = [-1002870952333]
 ALLOWED_CHAT_IDS = [533232884, -1002870952333]
 ONLY_CHANNEL = True
+
+# Доп. флажки логики
+RETEST_ONLY = True
+MOMENTUM_ENTRIES = False
 
 # =========================
 # Утилиты
@@ -128,6 +154,16 @@ def now_ts_ms() -> int:
 def setup_logging(level: str) -> None:
     fmt = "%(asctime)s %(levelname)s %(message)s"
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt)
+
+def dedup_preserve(seq: List[str]) -> List[str]:
+    """Удаляет дубликаты, сохраняя исходный порядок."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 logger = logging.getLogger("cryptobot")
 
@@ -168,6 +204,14 @@ class BybitRest:
             data = await r.json()
         return data.get("result", {}).get("list", []) or []
 
+    async def instrument_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        url = f"{self.base}/v5/market/instruments-info?category=linear&symbol={symbol}"
+        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            r.raise_for_status()
+            data = await r.json()
+        lst = data.get("result", {}).get("list", []) or []
+        return lst[0] if lst else None
+
 # =========================
 # Bybit WebSocket
 # =========================
@@ -176,7 +220,8 @@ class BybitWS:
         self.url = url
         self.http = session
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._subs: List[str] = []
+        self._subs: Set[str] = set()
+        a = None
         self._ping_task: Optional[asyncio.Task] = None
         self.on_message: Optional[callable] = None
 
@@ -188,7 +233,7 @@ class BybitWS:
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.create_task(self._ping_loop())
         if self._subs:
-            await self.subscribe(self._subs)
+            await self.subscribe(list(self._subs))
 
     async def _ping_loop(self) -> None:
         while True:
@@ -202,14 +247,23 @@ class BybitWS:
 
     async def subscribe(self, args: List[str]) -> None:
         for a in args:
-            if a not in self._subs:
-                self._subs.append(a)
+            self._subs.add(a)
         if not self.ws or self.ws.closed:
             await self.connect()
         if not args:
             return
         await self.ws.send_json({"op": "subscribe", "args": args})
         logger.info(f"WS subscribed: {args}")
+
+    async def unsubscribe(self, args: List[str]) -> None:
+        for a in args:
+            self._subs.discard(a)
+        if not self.ws or self.ws.closed:
+            return
+        if not args:
+            return
+        await self.ws.send_json({"op": "unsubscribe", "args": args})
+        logger.info(f"WS unsubscribed: {args}")
 
     async def run(self) -> None:
         assert self.ws is not None, "call connect() first"
@@ -219,7 +273,7 @@ class BybitWS:
                     data = json.loads(msg.data)
                 except Exception:
                     continue
-                if data.get("op") in {"subscribe", "ping", "pong"} or "success" in data:
+                if data.get("op") in {"subscribe", "unsubscribe", "ping", "pong"} or "success" in data:
                     continue
                 if self.on_message:
                     try:
@@ -235,17 +289,178 @@ class BybitWS:
             await self.run()
 
 # =========================
+# OrderBook / Features
+# =========================
+class AutoLadder:
+    def __init__(self, tick: float, bps: float = LADDER_BPS_DEFAULT) -> None:
+        self.tick = max(tick, 1e-12)
+        self.bps = bps
+
+    def step(self, mid: float) -> float:
+        raw = max(self.tick, mid * self.bps)
+        steps = max(1, round(raw / self.tick))
+        return steps * self.tick
+
+class OrderBookState:
+    """Простая L2 книга с агрегированием и seq."""
+    __slots__ = ("tick", "seq", "bids", "asks", "last_mid", "last_spreads", "last_levels_ts")
+
+    def __init__(self, tick: float) -> None:
+        self.tick = max(tick, 1e-12)
+        self.seq: Optional[int] = None
+        self.bids: Dict[float, float] = {}
+        self.asks: Dict[float, float] = {}
+        self.last_mid: float = 0.0
+        self.last_spreads: List[float] = []  # для квантиля спреда
+        self.last_levels_ts: List[Tuple[int, float, float]] = []  # (ts, price, notional)
+
+    def apply_snapshot(self, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
+        self.bids = {float(p): float(s) for p, s in bids if float(s) > 0.0}
+        self.asks = {float(p): float(s) for p, s in asks if float(s) > 0.0}
+        self.seq = int(seq) if seq is not None else None
+        self._update_mid_spread()
+
+    def apply_delta(self, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
+        if seq is not None and self.seq is not None and int(seq) <= int(self.seq):
+            return
+        for p, s in bids:
+            p = float(p); s = float(s)
+            if s <= 0.0: self.bids.pop(p, None)
+            else: self.bids[p] = s
+        for p, s in asks:
+            p = float(p); s = float(s)
+            if s <= 0.0: self.asks.pop(p, None)
+            else: self.asks[p] = s
+        self.seq = int(seq) if seq is not None else self.seq
+        self._update_mid_spread()
+
+    def _update_mid_spread(self) -> None:
+        bb = max(self.bids) if self.bids else 0.0
+        ba = min(self.asks) if self.asks else 0.0
+        if bb > 0 and ba > 0 and ba >= bb:
+            self.last_mid = (bb + ba) / 2.0
+            spread = (ba - bb)
+            if spread > 0:
+                self.last_spreads.append(spread)
+                if len(self.last_spreads) > 600:
+                    self.last_spreads = self.last_spreads[-600:]
+
+    def best(self) -> Tuple[Optional[float], Optional[float]]:
+        bb = max(self.bids) if self.bids else None
+        ba = min(self.asks) if self.asks else None
+        return bb, ba
+
+class OrderBookManager:
+    def __init__(self) -> None:
+        self.books: Dict[str, OrderBookState] = {}
+        self.ticks: Dict[str, float] = {}
+        self.last_wall_levels: Dict[str, List[Tuple[int, float, float]]] = {}  # symbol -> [(ts, price, notional)]
+
+    def ensure(self, sym: str, tick: float) -> OrderBookState:
+        if sym not in self.books:
+            self.books[sym] = OrderBookState(tick)
+        self.ticks[sym] = tick
+        return self.books[sym]
+
+    def note_snapshot(self, sym: str, tick: float, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
+        ob = self.ensure(sym, tick)
+        ob.apply_snapshot(bids, asks, seq)
+
+    def note_delta(self, sym: str, tick: float, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
+        ob = self.ensure(sym, tick)
+        ob.apply_delta(bids, asks, seq)
+
+    def spread_ticks(self, sym: str) -> Optional[float]:
+        ob = self.books.get(sym)
+        if not ob: return None
+        bb, ba = ob.best()
+        if not bb or not ba: return None
+        spread = ba - bb
+        return spread / max(ob.tick, 1e-12)
+
+    def p25_spread_ticks(self, sym: str) -> Optional[float]:
+        ob = self.books.get(sym)
+        if not ob or not ob.last_spreads: return None
+        arr = sorted(ob.last_spreads[-600:])
+        idx = int(0.25 * (len(arr)-1))
+        return arr[idx] / max(ob.tick, 1e-12)
+
+    def p_quantile_spread_ticks(self, sym: str, q: float = SPREAD_Q) -> Optional[float]:
+        ob = self.books.get(sym)
+        if not ob or not ob.last_spreads: return None
+        arr = sorted(ob.last_spreads[-600:])
+        idx = int(max(0, min(len(arr)-1, q * (len(arr)-1))))
+        return arr[idx] / max(ob.tick, 1e-12)
+
+    def features(self, sym: str, ladder: AutoLadder) -> Optional[Dict[str, Any]]:
+        ob = self.books.get(sym)
+        if not ob or ob.last_mid <= 0: return None
+        step = ladder.step(ob.last_mid)
+        # агрегируем корзины bids/asks по шагу
+        def agg(book: Dict[float,float], reverse: bool) -> List[Tuple[float,float]]:
+            buckets: Dict[float, float] = {}
+            for p, s in book.items():
+                b = round(p / step) * step
+                buckets[b] = buckets.get(b, 0.0) + s * p  # считаем ноушнл
+            levels = sorted(buckets.items(), key=lambda x: x[0], reverse=reverse)
+            return levels
+
+        bids_levels = agg(ob.bids, True)
+        asks_levels = agg(ob.asks, False)
+
+        # OBI
+        b_not = sum(s for _, s in bids_levels[:ORDERBOOK_DEPTH_BINS])
+        a_not = sum(s for _, s in asks_levels[:ORDERBOOK_DEPTH_BINS])
+        denom = max(1e-9, a_not + b_not)
+        obi = (b_not - a_not) / denom
+
+        # стенки: порог по p95 от истории
+        ts_now = now_ts_ms()
+        hist = self.last_wall_levels.setdefault(sym, [])
+        for p, s in (bids_levels[:10] + asks_levels[:10]):
+            hist.append((ts_now, p, s))
+        cutoff = ts_now - WALL_LOOKBACK_SEC * 1000
+        self.last_wall_levels[sym] = [x for x in hist if x[0] >= cutoff]
+        only_vals = [x[2] for x in self.last_wall_levels[sym]]
+        wall_thr = 0.0
+        if only_vals:
+            only_vals_sorted = sorted(only_vals)
+            idx = int(len(only_vals_sorted) * WALL_PCTL / 100)
+            idx = min(max(idx, 0), len(only_vals_sorted)-1)
+            wall_thr = only_vals_sorted[idx]
+
+        walls_bid = [(p, s) for p, s in bids_levels if s >= wall_thr]
+        walls_ask = [(p, s) for p, s in asks_levels if s >= wall_thr]
+
+        bb, ba = ob.best()
+        spread_ticks_now = self.spread_ticks(sym) or 0.0
+        p25 = self.p25_spread_ticks(sym) or spread_ticks_now
+
+        return {
+            "step": float(step),
+            "obi": float(obi),
+            "walls_bid": walls_bid,
+            "walls_ask": walls_ask,
+            "best_bid": float(bb) if bb else None,
+            "best_ask": float(ba) if ba else None,
+            "spread_ticks": float(spread_ticks_now),
+            "spread_p25_ticks": float(p25),
+            "tick": float(ob.tick),
+        }
+
+# =========================
 # Рыночное состояние
 # =========================
 class MarketState:
     def __init__(self) -> None:
         self.tickers: Dict[str, Dict[str, Any]] = {}
-        self.kline: Dict[str, Dict[str, List[Tuple[float,float,float,float,float]]]] = {"1": {}, "5": {}}
-        self.kline_maxlen = 600
+        self.kline: Dict[str, Dict[str, List[Tuple[float,float,float,float,float]]]] = {"1": {}, "5": {}, "60": {}, "240": {}}
+        self.kline_maxlen = 900
         self.liq_events: Dict[str, List[int]] = {}
         self.last_ws_msg_ts: int = now_ts_ms()
         self.cooldown: Dict[Tuple[str,str], int] = {}
         self.last_signal_sent_ts: int = 0
+        self.instruments: Dict[str, Dict[str, Any]] = {}
 
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
@@ -291,27 +506,17 @@ def sma(vals: List[float], period: int) -> float:
     if len(vals) < period or period <= 0: return 0.0
     return sum(vals[-period:]) / period
 
-def ema(vals: List[float], period: int) -> float:
-    if not vals or period <= 1 or len(vals) < period: return 0.0
-    k = 2.0 / (period + 1.0)
-    e = vals[-period]
-    for x in vals[-period+1:]:
-        e = x * k + e * (1 - k)
-    return e
-
 def rolling_vwap(rows: List[Tuple[float,float,float,float,float]], window: int) -> Tuple[float, float]:
     n = len(rows)
     need = max(window, VWAP_SLOPE_BARS + 1)
-    if n < need:
-        return 0.0, 0.0
+    if n < need: return 0.0, 0.0
     tp = [(r[1] + r[2] + r[3]) / 3.0 for r in rows]
     v  = [r[4] for r in rows]
     tpw_now = sum(tp[-window+i] * v[-window+i] for i in range(window))
     vw_now  = sum(v[-window+i] for i in range(window)) or 1e-9
     vwap_now = tpw_now / vw_now
-    if n < window + VWAP_SLOPE_BARS:
-        return vwap_now, 0.0
     start = n - window - VWAP_SLOPE_BARS
+    if start < 0: return vwap_now, 0.0
     tpw_prev = sum(tp[start+i] * v[start+i] for i in range(window))
     vw_prev  = sum(v[start+i] for i in range(window)) or 1e-9
     vwap_prev = tpw_prev / vw_prev
@@ -373,55 +578,30 @@ def simple_ob(rows, side: str, body_atr_thr: float, atr_val: float) -> Optional[
             return (l2, max(o2, c2)) if side == "LONG" else (min(o2, c2), h2)
     return None
 
-def detect_equal_levels(rows: List[Tuple[float,float,float,float,float]], lookback:int, eps_pct:float, side:str) -> Optional[float]:
-    n = len(rows)
-    if n < lookback + 1: return None
-    levels = []
-    if side == "LONG":
-        highs = [rows[i][1] for i in range(n - lookback, n)]
-        highs_sorted = sorted(highs)
-        for i in range(1, len(highs_sorted)):
-            if abs(highs_sorted[i] - highs_sorted[i-1]) / max(1e-9, highs_sorted[i]) <= eps_pct:
-                levels.append((highs_sorted[i] + highs_sorted[i-1]) / 2.0)
-    else:
-        lows = [rows[i][2] for i in range(n - lookback, n)]
-        lows_sorted = sorted(lows)
-        for i in range(1, len(lows_sorted)):
-            if abs(lows_sorted[i] - lows_sorted[i-1]) / max(1e-9, lows_sorted[i]) <= eps_pct:
-                levels.append((lows_sorted[i] + lows_sorted[i-1]) / 2.0)
-    if not levels: return None
-    price = rows[-1][3]
-    levels.sort(key=lambda x: abs(x - price))
-    return levels[0]
+def expected_move_pct(entry: float, targets: List[float]) -> float:
+    if not targets: return 0.0
+    dist = max(abs(t - entry) for t in targets)
+    return dist / max(1e-9, entry)
 
 # =========================
 # Движок сигналов
 # =========================
 class Engine:
-    def __init__(self, mkt: MarketState) -> None:
+    def __init__(self, mkt: MarketState, obm: OrderBookManager) -> None:
         self.mkt = mkt
-        self.pending: Dict[str, Dict[str, Any]] = {}  # sym -> {...}
+        self.obm = obm
+        self.pending: Dict[str, Dict[str, Any]] = {}
 
-    def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool) -> float:
+    # ---- Probability profile
+    def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool, ob_bonus: float=0.0) -> float:
         p = 0.45
         p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
         if vol_ok: p += 0.12
         if liq_cnt >= 3: p += 0.05
         p += min(0.12, 0.04 * max(0, confluence-1))
-        if mom_ok: p += MOMENTUM_PROB_BONUS
+        if mom_ok and MOMENTUM_ENTRIES: p += MOMENTUM_PROB_BONUS
+        p += max(0.0, min(0.12, ob_bonus))
         return max(0.0, min(0.99, p))
-
-    def _nearest_opposite_swing_tp(self, rows, sh, sl, side: str, entry: float) -> Optional[float]:
-        if side == "LONG":
-            for i in reversed(sh):
-                ph = rows[i][1]
-                if ph > entry: return ph
-            return rows[-1][1]
-        else:
-            for i in reversed(sl):
-                pl = rows[i][2]
-                if pl < entry: return pl
-            return rows[-1][2]
 
     def _validate_rr(self, entry: float, tp: float, sl: float, side: str) -> float:
         reward = (tp - entry) if side == "LONG" else (entry - tp)
@@ -429,13 +609,7 @@ class Engine:
         if risk <= 0: return 0.0
         return reward / risk
 
-    def _extended_run(self, rows1: List[Tuple[float,float,float,float,float]], atr1: float) -> Tuple[bool,float]:
-        if len(rows1) < EXT_RUN_BARS + 1 or atr1 <= 0: return False, 0.0
-        c0 = rows1[-EXT_RUN_BARS-1][3]
-        c1 = rows1[-1][3]
-        move = abs(c1 - c0)
-        return (move >= EXT_RUN_ATR_MULT * atr1), move/atr1
-
+    # ---- Pending-зоны (OB/FVG)
     def _build_pending(self, sym:str, side:str, rows1, atr1:float, prefer_ob_first:bool=True) -> None:
         ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1) if prefer_ob_first else None
         if ob:
@@ -448,13 +622,9 @@ class Engine:
             mode = "retest-FVG"
         created_len = len(rows1)
         self.pending[sym] = {
-            "side": side,
-            "zone_lo": float(zone_lo),
-            "zone_hi": float(zone_hi),
-            "created_len": created_len,
-            "expire_len": created_len + PENDING_EXPIRE_BARS,
-            "atr": float(atr1),
-            "mode": mode,
+            "side": side, "zone_lo": float(zone_lo), "zone_hi": float(zone_hi),
+            "created_len": created_len, "expire_len": created_len + PENDING_EXPIRE_BARS,
+            "atr": float(atr1), "mode": mode,
         }
         if DEBUG_SIGNALS:
             logger.info(f"[pending:set] {sym} {side} zone=({zone_lo:.8g},{zone_hi:.8g}) exp@{created_len + PENDING_EXPIRE_BARS}")
@@ -464,14 +634,10 @@ class Engine:
         if not pend: return None
         n = len(rows1)
         if n >= pend["expire_len"]:
-            if DEBUG_SIGNALS:
-                logger.info(f"[pending:expire] {sym}")
-            self.pending.pop(sym, None)
-            return None
-        side = pend["side"]
-        zone_lo = pend["zone_lo"]; zone_hi = pend["zone_hi"]
-        o,h,l,c,v = rows1[-1]
-        rng = max(1e-9, h - l)
+            if DEBUG_SIGNALS: logger.info(f"[pending:expire] {sym}")
+            self.pending.pop(sym, None); return None
+        side = pend["side"]; zone_lo = pend["zone_lo"]; zone_hi = pend["zone_hi"]
+        o,h,l,c,v = rows1[-1]; rng = max(1e-9, h - l)
         if side == "LONG":
             touched = (l <= zone_hi and h >= zone_lo)
             rejection = (c > o) and ((o - l) / rng >= RETEST_WICK_PCT)
@@ -480,9 +646,10 @@ class Engine:
             rejection = (c < o) and ((h - o) / rng >= RETEST_WICK_PCT)
         if touched and rejection:
             self.pending.pop(sym, None)
-            return {"triggered": True, "entry_mode": pend["mode"]}
+            return {"triggered": True, "entry_mode": pend["mode"], "ob_zone": (zone_lo, zone_hi)}
         return None
 
+    # ---- Сигналы на закрытии 1м
     def on_kline_closed_1m(self, sym: str) -> Optional[Dict[str, Any]]:
         rows1 = self.mkt.kline["1"].get(sym) or []
         if len(rows1) < max(ATR_PERIOD_1M+3, VOL_SMA_PERIOD+3, VWAP_WINDOW+VWAP_SLOPE_BARS+2):
@@ -497,19 +664,18 @@ class Engine:
         v_sma = sma(vols, VOL_SMA_PERIOD)
         vol_mult_ratio = (v / v_sma) if v_sma > 0 else 0.0
 
-        # Адаптив: при тишине ≥ ADAPTIVE_SILENCE_MINUTES — мягче пороги
+        # адаптив мягких порогов при тишине
         silent_min = (now_ts_ms() - self.mkt.last_signal_sent_ts)/60000.0 if self.mkt.last_signal_sent_ts else 1e9
         cur_body_thr = ADAPT_BODY_ATR if silent_min >= ADAPTIVE_SILENCE_MINUTES else BODY_ATR_MULT
         cur_vol_mult_thr = ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT
 
-        allow_clean = (body_ratio >= cur_body_thr) and (vol_mult_ratio >= cur_vol_mult_thr)
-        allow_pending = (body_ratio >= PENDING_BODY_ATR_MIN) or (vol_mult_ratio >= PENDING_VOL_MULT_MIN)
+        # входы без ретеста отключаем
+        allow_clean = (not RETEST_ONLY) and (body_ratio >= cur_body_thr) and (vol_mult_ratio >= cur_vol_mult_thr)
 
-        # VWAP фильтр (мягкий)
-        tp_price = (rows1[-1][1] + rows1[-1][2] + rows1[-1][3]) / 3.0
+        # VWAP
+        tp_price = (h + l + c) / 3.0
         vwap_now, vwap_slope = rolling_vwap(rows1, VWAP_WINDOW)
-        if vwap_now == 0.0 and vwap_slope == 0.0:
-            return None
+        if vwap_now == 0.0 and vwap_slope == 0.0: return None
         price_rel_to_vwap = (tp_price - vwap_now) / max(1e-9, vwap_now)
 
         # 1m SMC
@@ -528,127 +694,175 @@ class Engine:
             if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): smc_hits += 1
             if USE_FVG and has_fvg(rows1, bullish=False): smc_hits += 1
 
-        # Momentum
-        mom_ok = False
-        if len(rows1) > MOMENTUM_N_BARS:
-            c_prev = rows1[-MOMENTUM_N_BARS][3]
-            ret = (c - c_prev) / max(1e-9, c_prev)
-            strong_bar = body_ratio >= BODY_ATR_MOMO
-            if abs(ret) >= MOMENTUM_MIN_PCT or strong_bar:
-                mom_ok = True
-                if smc_hits == 0:
-                    side = "LONG" if ret > 0 else "SHORT"
-
-        # Pending-триггер?
+        # Pending-триггер (OB/FVG)
         pend_sig = self._check_pending_trigger(sym, rows1)
         entry_mode = pend_sig.get("entry_mode", "retest") if (pend_sig and pend_sig.get("triggered")) else None
+        ob_zone = pend_sig.get("ob_zone") if pend_sig else None
 
-        # Контекст 5m (мягкий): против явного 5m — только ретест
-        if USE_5M_FILTER and not entry_mode:
+        # Контекст 5m — STRONG
+        if USE_5M_FILTER:
             rows5 = self.mkt.kline["5"].get(sym) or []
             if len(rows5) >= ATR_PERIOD_1M + 3:
                 SH5, SL5 = find_swings(rows5, SWING_FRAC)
                 trend5, bos5_up, bos5_dn, _, _ = bos_choch(rows5, SH5, SL5)
-                if side == "LONG" and trend5 == "DOWN" and not bos5_up:
-                    allow_clean = False
-                if side == "SHORT" and trend5 == "UP" and not bos5_dn:
-                    allow_clean = False
+                if ALIGN_5M_STRICT:
+                    if (side == "LONG" and trend5 == "DOWN" and not bos5_up):
+                        if not (entry_mode and entry_mode.startswith("retest")): 
+                            return None
+                    if (side == "SHORT" and trend5 == "UP" and not bos5_dn):
+                        if not (entry_mode and entry_mode.startswith("retest")): 
+                            return None
+                else:
+                    if side == "LONG" and trend5 == "DOWN" and not bos5_up: allow_clean = False
+                    if side == "SHORT" and trend5 == "UP" and not bos5_dn: allow_clean = False
 
-        # VWAP guard: «против склона» и по «не той» стороне VWAP — только pending
-        if side == "LONG" and (vwap_slope < VWAP_SLOPE_MIN and price_rel_to_vwap < -VWAP_TOLERANCE):
-            allow_clean = False
-        if side == "SHORT" and (vwap_slope > -VWAP_SLOPE_MIN and price_rel_to_vwap > VWAP_TOLERANCE):
-            allow_clean = False
+        # VWAP строгий: торгуем по стороне VWAP+наклон; против — только ретест
+        if VWAP_STRICT:
+            if side == "LONG" and (vwap_slope <= 0 or price_rel_to_vwap < -VWAP_TOLERANCE):
+                if not (entry_mode and entry_mode.startswith("retest")): return None
+            if side == "SHORT" and (vwap_slope >= 0 or price_rel_to_vwap >  VWAP_TOLERANCE):
+                if not (entry_mode and entry_mode.startswith("retest")): return None
 
-        # Анти-истощение: большой «перебег» — только pending
-        ext, _ = self._extended_run(rows1, atr1)
-        if ext and not entry_mode:
-            allow_clean = False
+        # Анти-истощение — только pending
+        def _extended_run(rows1m: List[Tuple[float,float,float,float,float]], atr1v: float) -> Tuple[bool,float]:
+            if len(rows1m) < EXT_RUN_BARS + 1 or atr1v <= 0: return False, 0.0
+            c0 = rows1m[-EXT_RUN_BARS-1][3]; c1 = rows1m[-1][3]
+            move = abs(c1 - c0); return (move >= EXT_RUN_ATR_MULT * atr1v), move/atr1v
+        ext, _ = _extended_run(rows1, atr1)
+        if ext and not entry_mode: 
+            return None
 
-        # Равные уровни близко — только pending (для clean)
-        if not entry_mode and allow_clean:
-            eql = detect_equal_levels(rows1, EQL_LOOKBACK, EQL_EPS_PCT, side)
-            if eql is not None:
-                dist_pct = abs(eql - c) / max(1e-9, c)
-                if dist_pct <= EQL_PROX_PCT:
-                    allow_clean = False
+        # Требуем микро-откат от последнего импульса
+        last_imp_move = abs(rows1[-1][3] - rows1[-2][3])
+        if last_imp_move / max(1e-9, atr1) >= 0.8:
+            recent_low  = min(x[2] for x in rows1[-5:])
+            recent_high = max(x[1] for x in rows1[-5:])
+            pull_ok = ((recent_high - c) >= MIN_PULLBACK_ATR*atr1) if side=="LONG" else ((c - recent_low) >= MIN_PULLBACK_ATR*atr1)
+            if not pull_ok and not entry_mode:
+                return None
 
-        # Если ещё не в pending и есть смысл — поставим pending на мягких порогах
-        if not entry_mode and (smc_hits >= 1 or mom_ok):
-            if allow_clean:
-                pass  # clean
-            elif allow_pending:
+        # Если не было pending — поставим pending, но вход без ретеста запрещён
+        allow_pending = (body_ratio >= PENDING_BODY_ATR_MIN) or (vol_mult_ratio >= PENDING_VOL_MULT_MIN)
+        if not entry_mode and (smc_hits >= 1):
+            if allow_pending:
                 self._build_pending(sym, side, rows1, atr1)
                 return None
             else:
                 return None
 
-        # Если нет SMC/MOMO и не ретест — пропуск
-        if smc_hits == 0 and not mom_ok and not entry_mode:
+        # Тип входа: допускаем только ретесты и bounce от плотности
+        if not entry_mode:
+            entry_mode = "clean-pass"  # не используется, будет отфильтрован
+        allowed_modes = {"retest-OB","retest-FVG","BounceDensity"}
+        if entry_mode not in allowed_modes:
             return None
 
-        # Тип входа для профиля вероятности
-        if not entry_mode:
-            entry_mode = "clean-pass" if allow_clean else ("momo-pass" if mom_ok else "clean-pass")
+        # ==== СТАКАН ====
+        instr = self.mkt.instruments.get(sym) or {}
+        tick = float(instr.get("priceFilter", {}).get("tickSize") or instr.get("tickSize") or 0.0) or 1e-6
+        bps = LADDER_BPS_DEFAULT if (sym.startswith("BTC") or sym.startswith("ETH")) else LADDER_BPS_ALT
+        ladder = AutoLadder(tick=tick, bps=bps)
+        obf = self.obm.features(sym, ladder)
+        if not obf: return None
 
-        # --- Вероятность и пороги ---
-        liq_cnt = sum(1 for t in self.mkt.liq_events.get(sym, []) if t >= now_ts_ms() - 60_000)
-        vol_ok = (vol_mult_ratio >= cur_vol_mult_thr)
-        prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits, mom_ok)
+        # Узкий спред по q20 и cap
+        spread_ticks_now = obf["spread_ticks"]
+        spread_q = self.obm.p_quantile_spread_ticks(sym, SPREAD_Q) or spread_ticks_now
+        spread_thr = min(spread_q, SPREAD_TICKS_CAP)
+        if spread_ticks_now > spread_thr:
+            return None
+
+        # OBI обязателен и сильнее
+        obi = obf["obi"]
+        if side == "LONG" and obi < OBI_MIN["LONG"]:
+            return None
+        if side == "SHORT" and obi > OBI_MIN["SHORT"]:
+            return None
+
+        # Плотности
+        bb = obf["best_bid"]; ba = obf["best_ask"]; tick_sz = obf["tick"]
+        near_same = near_opp = None
+        if side == "LONG":
+            if obf["walls_bid"]:
+                near_same = max([p for p, s in obf["walls_bid"] if p <= c], default=None)
+            if obf["walls_ask"]:
+                near_opp = min([p for p, s in obf["walls_ask"] if p >= c], default=None)
+        else:
+            if obf["walls_ask"]:
+                near_same = min([p for p, s in obf["walls_ask"] if p >= c], default=None)
+            if obf["walls_bid"]:
+                near_opp = max([p for p, s in obf["walls_bid"] if p <= c], default=None)
+
+        if near_opp is not None:
+            dist_ticks_opp = abs(near_opp - c) / tick_sz
+            if dist_ticks_opp <= OPPOSITE_WALL_NEAR_TICKS:
+                return None
+
+        # Бонус от "своей" стены
+        entry_mode_density = None
+        if near_same is not None:
+            dist_ticks_same = abs(c - near_same) / tick_sz
+            if 2 <= dist_ticks_same <= 6:
+                entry_mode_density = "BounceDensity"
+
+        # Вероятность/порог (без ликвидаций и без моментума)
+        liq_cnt = 0
+        vol_ok = (vol_mult_ratio >= (ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT))
+        entry_mode_final = entry_mode_density or entry_mode
+        ob_bonus = 0.06 if entry_mode_density else 0.0
+        prob = self._probability(body_ratio, vol_ok, liq_cnt, smc_hits + (1 if entry_mode_density else 0), False, ob_bonus=ob_bonus)
 
         base_profile = PROB_THRESHOLDS_STRICT if USE_PROB_70_STRICT else PROB_THRESHOLDS
-        thr = base_profile.get(entry_mode, base_profile.get("default", 0.5))
+        thr = base_profile.get(entry_mode_final, base_profile.get("default", 0.5))
         if silent_min >= ADAPTIVE_SILENCE_MINUTES:
             thr = max(0.40, thr + ADAPT_PROB_DELTA)
-
         if prob < thr:
             if DEBUG_SIGNALS and (prob >= thr - 0.06):
-                logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{thr:.2f})"
-                            f" entry_mode={entry_mode} bodyATR={body_ratio:.2f} vol×SMA={vol_mult_ratio:.2f}"
-                            f" smc={smc_hits} mom={mom_ok}")
+                logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{thr:.2f}) entry={entry_mode_final} bodyATR={body_ratio:.2f} OBI={obi:.2f} spreadTicks={spread_ticks_now:.1f}/{spread_thr:.1f}")
             return None
 
-        # --- Постановка целей/стопов ---
+        # --- Постановка целей/стопов
         entry = c
-        SH1, SL1 = find_swings(rows1, SWING_FRAC)  # пересчёт
-        tp_struct = self._nearest_opposite_swing_tp(rows1, SH1, SL1, side, entry)
-        tp_pct_struct = abs(tp_struct - entry) / entry if tp_struct else 0.0
+        if side == "LONG":
+            if entry_mode_final == "BounceDensity" and near_same:
+                sl = min(near_same - 0.25*atr1, rows1[-1][2] - 0.20*atr1)
+            else:
+                sl = (ob_zone[0] - 0.05 * atr1) if ob_zone else (rows1[-1][2] - 0.20 * atr1)
+        else:
+            if entry_mode_final == "BounceDensity" and near_same:
+                sl = max(near_same + 0.25*atr1, rows1[-1][1] + 0.20*atr1)
+            else:
+                sl = (ob_zone[1] + 0.05 * atr1) if ob_zone else (rows1[-1][1] + 0.20 * atr1)
+
+        # Структурный TP + таймбокс/ATR, без форсирования
+        SH1, SL1 = find_swings(rows1, SWING_FRAC)
+        if side == "LONG":
+            tp_struct = None
+            for i in reversed(SH1):
+                ph = rows1[i][1]
+                if ph > entry: tp_struct = ph; break
+        else:
+            tp_struct = None
+            for i in reversed(SL1):
+                pl = rows1[i][2]
+                if pl < entry: tp_struct = pl; break
+
+        tp_pct_struct = abs(tp_struct - entry)/entry if tp_struct else 0.0
         atr_pct_1m = atr1 / max(1e-9, entry)
         tp_pct_timebox = atr_pct_1m * TIMEBOX_MINUTES * TIMEBOX_FACTOR
-        tp_pct_atr = max(TP_MIN_PCT, 0.6 * atr1 / max(1e-9, entry))
+        tp_pct_atr = max(TP_MIN_PCT, 0.5 * atr1 / max(1e-9, entry))
         tp_pct = max(tp_pct_atr, min(tp_pct_struct if tp_pct_struct > 0 else TP_MAX_PCT, tp_pct_timebox))
         tp_pct = max(TP_MIN_PCT, min(TP_MAX_PCT, tp_pct))
-
-        if side == "LONG":
-            ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
-            sl = (ob[0] - 0.05 * atr1) if ob else (rows1[-1][2] - 0.20 * atr1)
-            tp = entry * (1.0 + tp_pct)
-        else:
-            ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1)
-            sl = (ob[1] + 0.05 * atr1) if ob else (rows1[-1][1] + 0.20 * atr1)
-            tp = entry * (1.0 - tp_pct)
+        tp = entry * (1.0 + tp_pct) if side == "LONG" else entry * (1.0 - tp_pct)
 
         rr = self._validate_rr(entry, tp, sl, side)
         if rr < RR_TARGET:
-            if side == "LONG":
-                tp = entry * (1.0 + min(TP_MAX_PCT, tp_pct_timebox))
-            else:
-                tp = entry * (1.0 - min(TP_MAX_PCT, tp_pct_timebox))
-            rr = self._validate_rr(entry, tp, sl, side)
-            if rr < RR_TARGET:
-                if DEBUG_SIGNALS:
-                    logger.info(f"[signal:reject] {sym} side={side} rr={rr:.2f} (<{RR_TARGET:.2f})"
-                                f" tp_pct={tp_pct:.3f} timebox={tp_pct_timebox:.3f} entry_mode={entry_mode}")
-                return None
-
-        # Финальный фильтр по прибыли
-        tp_pct_final = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
-        if tp_pct_final < MIN_PROFIT_PCT:
-            if DEBUG_SIGNALS:
-                logger.info(f"[signal:reject] {sym} side={side} tp_pct={tp_pct_final:.3f} (<{MIN_PROFIT_PCT:.3f})")
             return None
 
-        # антиспам
+        tp_pct_final = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
+        if tp_pct_final < MIN_PROFIT_PCT:
+            return None
+
         key = (sym, side)
         last_ts = self.mkt.cooldown.get(key, 0)
         if now_ts_ms() - last_ts < SIGNAL_COOLDOWN_SEC * 1000:
@@ -659,8 +873,11 @@ class Engine:
             "symbol": sym, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl),
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
             "liq_cnt": int(liq_cnt), "rr": float(rr),
-            "confluence": int(max(smc_hits, 1) + (1 if mom_ok else 0)),
-            "entry_mode": entry_mode,
+            "confluence": int(max(smc_hits, 1) + (1 if entry_mode_density else 0)),
+            "entry_mode": entry_mode_final,
+            "tags": [],
+            "obi": float(obi),
+            "spread_ticks": float(spread_ticks_now),
         }
 
 # =========================
@@ -673,15 +890,17 @@ def format_signal(sig: Dict[str, Any]) -> str:
     body_ratio = sig.get("body_ratio", 0.0); rr = sig.get("rr", 0.0); con = sig.get("confluence", 0)
     entry_mode = sig.get("entry_mode", "n/a")
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
+    tags = " ".join(sig.get("tags", []))
+    add = f" | OBI={sig.get('obi', 0.0):.2f} | spreadTicks={sig.get('spread_ticks', 0.0):.1f}"
     lines = [
-        f"⚡️ <b>Сигнал по {sym}</b>",
+        f"⚡️ <b>Сигнал по {sym}</b> {tags}",
         f"Направление: <b>{'LONG' if side=='LONG' else 'SHORT'}</b>",
         f"Вход: <b>{entry_mode}</b> • Горизонт: ~<b>{TIMEBOX_MINUTES} мин</b>",
         f"Текущая цена: <b>{entry:g}</b>",
         f"Тейк: <b>{tp:g}</b> ({pct(tp_pct)})",
         f"Стоп: <b>{sl:g}</b>  •  RR ≈ <b>1:{rr:.2f}</b>",
-        f"Вероятность: <b>{pct(prob)}</b>  •  Конфлюэнс: <b>{con}</b>",
-        f"Фильтры: TP≥{pct(MIN_PROFIT_PCT)}; профиль вероятности={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}",
+        f"Вероятность: <b>{pct(prob)}</b>  •  Конфлюэнс: <b>{con}</b>{add}",
+        f"Фильтры: TP≥{pct(MIN_PROFIT_PCT)}; профиль={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}",
         f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
@@ -714,7 +933,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
-                    mode = 'SCALP TURBO (retest+VWAP)'
+                    mode = 'SCALP RETEST+DENSITY'
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\n"
                                            f"Mode: {mode}\nProb profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}\n"
                                            f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}")
@@ -726,7 +945,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
                     tasks = {k: (not app[k].done()) if app.get(k) else False for k in
-                             ["ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"]}
+                             ["ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task","universe_task"]}
                     await tg.send(chat_id, "Jobs:\n"
                                      f"WS connected: {ws_alive}\n" +
                                      "\n".join(f"{k}: {'running' if v else 'stopped'}" for k,v in tasks.items()))
@@ -784,11 +1003,62 @@ async def watchdog_loop(app: web.Application) -> None:
         except Exception as e:
             logger.warning(f"watchdog error: {e}")
 
+async def universe_refresh_loop(app: web.Application) -> None:
+    """Динамический фильтр котировок (оборот/изменение) + (де)подписка без рестарта."""
+    rest: BybitRest = app["rest"]; ws: BybitWS = app["ws"]
+    mkt: MarketState = app["mkt"]
+    while True:
+        try:
+            await asyncio.sleep(UNIVERSE_REFRESH_SEC)
+            tickers = await rest.tickers_linear()
+            cands: List[Tuple[str, float]] = []
+            for t in tickers:
+                sym = t.get("symbol") or ""
+                if not sym.endswith("USDT"): continue
+                try:
+                    turn = float(t.get("turnover24h") or 0.0)
+                    chg = float(t.get("price24hPcnt") or 0.0)
+                except Exception:
+                    turn, chg = 0.0, 0.0
+                if turn >= TURNOVER_MIN_USD and abs(chg) >= CHANGE24H_MIN_ABS:
+                    cands.append((sym, turn))
+            cands.sort(key=lambda x: x[1], reverse=True)
+            symbols_new: List[str] = dedup_preserve(CORE_SYMBOLS + [s for s,_ in cands])[:ACTIVE_SYMBOLS]
+            symbols_old: List[str] = app.get("symbols", [])
+            if not symbols_new:
+                symbols_new = symbols_old or CORE_SYMBOLS[:ACTIVE_SYMBOLS]
+            add = sorted(set(symbols_new) - set(symbols_old))
+            rem = sorted(set(symbols_old) - set(symbols_new))
+            if add or rem:
+                if rem:
+                    args = []
+                    for s in rem:
+                        args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
+                    await ws.unsubscribe(args)
+                if add:
+                    args = []
+                    for s in add:
+                        args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
+                    await ws.subscribe(args)
+                    for s in add:
+                        with contextlib.suppress(Exception):
+                            info = await rest.instrument_info(s)
+                            if info:
+                                pf = info.get("priceFilter") or {}
+                                tick_sz = float(pf.get("tickSize") or info.get("tickSize") or 0.0) or 1e-6
+                                mkt.instruments[s] = {"priceFilter": {"tickSize": tick_sz}}
+                app["symbols"] = symbols_new
+                logger.info(f"[universe] updated; +{len(add)} / -{len(rem)} | total={len(symbols_new)}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"universe_refresh_loop error: {e}")
+
 # =========================
 # WS handler
 # =========================
 async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
-    mkt: MarketState = app["mkt"]; tg: Tg = app["tg"]; eng: Engine = app["engine"]
+    mkt: MarketState = app["mkt"]; tg: Tg = app["tg"]; eng: Engine = app["engine"]; obm: OrderBookManager = app["obm"]
 
     topic = data.get("topic") or ""
     if topic.startswith("tickers."):
@@ -817,6 +1087,18 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             mkt.note_kline("5", sym, payload)
 
+    elif topic.startswith("kline.60."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("60", sym, payload)
+
+    elif topic.startswith("kline.240."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("240", sym, payload)
+
     elif topic.startswith("liquidation."):
         arr = data.get("data") or []
         for liq in arr:
@@ -824,6 +1106,36 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = (liq.get("s") or liq.get("symbol"))
             ts = int(liq.get("T") or data.get("ts") or now_ts_ms())
             if sym: mkt.note_liq(sym, ts)
+
+    elif topic.startswith("orderbook.50."):
+        d = data.get("data") or {}
+        if not isinstance(d, dict):
+            return
+        sym = (d.get("s") or d.get("symbol") or topic.split(".")[-1])
+        typ = (d.get("type") or data.get("type") or "").lower()
+        bids = d.get("b") or d.get("bids") or []
+        asks = d.get("a") or d.get("asks") or []
+        seq = d.get("u") or d.get("seq") or d.get("update") or None
+        def _to_pairs(arr: Iterable[List[str]]) -> List[Tuple[float,float]]:
+            out: List[Tuple[float,float]] = []
+            for it in arr:
+                if not it: continue
+                try:
+                    if isinstance(it, dict):
+                        p = float(it.get("price") or it.get("p")); s = float(it.get("size") or it.get("s"))
+                    else:
+                        p = float(it[0]); s = float(it[1])
+                except Exception:
+                    continue
+                out.append((p, s))
+            return out
+        bids = _to_pairs(bids); asks = _to_pairs(asks)
+        instr = mkt.instruments.get(sym) or {}
+        tick = float(instr.get("priceFilter", {}).get("tickSize") or instr.get("tickSize") or 0.0) or 1e-6
+        if typ == "snapshot":
+            obm.note_snapshot(sym, tick, bids, asks, seq)
+        else:
+            obm.note_delta(sym, tick, bids, asks, seq)
 
 # =========================
 # Web-приложение
@@ -854,24 +1166,41 @@ async def on_startup(app: web.Application) -> None:
     app["tg"] = Tg(token, http)
     app["public_url"] = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
-    rest = BybitRest(BYBIT_REST, http)
+    rest = BybitRest(BYBIT_REST, http); app["rest"] = rest
     tickers = await rest.tickers_linear()
+
+    # Фильтр котировок (оборот≥150M и |change|≥1%) + whitelist CORE_SYMBOLS
     cands: List[Tuple[str, float]] = []
     for t in tickers:
-        sym = t.get("symbol")
+        sym = t.get("symbol") or ""
+        if not sym.endswith("USDT"): 
+            continue
         try:
             turn = float(t.get("turnover24h") or 0.0)
+            chg = float(t.get("price24hPcnt") or 0.0)
         except Exception:
-            turn = 0.0
-        if sym and sym.endswith("USDT"):
+            continue
+        if turn >= TURNOVER_MIN_USD and abs(chg) >= CHANGE24H_MIN_ABS:
             cands.append((sym, turn))
     cands.sort(key=lambda x: x[1], reverse=True)
-    symbols = [s for s,_ in cands[:ACTIVE_SYMBOLS]] or ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT","TONUSDT","ADAUSDT","LINKUSDT","AVAXUSDT"][:ACTIVE_SYMBOLS]
+
+    symbols = dedup_preserve(CORE_SYMBOLS + [s for s,_ in cands])[:ACTIVE_SYMBOLS]
+    if not symbols:
+        symbols = CORE_SYMBOLS[:ACTIVE_SYMBOLS]
     app["symbols"] = symbols
     logger.info(f"symbols: {symbols}")
 
     mkt = MarketState(); app["mkt"] = mkt
-    app["engine"] = Engine(mkt)
+    for s in symbols:
+        with contextlib.suppress(Exception):
+            info = await rest.instrument_info(s)
+            if info:
+                pf = info.get("priceFilter") or {}
+                tick_sz = float(pf.get("tickSize") or info.get("tickSize") or 0.0) or 1e-6
+                mkt.instruments[s] = {"priceFilter": {"tickSize": tick_sz}}
+
+    obm = OrderBookManager(); app["obm"] = obm
+    app["engine"] = Engine(mkt, obm)
 
     ws = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http); app["ws"] = ws
     async def _on_msg(msg: Dict[str, Any]) -> None: await ws_on_message(app, msg)
@@ -880,7 +1209,7 @@ async def on_startup(app: web.Application) -> None:
 
     args: List[str] = []
     for s in symbols:
-        args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"liquidation.{s}"]
+        args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
     await ws.subscribe(args)
 
     # фоновые задачи
@@ -889,9 +1218,10 @@ async def on_startup(app: web.Application) -> None:
     app["hb_task"] = asyncio.create_task(heartbeat_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
     app["tg_updates_task"] = asyncio.create_task(tg_updates_loop(app))
+    app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
 
 async def on_cleanup(app: web.Application) -> None:
-    for key in ("ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task"):
+    for key in ("ws_task","keepalive_task","hb_task","watchdog_task","tg_updates_task","universe_task"):
         t = app.get(key)
         if t:
             t.cancel()
@@ -920,7 +1250,7 @@ def main() -> None:
         f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | rr≥{RR_TARGET:.2f} | "
         f"min_tp_filter=≥{MIN_PROFIT_PCT:.1%} | "
         f"prob_profile={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'} | "
-        f"mode=SCALP TURBO (retest+VWAP)"
+        f"mode=SCALP RETEST+DENSITY"
     )
     app = make_app()
     web.run_app(app, host="0.0.0.0", port=PORT)
@@ -931,4 +1261,3 @@ if __name__ == "__main__":
     except Exception:
         logging.exception("FATAL: app crashed on startup")
         raise
-
