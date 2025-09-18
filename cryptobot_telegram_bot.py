@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-v3.1 — Futures SCALP anti-inversion
+v3.3 — Futures SCALP anti-inversion (safe loosen) + Wider USDT Universe
   • Только ретесты (OB/FVG) и отбой от «своей» плотности — без чистых моментум-входов.
   • Строгое согласование с трендом 5m; против тренда — лишь ретест.
-  • Строже стакан: OBI ≥ +0.05 / ≤ −0.05; спред ≤ q20 и ≤ cap.
-  • Анти-перегрев: ждём микро-откат ≥0.35×ATR(1m) от импульса.
-  • Кулдаун 30 секунд на символ+направление.
+  • Стакан (ослаблено безопасно): OBI ≥ +0.04 / ≤ −0.04; спред ≤ q25 и ≤ cap.
+  • Анти-перегрев: ждём микро-откат ≥0.30×ATR(1m).
+  • Кулдаун 20 секунд на символ+направление.
+  • Универс: ТОЛЬКО USDT-перпетулы; оборот ≥ 75M, |24h change| ≥ 0.5%; при нехватке — дозаполнение топ-оборотом до лимита.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ ATR_PERIOD_1M = 14
 BODY_ATR_MULT = 0.30
 VOL_SMA_PERIOD = 20
 VOL_MULT = 1.00
-SIGNAL_COOLDOWN_SEC = 30        # было 10 → стало 30
+SIGNAL_COOLDOWN_SEC = 20        # было 30 → стало 20
 
 # SMC / уровни / тренд
 SWING_FRAC = 2
@@ -77,7 +78,7 @@ VWAP_STRICT = True
 # Анти-истощение и «микро-откат»
 EXT_RUN_BARS = 5
 EXT_RUN_ATR_MULT = 2.2
-MIN_PULLBACK_ATR = 0.35
+MIN_PULLBACK_ATR = 0.30        # было 0.35 → 0.30
 
 # Equal highs/lows guard
 EQL_LOOKBACK = 30
@@ -111,16 +112,16 @@ ORDERBOOK_DEPTH_BINS = 5        # для OBI
 WALL_PCTL = 95                  # p95 ноушнл за lookback
 WALL_LOOKBACK_SEC = 30 * 60     # 30 минут
 SPREAD_TICKS_CAP = 8            # safety cap на спред в тиках
-SPREAD_Q = 0.20                 # квантиль «узкого» спреда
+SPREAD_Q = 0.25                 # квантиль «узкого» спреда (ослаблено до q25)
 OPPOSITE_WALL_NEAR_TICKS = 8    # встречная стена — запрет входа ближе этого
-OBI_MIN = {"LONG": 0.05, "SHORT": -0.05}
+OBI_MIN = {"LONG": 0.04, "SHORT": -0.04}  # было 0.05/−0.05 → 0.04/−0.04
 
-# Фильтр котировок (динамический)
+# Фильтр котировок (динамический) — шире охват
 UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = 150_000_000.0
-CHANGE24H_MIN_ABS = 0.01        # ≥1%
+TURNOVER_MIN_USD = 75_000_000.0   # было 150M → 75M
+CHANGE24H_MIN_ABS = 0.005         # было 1% → 0.5%
 
-# Ядро рынков, которые всегда должны быть в подписках
+# Ядро рынков, которые всегда должны быть в подписках (USDT)
 CORE_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "TONUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT",
@@ -765,14 +766,14 @@ class Engine:
         obf = self.obm.features(sym, ladder)
         if not obf: return None
 
-        # Узкий спред по q20 и cap
+        # Узкий спред по q25 и cap
         spread_ticks_now = obf["spread_ticks"]
         spread_q = self.obm.p_quantile_spread_ticks(sym, SPREAD_Q) or spread_ticks_now
         spread_thr = min(spread_q, SPREAD_TICKS_CAP)
         if spread_ticks_now > spread_thr:
             return None
 
-        # OBI обязателен и сильнее
+        # OBI обязателен (ослаблено до 0.04)
         obi = obf["obi"]
         if side == "LONG" and obi < OBI_MIN["LONG"]:
             return None
@@ -933,7 +934,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
-                    mode = 'SCALP RETEST+DENSITY'
+                    mode = 'SCALP RETEST+DENSITY (safe loosen)'
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\n"
                                            f"Mode: {mode}\nProb profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}\n"
                                            f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}")
@@ -1004,29 +1005,42 @@ async def watchdog_loop(app: web.Application) -> None:
             logger.warning(f"watchdog error: {e}")
 
 async def universe_refresh_loop(app: web.Application) -> None:
-    """Динамический фильтр котировок (оборот/изменение) + (де)подписка без рестарта."""
+    """Динамический фильтр котировок (USDT; оборот/изменение) + (де)подписка без рестарта; дозаполнение по обороту."""
     rest: BybitRest = app["rest"]; ws: BybitWS = app["ws"]
     mkt: MarketState = app["mkt"]
     while True:
         try:
             await asyncio.sleep(UNIVERSE_REFRESH_SEC)
             tickers = await rest.tickers_linear()
-            cands: List[Tuple[str, float]] = []
+
+            primary: List[Tuple[str, float]] = []   # оборот≥thr & |chg|≥thr
+            fallback: List[Tuple[str, float]] = []  # оборот≥thr (без порога изменения)
+
             for t in tickers:
                 sym = t.get("symbol") or ""
-                if not sym.endswith("USDT"): continue
+                if not sym.endswith("USDT"):
+                    continue
                 try:
                     turn = float(t.get("turnover24h") or 0.0)
-                    chg = float(t.get("price24hPcnt") or 0.0)
+                    chg  = float(t.get("price24hPcnt") or 0.0)
                 except Exception:
-                    turn, chg = 0.0, 0.0
-                if turn >= TURNOVER_MIN_USD and abs(chg) >= CHANGE24H_MIN_ABS:
-                    cands.append((sym, turn))
-            cands.sort(key=lambda x: x[1], reverse=True)
-            symbols_new: List[str] = dedup_preserve(CORE_SYMBOLS + [s for s,_ in cands])[:ACTIVE_SYMBOLS]
+                    continue
+                if turn >= TURNOVER_MIN_USD:
+                    fallback.append((sym, turn))
+                    if abs(chg) >= CHANGE24H_MIN_ABS:
+                        primary.append((sym, turn))
+
+            primary.sort(key=lambda x: x[1], reverse=True)
+            fallback.sort(key=lambda x: x[1], reverse=True)
+
+            symbols_new: List[str] = dedup_preserve(
+                CORE_SYMBOLS + [s for s,_ in primary] + [s for s,_ in fallback]
+            )[:ACTIVE_SYMBOLS]
+
             symbols_old: List[str] = app.get("symbols", [])
             if not symbols_new:
                 symbols_new = symbols_old or CORE_SYMBOLS[:ACTIVE_SYMBOLS]
+
             add = sorted(set(symbols_new) - set(symbols_old))
             rem = sorted(set(symbols_old) - set(symbols_new))
             if add or rem:
@@ -1169,22 +1183,29 @@ async def on_startup(app: web.Application) -> None:
     rest = BybitRest(BYBIT_REST, http); app["rest"] = rest
     tickers = await rest.tickers_linear()
 
-    # Фильтр котировок (оборот≥150M и |change|≥1%) + whitelist CORE_SYMBOLS
-    cands: List[Tuple[str, float]] = []
+    # Универс: ТОЛЬКО USDT; primary = оборот≥thr & |chg|≥thr; fallback = оборот≥thr; fill-to-target
+    primary: List[Tuple[str, float]] = []
+    fallback: List[Tuple[str, float]] = []
     for t in tickers:
         sym = t.get("symbol") or ""
-        if not sym.endswith("USDT"): 
+        if not sym.endswith("USDT"):
             continue
         try:
             turn = float(t.get("turnover24h") or 0.0)
-            chg = float(t.get("price24hPcnt") or 0.0)
+            chg  = float(t.get("price24hPcnt") or 0.0)
         except Exception:
             continue
-        if turn >= TURNOVER_MIN_USD and abs(chg) >= CHANGE24H_MIN_ABS:
-            cands.append((sym, turn))
-    cands.sort(key=lambda x: x[1], reverse=True)
+        if turn >= TURNOVER_MIN_USD:
+            fallback.append((sym, turn))
+            if abs(chg) >= CHANGE24H_MIN_ABS:
+                primary.append((sym, turn))
 
-    symbols = dedup_preserve(CORE_SYMBOLS + [s for s,_ in cands])[:ACTIVE_SYMBOLS]
+    primary.sort(key=lambda x: x[1], reverse=True)
+    fallback.sort(key=lambda x: x[1], reverse=True)
+
+    symbols = dedup_preserve(
+        CORE_SYMBOLS + [s for s,_ in primary] + [s for s,_ in fallback]
+    )[:ACTIVE_SYMBOLS]
     if not symbols:
         symbols = CORE_SYMBOLS[:ACTIVE_SYMBOLS]
     app["symbols"] = symbols
@@ -1250,7 +1271,7 @@ def main() -> None:
         f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | rr≥{RR_TARGET:.2f} | "
         f"min_tp_filter=≥{MIN_PROFIT_PCT:.1%} | "
         f"prob_profile={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'} | "
-        f"mode=SCALP RETEST+DENSITY"
+        f"mode=SCALP RETEST+DENSITY (safe loosen) | universe=USDT only (≥75M turn, ≥0.5% chg; fill-to-target)"
     )
     app = make_app()
     web.run_app(app, host="0.0.0.0", port=PORT)
