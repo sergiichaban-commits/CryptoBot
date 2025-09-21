@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-v3.3 — Futures SCALP anti-inversion (safe loosen) + Wider USDT Universe
-  • Только ретесты (OB/FVG) и отбой от «своей» плотности — без чистых моментум-входов.
-  • Строгое согласование с трендом 5m; против тренда — лишь ретест.
-  • Стакан (ослаблено безопасно): OBI ≥ +0.04 / ≤ −0.04; спред ≤ q25 и ≤ cap.
-  • Анти-перегрев: ждём микро-откат ≥0.30×ATR(1m).
-  • Кулдаун 20 секунд на символ+направление.
-  • Универс: ТОЛЬКО USDT-перпетулы; оборот ≥ 75M, |24h change| ≥ 0.5%; при нехватке — дозаполнение топ-оборотом до лимита.
+v3.4 — Hard-watchdog + no-liquidations mention + richer status
+  • Жёсткий сторожок: os._exit(3), если WS залип > STALL_EXIT_SEC.
+  • Формат сообщений: убрано упоминание ликвидаций.
+  • /status и /diag показывают silent minutes и stall-risk.
+  • Остальная логика (ретесты OB/FVG + bounce от плотностей, строгий 5m/VWAP) без изменения.
 """
 
 from __future__ import annotations
@@ -38,14 +36,14 @@ TIMEBOX_FACTOR = 0.50
 
 # Символы и фильтры
 ACTIVE_SYMBOLS = 80
-TP_MIN_PCT = 0.004              # 0.4% (минимальный тейк)
-TP_MAX_PCT = 0.025              # 2.5% потолок
+TP_MIN_PCT = 0.004              # 0.4%
+TP_MAX_PCT = 0.025              # 2.5%
 MIN_PROFIT_PCT = 0.010          # ≥1% — фильтр публикации
 ATR_PERIOD_1M = 14
 BODY_ATR_MULT = 0.30
 VOL_SMA_PERIOD = 20
 VOL_MULT = 1.00
-SIGNAL_COOLDOWN_SEC = 20        # было 30 → стало 20
+SIGNAL_COOLDOWN_SEC = 20
 
 # SMC / уровни / тренд
 SWING_FRAC = 2
@@ -53,7 +51,7 @@ USE_FVG = True
 USE_SWEEP = True
 RR_TARGET = 1.10
 USE_5M_FILTER = True
-ALIGN_5M_STRICT = True          # строгий фильтр 5m
+ALIGN_5M_STRICT = True
 BOS_FRESH_BARS = 12
 
 # Momentum выключен
@@ -78,7 +76,7 @@ VWAP_STRICT = True
 # Анти-истощение и «микро-откат»
 EXT_RUN_BARS = 5
 EXT_RUN_ATR_MULT = 2.2
-MIN_PULLBACK_ATR = 0.30        # было 0.35 → 0.30
+MIN_PULLBACK_ATR = 0.30
 
 # Equal highs/lows guard
 EQL_LOOKBACK = 30
@@ -106,22 +104,22 @@ ADAPT_VOL_MULT = 0.98
 ADAPT_PROB_DELTA = -0.08
 
 # Стакан/плотности
-LADDER_BPS_DEFAULT = 0.0004     # 4 bps = 0.04%
-LADDER_BPS_ALT = 0.0008         # для волатильных альтов
-ORDERBOOK_DEPTH_BINS = 5        # для OBI
-WALL_PCTL = 95                  # p95 ноушнл за lookback
-WALL_LOOKBACK_SEC = 30 * 60     # 30 минут
-SPREAD_TICKS_CAP = 8            # safety cap на спред в тиках
-SPREAD_Q = 0.25                 # квантиль «узкого» спреда (ослаблено до q25)
-OPPOSITE_WALL_NEAR_TICKS = 8    # встречная стена — запрет входа ближе этого
-OBI_MIN = {"LONG": 0.04, "SHORT": -0.04}  # было 0.05/−0.05 → 0.04/−0.04
+LADDER_BPS_DEFAULT = 0.0004
+LADDER_BPS_ALT = 0.0008
+ORDERBOOK_DEPTH_BINS = 5
+WALL_PCTL = 95
+WALL_LOOKBACK_SEC = 30 * 60
+SPREAD_TICKS_CAP = 8
+SPREAD_Q = 0.25
+OPPOSITE_WALL_NEAR_TICKS = 8
+OBI_MIN = {"LONG": 0.04, "SHORT": -0.04}
 
 # Фильтр котировок (динамический) — шире охват
 UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = 75_000_000.0   # было 150M → 75M
-CHANGE24H_MIN_ABS = 0.005         # было 1% → 0.5%
+TURNOVER_MIN_USD = 75_000_000.0
+CHANGE24H_MIN_ABS = 0.005
 
-# Ядро рынков, которые всегда должны быть в подписках (USDT)
+# Ядро рынков (USDT)
 CORE_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "TONUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT",
@@ -131,7 +129,11 @@ CORE_SYMBOLS = [
 DEBUG_SIGNALS = True
 HEARTBEAT_SEC = 60 * 60
 KEEPALIVE_SEC = 13 * 60
+
+# ---- Новый жёсткий сторожок
 WATCHDOG_SEC = 60
+STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "420"))  # 7 минут по умолчанию
+
 PORT = int(os.getenv("PORT", "10000"))
 
 # Роутинг
@@ -154,10 +156,9 @@ def now_ts_ms() -> int:
 
 def setup_logging(level: str) -> None:
     fmt = "%(asctime)s %(levelname)s %(message)s"
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt)
+    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt, force=True)
 
 def dedup_preserve(seq: List[str]) -> List[str]:
-    """Удаляет дубликаты, сохраняя исходный порядок."""
     seen: Set[str] = set()
     out: List[str] = []
     for x in seq:
@@ -222,7 +223,6 @@ class BybitWS:
         self.http = session
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._subs: Set[str] = set()
-        a = None
         self._ping_task: Optional[asyncio.Task] = None
         self.on_message: Optional[callable] = None
 
@@ -303,7 +303,6 @@ class AutoLadder:
         return steps * self.tick
 
 class OrderBookState:
-    """Простая L2 книга с агрегированием и seq."""
     __slots__ = ("tick", "seq", "bids", "asks", "last_mid", "last_spreads", "last_levels_ts")
 
     def __init__(self, tick: float) -> None:
@@ -312,8 +311,8 @@ class OrderBookState:
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         self.last_mid: float = 0.0
-        self.last_spreads: List[float] = []  # для квантиля спреда
-        self.last_levels_ts: List[Tuple[int, float, float]] = []  # (ts, price, notional)
+        self.last_spreads: List[float] = []
+        self.last_levels_ts: List[Tuple[int, float, float]] = []
 
     def apply_snapshot(self, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
         self.bids = {float(p): float(s) for p, s in bids if float(s) > 0.0}
@@ -355,7 +354,7 @@ class OrderBookManager:
     def __init__(self) -> None:
         self.books: Dict[str, OrderBookState] = {}
         self.ticks: Dict[str, float] = {}
-        self.last_wall_levels: Dict[str, List[Tuple[int, float, float]]] = {}  # symbol -> [(ts, price, notional)]
+        self.last_wall_levels: Dict[str, List[Tuple[int, float, float]]] = {}
 
     def ensure(self, sym: str, tick: float) -> OrderBookState:
         if sym not in self.books:
@@ -397,25 +396,23 @@ class OrderBookManager:
         ob = self.books.get(sym)
         if not ob or ob.last_mid <= 0: return None
         step = ladder.step(ob.last_mid)
-        # агрегируем корзины bids/asks по шагу
+
         def agg(book: Dict[float,float], reverse: bool) -> List[Tuple[float,float]]:
             buckets: Dict[float, float] = {}
             for p, s in book.items():
                 b = round(p / step) * step
-                buckets[b] = buckets.get(b, 0.0) + s * p  # считаем ноушнл
+                buckets[b] = buckets.get(b, 0.0) + s * p
             levels = sorted(buckets.items(), key=lambda x: x[0], reverse=reverse)
             return levels
 
         bids_levels = agg(ob.bids, True)
         asks_levels = agg(ob.asks, False)
 
-        # OBI
         b_not = sum(s for _, s in bids_levels[:ORDERBOOK_DEPTH_BINS])
         a_not = sum(s for _, s in asks_levels[:ORDERBOOK_DEPTH_BINS])
         denom = max(1e-9, a_not + b_not)
         obi = (b_not - a_not) / denom
 
-        # стенки: порог по p95 от истории
         ts_now = now_ts_ms()
         hist = self.last_wall_levels.setdefault(sym, [])
         for p, s in (bids_levels[:10] + asks_levels[:10]):
@@ -593,12 +590,11 @@ class Engine:
         self.obm = obm
         self.pending: Dict[str, Dict[str, Any]] = {}
 
-    # ---- Probability profile
     def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool, ob_bonus: float=0.0) -> float:
+        # Ликвидации в вероятности не используем (liq_cnt игнорируется)
         p = 0.45
         p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
         if vol_ok: p += 0.12
-        if liq_cnt >= 3: p += 0.05
         p += min(0.12, 0.04 * max(0, confluence-1))
         if mom_ok and MOMENTUM_ENTRIES: p += MOMENTUM_PROB_BONUS
         p += max(0.0, min(0.12, ob_bonus))
@@ -610,7 +606,6 @@ class Engine:
         if risk <= 0: return 0.0
         return reward / risk
 
-    # ---- Pending-зоны (OB/FVG)
     def _build_pending(self, sym:str, side:str, rows1, atr1:float, prefer_ob_first:bool=True) -> None:
         ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1) if prefer_ob_first else None
         if ob:
@@ -650,7 +645,6 @@ class Engine:
             return {"triggered": True, "entry_mode": pend["mode"], "ob_zone": (zone_lo, zone_hi)}
         return None
 
-    # ---- Сигналы на закрытии 1м
     def on_kline_closed_1m(self, sym: str) -> Optional[Dict[str, Any]]:
         rows1 = self.mkt.kline["1"].get(sym) or []
         if len(rows1) < max(ATR_PERIOD_1M+3, VOL_SMA_PERIOD+3, VWAP_WINDOW+VWAP_SLOPE_BARS+2):
@@ -665,21 +659,17 @@ class Engine:
         v_sma = sma(vols, VOL_SMA_PERIOD)
         vol_mult_ratio = (v / v_sma) if v_sma > 0 else 0.0
 
-        # адаптив мягких порогов при тишине
         silent_min = (now_ts_ms() - self.mkt.last_signal_sent_ts)/60000.0 if self.mkt.last_signal_sent_ts else 1e9
         cur_body_thr = ADAPT_BODY_ATR if silent_min >= ADAPTIVE_SILENCE_MINUTES else BODY_ATR_MULT
         cur_vol_mult_thr = ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT
 
-        # входы без ретеста отключаем
         allow_clean = (not RETEST_ONLY) and (body_ratio >= cur_body_thr) and (vol_mult_ratio >= cur_vol_mult_thr)
 
-        # VWAP
         tp_price = (h + l + c) / 3.0
         vwap_now, vwap_slope = rolling_vwap(rows1, VWAP_WINDOW)
         if vwap_now == 0.0 and vwap_slope == 0.0: return None
         price_rel_to_vwap = (tp_price - vwap_now) / max(1e-9, vwap_now)
 
-        # 1m SMC
         SH1, SL1 = find_swings(rows1, SWING_FRAC)
         _, bos_up, bos_dn, bos_up_idx, bos_dn_idx = bos_choch(rows1, SH1, SL1)
 
@@ -695,12 +685,10 @@ class Engine:
             if USE_SWEEP and swept_liquidity(rows1, SH1, SL1, "SHORT"): smc_hits += 1
             if USE_FVG and has_fvg(rows1, bullish=False): smc_hits += 1
 
-        # Pending-триггер (OB/FVG)
         pend_sig = self._check_pending_trigger(sym, rows1)
         entry_mode = pend_sig.get("entry_mode", "retest") if (pend_sig and pend_sig.get("triggered")) else None
         ob_zone = pend_sig.get("ob_zone") if pend_sig else None
 
-        # Контекст 5m — STRONG
         if USE_5M_FILTER:
             rows5 = self.mkt.kline["5"].get(sym) or []
             if len(rows5) >= ATR_PERIOD_1M + 3:
@@ -708,32 +696,29 @@ class Engine:
                 trend5, bos5_up, bos5_dn, _, _ = bos_choch(rows5, SH5, SL5)
                 if ALIGN_5M_STRICT:
                     if (side == "LONG" and trend5 == "DOWN" and not bos5_up):
-                        if not (entry_mode and entry_mode.startswith("retest")): 
+                        if not (entry_mode and entry_mode.startswith("retest")):
                             return None
                     if (side == "SHORT" and trend5 == "UP" and not bos5_dn):
-                        if not (entry_mode and entry_mode.startswith("retest")): 
+                        if not (entry_mode and entry_mode.startswith("retest")):
                             return None
                 else:
                     if side == "LONG" and trend5 == "DOWN" and not bos5_up: allow_clean = False
                     if side == "SHORT" and trend5 == "UP" and not bos5_dn: allow_clean = False
 
-        # VWAP строгий: торгуем по стороне VWAP+наклон; против — только ретест
         if VWAP_STRICT:
             if side == "LONG" and (vwap_slope <= 0 or price_rel_to_vwap < -VWAP_TOLERANCE):
                 if not (entry_mode and entry_mode.startswith("retest")): return None
             if side == "SHORT" and (vwap_slope >= 0 or price_rel_to_vwap >  VWAP_TOLERANCE):
                 if not (entry_mode and entry_mode.startswith("retest")): return None
 
-        # Анти-истощение — только pending
         def _extended_run(rows1m: List[Tuple[float,float,float,float,float]], atr1v: float) -> Tuple[bool,float]:
             if len(rows1m) < EXT_RUN_BARS + 1 or atr1v <= 0: return False, 0.0
             c0 = rows1m[-EXT_RUN_BARS-1][3]; c1 = rows1m[-1][3]
             move = abs(c1 - c0); return (move >= EXT_RUN_ATR_MULT * atr1v), move/atr1v
         ext, _ = _extended_run(rows1, atr1)
-        if ext and not entry_mode: 
+        if ext and not entry_mode:
             return None
 
-        # Требуем микро-откат от последнего импульса
         last_imp_move = abs(rows1[-1][3] - rows1[-2][3])
         if last_imp_move / max(1e-9, atr1) >= 0.8:
             recent_low  = min(x[2] for x in rows1[-5:])
@@ -742,7 +727,6 @@ class Engine:
             if not pull_ok and not entry_mode:
                 return None
 
-        # Если не было pending — поставим pending, но вход без ретеста запрещён
         allow_pending = (body_ratio >= PENDING_BODY_ATR_MIN) or (vol_mult_ratio >= PENDING_VOL_MULT_MIN)
         if not entry_mode and (smc_hits >= 1):
             if allow_pending:
@@ -751,14 +735,12 @@ class Engine:
             else:
                 return None
 
-        # Тип входа: допускаем только ретесты и bounce от плотности
         if not entry_mode:
-            entry_mode = "clean-pass"  # не используется, будет отфильтрован
+            entry_mode = "clean-pass"
         allowed_modes = {"retest-OB","retest-FVG","BounceDensity"}
         if entry_mode not in allowed_modes:
             return None
 
-        # ==== СТАКАН ====
         instr = self.mkt.instruments.get(sym) or {}
         tick = float(instr.get("priceFilter", {}).get("tickSize") or instr.get("tickSize") or 0.0) or 1e-6
         bps = LADDER_BPS_DEFAULT if (sym.startswith("BTC") or sym.startswith("ETH")) else LADDER_BPS_ALT
@@ -766,21 +748,18 @@ class Engine:
         obf = self.obm.features(sym, ladder)
         if not obf: return None
 
-        # Узкий спред по q25 и cap
         spread_ticks_now = obf["spread_ticks"]
         spread_q = self.obm.p_quantile_spread_ticks(sym, SPREAD_Q) or spread_ticks_now
         spread_thr = min(spread_q, SPREAD_TICKS_CAP)
         if spread_ticks_now > spread_thr:
             return None
 
-        # OBI обязателен (ослаблено до 0.04)
         obi = obf["obi"]
         if side == "LONG" and obi < OBI_MIN["LONG"]:
             return None
         if side == "SHORT" and obi > OBI_MIN["SHORT"]:
             return None
 
-        # Плотности
         bb = obf["best_bid"]; ba = obf["best_ask"]; tick_sz = obf["tick"]
         near_same = near_opp = None
         if side == "LONG":
@@ -799,14 +778,13 @@ class Engine:
             if dist_ticks_opp <= OPPOSITE_WALL_NEAR_TICKS:
                 return None
 
-        # Бонус от "своей" стены
         entry_mode_density = None
         if near_same is not None:
             dist_ticks_same = abs(c - near_same) / tick_sz
             if 2 <= dist_ticks_same <= 6:
                 entry_mode_density = "BounceDensity"
 
-        # Вероятность/порог (без ликвидаций и без моментума)
+        # Ликвидации не учитываем
         liq_cnt = 0
         vol_ok = (vol_mult_ratio >= (ADAPT_VOL_MULT if silent_min >= ADAPTIVE_SILENCE_MINUTES else VOL_MULT))
         entry_mode_final = entry_mode_density or entry_mode
@@ -822,7 +800,6 @@ class Engine:
                 logger.info(f"[signal:reject] {sym} side={side} prob={prob:.2f} (<{thr:.2f}) entry={entry_mode_final} bodyATR={body_ratio:.2f} OBI={obi:.2f} spreadTicks={spread_ticks_now:.1f}/{spread_thr:.1f}")
             return None
 
-        # --- Постановка целей/стопов
         entry = c
         if side == "LONG":
             if entry_mode_final == "BounceDensity" and near_same:
@@ -835,7 +812,6 @@ class Engine:
             else:
                 sl = (ob_zone[1] + 0.05 * atr1) if ob_zone else (rows1[-1][1] + 0.20 * atr1)
 
-        # Структурный TP + таймбокс/ATR, без форсирования
         SH1, SL1 = find_swings(rows1, SWING_FRAC)
         if side == "LONG":
             tp_struct = None
@@ -873,7 +849,7 @@ class Engine:
         return {
             "symbol": sym, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl),
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
-            "liq_cnt": int(liq_cnt), "rr": float(rr),
+            "rr": float(rr),
             "confluence": int(max(smc_hits, 1) + (1 if entry_mode_density else 0)),
             "entry_mode": entry_mode_final,
             "tags": [],
@@ -887,8 +863,7 @@ class Engine:
 def format_signal(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]; side = sig["side"]
     entry = sig["entry"]; tp = sig["tp"]; sl = sig["sl"]
-    prob = sig["prob"]; liq_cnt = sig.get("liq_cnt", 0)
-    body_ratio = sig.get("body_ratio", 0.0); rr = sig.get("rr", 0.0); con = sig.get("confluence", 0)
+    prob = sig["prob"]; body_ratio = sig.get("body_ratio", 0.0); rr = sig.get("rr", 0.0); con = sig.get("confluence", 1)
     entry_mode = sig.get("entry_mode", "n/a")
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
     tags = " ".join(sig.get("tags", []))
@@ -902,7 +877,7 @@ def format_signal(sig: Dict[str, Any]) -> str:
         f"Стоп: <b>{sl:g}</b>  •  RR ≈ <b>1:{rr:.2f}</b>",
         f"Вероятность: <b>{pct(prob)}</b>  •  Конфлюэнс: <b>{con}</b>{add}",
         f"Фильтры: TP≥{pct(MIN_PROFIT_PCT)}; профиль={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}",
-        f"Основание: тело/ATR={body_ratio:.2f}; ликвидаций(60с)={liq_cnt}",
+        f"Основание: тело/ATR={body_ratio:.2f}",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     return "\n".join(lines)
@@ -934,15 +909,20 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
+                    silent_min = (now_ts_ms() - mkt.last_signal_sent_ts)/60000.0 if mkt.last_signal_sent_ts else 1e9
+                    stall_risk = "HIGH" if ago >= STALL_EXIT_SEC else ("MED" if ago >= STALL_EXIT_SEC/2 else "LOW")
                     mode = 'SCALP RETEST+DENSITY (safe loosen)'
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\n"
                                            f"Mode: {mode}\nProb profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}\n"
-                                           f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}")
+                                           f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}\nSilent (signals): {silent_min:.1f}m\nStall risk: {stall_risk}")
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
                     k1 = sum(len(mkt.kline['1'].get(s, [])) for s in syms)
                     k5 = sum(len(mkt.kline['5'].get(s, [])) for s in syms)
-                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}\nLast signal ts: {mkt.last_signal_sent_ts}")
+                    ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
+                    silent_min = (now_ts_ms() - mkt.last_signal_sent_ts)/60000.0 if mkt.last_signal_sent_ts else 1e9
+                    await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}\nLast signal ts: {mkt.last_signal_sent_ts}\n"
+                                           f"WS last msg age: {ago:.1f}s\nSilent minutes: {silent_min:.1f}")
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
                     tasks = {k: (not app[k].done()) if app.get(k) else False for k in
@@ -999,13 +979,16 @@ async def watchdog_loop(app: web.Application) -> None:
             await asyncio.sleep(WATCHDOG_SEC)
             ago = (now_ts_ms() - mkt.last_ws_msg_ts) / 1000.0
             logger.info(f"[watchdog] alive; last WS msg {ago:.1f}s ago; symbols={len(app.get('symbols', []))}")
+            # Жёсткий сторожок: если WS молчит слишком долго — форс-рестарт процесса
+            if ago >= STALL_EXIT_SEC:
+                logger.error(f"[watchdog] WS stalled for {ago:.1f}s (>= {STALL_EXIT_SEC}s). Exiting for platform restart.")
+                os._exit(3)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.warning(f"watchdog error: {e}")
 
 async def universe_refresh_loop(app: web.Application) -> None:
-    """Динамический фильтр котировок (USDT; оборот/изменение) + (де)подписка без рестарта; дозаполнение по обороту."""
     rest: BybitRest = app["rest"]; ws: BybitWS = app["ws"]
     mkt: MarketState = app["mkt"]
     while True:
@@ -1013,8 +996,8 @@ async def universe_refresh_loop(app: web.Application) -> None:
             await asyncio.sleep(UNIVERSE_REFRESH_SEC)
             tickers = await rest.tickers_linear()
 
-            primary: List[Tuple[str, float]] = []   # оборот≥thr & |chg|≥thr
-            fallback: List[Tuple[str, float]] = []  # оборот≥thr (без порога изменения)
+            primary: List[Tuple[str, float]] = []
+            fallback: List[Tuple[str, float]] = []
 
             for t in tickers:
                 sym = t.get("symbol") or ""
@@ -1114,6 +1097,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             mkt.note_kline("240", sym, payload)
 
     elif topic.startswith("liquidation."):
+        # Отмечаем для диагностики, но не используем в сигналах
         arr = data.get("data") or []
         for liq in arr:
             if not isinstance(liq, dict): continue
@@ -1183,7 +1167,6 @@ async def on_startup(app: web.Application) -> None:
     rest = BybitRest(BYBIT_REST, http); app["rest"] = rest
     tickers = await rest.tickers_linear()
 
-    # Универс: ТОЛЬКО USDT; primary = оборот≥thr & |chg|≥thr; fallback = оборот≥thr; fill-to-target
     primary: List[Tuple[str, float]] = []
     fallback: List[Tuple[str, float]] = []
     for t in tickers:
@@ -1233,7 +1216,6 @@ async def on_startup(app: web.Application) -> None:
         args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
     await ws.subscribe(args)
 
-    # фоновые задачи
     app["ws_task"] = asyncio.create_task(ws.run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["hb_task"] = asyncio.create_task(heartbeat_loop(app))
