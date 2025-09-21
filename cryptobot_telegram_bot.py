@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-v3.5 — No-heartbeat + Hard-watchdog + richer status
-  • Убран авто-хартбит в Telegram (никаких периодических "я жив").
-  • Ручные проверки: /ping, /status, /healthz, /diag, /jobs.
-  • Жёсткий сторожок: os._exit(3) при залипании WS > STALL_EXIT_SEC (по умолчанию 7 мин).
-  • Сигналы: только ретесты OB/FVG и bounce от своей плотности; без ликвидаций в тексте и логике.
+v3.5 — No-heartbeat + Reply Keyboard + Hard-watchdog
+  • Убран heartbeat-цикл (никаких “я жив” сообщений).
+  • Добавлена reply-клавиатура под /help: /ping /status /healthz /diag /jobs.
+  • Жёсткий сторожок: os._exit(3), если WS залип > STALL_EXIT_SEC.
+  • Сообщения сигналов — без упоминаний ликвидаций.
 """
 
 from __future__ import annotations
@@ -83,10 +83,21 @@ EQL_LOOKBACK = 30
 EQL_EPS_PCT = 0.0007
 EQL_PROX_PCT = 0.0012
 
-# Вероятность
-PROB_THRESHOLDS = {"retest-OB": 0.46, "retest-FVG": 0.50, "BounceDensity": 0.56, "default": 0.50}
+# Вероятность (без ликвидаций)
+PROB_THRESHOLDS = {
+    "retest-OB": 0.46,
+    "retest-FVG": 0.50,
+    "BounceDensity": 0.56,
+    "default": 0.50
+}
 USE_PROB_70_STRICT = False
-PROB_THRESHOLDS_STRICT = {"retest-OB": 0.66, "retest-FVG": 0.68, "BounceDensity": 0.70, "default": 0.70}
+PROB_THRESHOLDS_STRICT = {
+    "retest-OB": 0.66,
+    "retest-FVG": 0.68,
+    "BounceDensity": 0.70,
+    "default": 0.70
+}
+# АДАПТИВ
 ADAPTIVE_SILENCE_MINUTES = 30
 ADAPT_BODY_ATR = 0.24
 ADAPT_VOL_MULT = 0.98
@@ -103,17 +114,30 @@ SPREAD_Q = 0.25
 OPPOSITE_WALL_NEAR_TICKS = 8
 OBI_MIN = {"LONG": 0.04, "SHORT": -0.04}
 
+# Фильтр котировок (динамический)
+UNIVERSE_REFRESH_SEC = 600
+TURNOVER_MIN_USD = 75_000_000.0
+CHANGE24H_MIN_ABS = 0.005
+
+# Ядро рынков (USDT)
+CORE_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "TONUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT",
+]
+
 # Диагностика/веб
 DEBUG_SIGNALS = True
-KEEPALIVE_SEC = 13 * 60          # внешний будильник всё равно советую держать
+KEEPALIVE_SEC = 13 * 60
+
+# ---- Жёсткий сторожок
 WATCHDOG_SEC = 60
-STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "420"))  # 7 минут
+STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "420"))  # 7 мин по умолчанию
 
 PORT = int(os.getenv("PORT", "10000"))
 
 # Роутинг
-PRIMARY_RECIPIENTS = [-1002870952333]
-ALLOWED_CHAT_IDS = [533232884, -1002870952333]
+PRIMARY_RECIPIENTS = [-1002870952333]          # канал
+ALLOWED_CHAT_IDS = [533232884, -1002870952333] # личный чат и канал
 ONLY_CHANNEL = True
 
 # Доп. флажки логики
@@ -154,6 +178,25 @@ class Tg:
 
     async def send(self, chat_id: int, text: str) -> None:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        async with self.http.post(f"{self.base}/sendMessage", json=payload) as r:
+            r.raise_for_status()
+            await r.json()
+
+    async def send_with_keyboard(self, chat_id: int, text: str, buttons: List[List[str]]) -> None:
+        # reply-клавиатура: список строк, каждая строка — список текстов кнопок
+        keyboard = [[{"text": b} for b in row] for row in buttons]
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": {
+                "keyboard": keyboard,
+                "resize_keyboard": True,
+                "is_persistent": True,
+                "one_time_keyboard": False
+            }
+        }
         async with self.http.post(f"{self.base}/sendMessage", json=payload) as r:
             r.raise_for_status()
             await r.json()
@@ -271,6 +314,7 @@ class AutoLadder:
     def __init__(self, tick: float, bps: float = LADDER_BPS_DEFAULT) -> None:
         self.tick = max(tick, 1e-12)
         self.bps = bps
+
     def step(self, mid: float) -> float:
         raw = max(self.tick, mid * self.bps)
         steps = max(1, round(raw / self.tick))
@@ -278,6 +322,7 @@ class AutoLadder:
 
 class OrderBookState:
     __slots__ = ("tick", "seq", "bids", "asks", "last_mid", "last_spreads", "last_levels_ts")
+
     def __init__(self, tick: float) -> None:
         self.tick = max(tick, 1e-12)
         self.seq: Optional[int] = None
@@ -286,11 +331,13 @@ class OrderBookState:
         self.last_mid: float = 0.0
         self.last_spreads: List[float] = []
         self.last_levels_ts: List[Tuple[int, float, float]] = []
+
     def apply_snapshot(self, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
         self.bids = {float(p): float(s) for p, s in bids if float(s) > 0.0}
         self.asks = {float(p): float(s) for p, s in asks if float(s) > 0.0}
         self.seq = int(seq) if seq is not None else None
         self._update_mid_spread()
+
     def apply_delta(self, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
         if seq is not None and self.seq is not None and int(seq) <= int(self.seq):
             return
@@ -304,6 +351,7 @@ class OrderBookState:
             else: self.asks[p] = s
         self.seq = int(seq) if seq is not None else self.seq
         self._update_mid_spread()
+
     def _update_mid_spread(self) -> None:
         bb = max(self.bids) if self.bids else 0.0
         ba = min(self.asks) if self.asks else 0.0
@@ -314,6 +362,7 @@ class OrderBookState:
                 self.last_spreads.append(spread)
                 if len(self.last_spreads) > 600:
                     self.last_spreads = self.last_spreads[-600:]
+
     def best(self) -> Tuple[Optional[float], Optional[float]]:
         bb = max(self.bids) if self.bids else None
         ba = min(self.asks) if self.asks else None
@@ -324,17 +373,21 @@ class OrderBookManager:
         self.books: Dict[str, OrderBookState] = {}
         self.ticks: Dict[str, float] = {}
         self.last_wall_levels: Dict[str, List[Tuple[int, float, float]]] = {}
+
     def ensure(self, sym: str, tick: float) -> OrderBookState:
         if sym not in self.books:
             self.books[sym] = OrderBookState(tick)
         self.ticks[sym] = tick
         return self.books[sym]
+
     def note_snapshot(self, sym: str, tick: float, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
         ob = self.ensure(sym, tick)
         ob.apply_snapshot(bids, asks, seq)
+
     def note_delta(self, sym: str, tick: float, bids: Iterable[Tuple[float,float]], asks: Iterable[Tuple[float,float]], seq: Optional[int]) -> None:
         ob = self.ensure(sym, tick)
         ob.apply_delta(bids, asks, seq)
+
     def spread_ticks(self, sym: str) -> Optional[float]:
         ob = self.books.get(sym)
         if not ob: return None
@@ -342,22 +395,26 @@ class OrderBookManager:
         if not bb or not ba: return None
         spread = ba - bb
         return spread / max(ob.tick, 1e-12)
+
     def p25_spread_ticks(self, sym: str) -> Optional[float]:
         ob = self.books.get(sym)
         if not ob or not ob.last_spreads: return None
         arr = sorted(ob.last_spreads[-600:])
         idx = int(0.25 * (len(arr)-1))
         return arr[idx] / max(ob.tick, 1e-12)
+
     def p_quantile_spread_ticks(self, sym: str, q: float = SPREAD_Q) -> Optional[float]:
         ob = self.books.get(sym)
         if not ob or not ob.last_spreads: return None
         arr = sorted(ob.last_spreads[-600:])
         idx = int(max(0, min(len(arr)-1, q * (len(arr)-1))))
         return arr[idx] / max(ob.tick, 1e-12)
+
     def features(self, sym: str, ladder: AutoLadder) -> Optional[Dict[str, Any]]:
         ob = self.books.get(sym)
         if not ob or ob.last_mid <= 0: return None
         step = ladder.step(ob.last_mid)
+
         def agg(book: Dict[float,float], reverse: bool) -> List[Tuple[float,float]]:
             buckets: Dict[float, float] = {}
             for p, s in book.items():
@@ -365,12 +422,15 @@ class OrderBookManager:
                 buckets[b] = buckets.get(b, 0.0) + s * p
             levels = sorted(buckets.items(), key=lambda x: x[0], reverse=reverse)
             return levels
+
         bids_levels = agg(ob.bids, True)
         asks_levels = agg(ob.asks, False)
+
         b_not = sum(s for _, s in bids_levels[:ORDERBOOK_DEPTH_BINS])
         a_not = sum(s for _, s in asks_levels[:ORDERBOOK_DEPTH_BINS])
         denom = max(1e-9, a_not + b_not)
         obi = (b_not - a_not) / denom
+
         ts_now = now_ts_ms()
         hist = self.last_wall_levels.setdefault(sym, [])
         for p, s in (bids_levels[:10] + asks_levels[:10]):
@@ -384,16 +444,23 @@ class OrderBookManager:
             idx = int(len(only_vals_sorted) * WALL_PCTL / 100)
             idx = min(max(idx, 0), len(only_vals_sorted)-1)
             wall_thr = only_vals_sorted[idx]
+
         walls_bid = [(p, s) for p, s in bids_levels if s >= wall_thr]
         walls_ask = [(p, s) for p, s in asks_levels if s >= wall_thr]
+
         bb, ba = ob.best()
         spread_ticks_now = self.spread_ticks(sym) or 0.0
         p25 = self.p25_spread_ticks(sym) or spread_ticks_now
+
         return {
-            "step": float(step), "obi": float(obi),
-            "walls_bid": walls_bid, "walls_ask": walls_ask,
-            "best_bid": float(bb) if bb else None, "best_ask": float(ba) if ba else None,
-            "spread_ticks": float(spread_ticks_now), "spread_p25_ticks": float(p25),
+            "step": float(step),
+            "obi": float(obi),
+            "walls_bid": walls_bid,
+            "walls_ask": walls_ask,
+            "best_bid": float(bb) if bb else None,
+            "best_ask": float(ba) if ba else None,
+            "spread_ticks": float(spread_ticks_now),
+            "spread_p25_ticks": float(p25),
             "tick": float(ob.tick),
         }
 
@@ -410,11 +477,13 @@ class MarketState:
         self.cooldown: Dict[Tuple[str,str], int] = {}
         self.last_signal_sent_ts: int = 0
         self.instruments: Dict[str, Dict[str, Any]] = {}
+
     def note_ticker(self, d: Dict[str, Any]) -> None:
         sym = d.get("symbol")
         if not sym: return
         self.tickers[sym] = d
         self.last_ws_msg_ts = now_ts_ms()
+
     def note_kline(self, tf: str, sym: str, points: List[Dict[str, Any]]) -> None:
         buf = self.kline.setdefault(tf, {}).setdefault(sym, [])
         for p in points:
@@ -427,6 +496,7 @@ class MarketState:
                 if len(buf) > self.kline_maxlen:
                     del buf[0:len(buf)-self.kline_maxlen]
         self.last_ws_msg_ts = now_ts_ms()
+
     def note_liq(self, sym: str, ts_ms: int) -> None:
         arr = self.liq_events.setdefault(sym, [])
         arr.append(ts_ms)
@@ -436,7 +506,7 @@ class MarketState:
         self.last_ws_msg_ts = now_ts_ms()
 
 # =========================
-# Индикаторы
+# Индикаторы / вспомогательные
 # =========================
 def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
     if len(rows) < period + 1: return 0.0
@@ -453,7 +523,8 @@ def sma(vals: List[float], period: int) -> float:
     return sum(vals[-period:]) / period
 
 def rolling_vwap(rows: List[Tuple[float,float,float,float,float]], window: int) -> Tuple[float, float]:
-    n = len(rows); need = max(window, VWAP_SLOPE_BARS + 1)
+    n = len(rows)
+    need = max(window, VWAP_SLOPE_BARS + 1)
     if n < need: return 0.0, 0.0
     tp = [(r[1] + r[2] + r[3]) / 3.0 for r in rows]
     v  = [r[4] for r in rows]
@@ -538,7 +609,7 @@ class Engine:
         self.pending: Dict[str, Dict[str, Any]] = {}
 
     def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool, ob_bonus: float=0.0) -> float:
-        # ликвидации не учитываем (liq_cnt игнорируется)
+        # Ликвидации в вероятности не учитываем
         p = 0.45
         p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
         if vol_ok: p += 0.12
@@ -556,11 +627,13 @@ class Engine:
     def _build_pending(self, sym:str, side:str, rows1, atr1:float, prefer_ob_first:bool=True) -> None:
         ob = simple_ob(rows1, side, BODY_ATR_MULT, atr1) if prefer_ob_first else None
         if ob:
-            zone_lo, zone_hi = ob[0], ob[1]; mode = "retest-OB"
+            zone_lo, zone_hi = ob[0], ob[1]
+            mode = "retest-OB"
         else:
             fvg = has_fvg(rows1, bullish=(side=="LONG"))
             if not fvg: return
-            zone_lo, zone_hi = fvg; mode = "retest-FVG"
+            zone_lo, zone_hi = fvg
+            mode = "retest-FVG"
         created_len = len(rows1)
         self.pending[sym] = {
             "side": side, "zone_lo": float(zone_lo), "zone_hi": float(zone_hi),
@@ -793,9 +866,12 @@ class Engine:
         return {
             "symbol": sym, "side": side, "entry": float(entry), "tp": float(tp), "sl": float(sl),
             "prob": float(prob), "atr": float(atr1), "body_ratio": float(body_ratio),
-            "rr": float(rr), "confluence": int(max(smc_hits, 1) + (1 if entry_mode_density else 0)),
-            "entry_mode": entry_mode_final, "tags": [],
-            "obi": float(obi), "spread_ticks": float(spread_ticks_now),
+            "rr": float(rr),
+            "confluence": int(max(smc_hits, 1) + (1 if entry_mode_density else 0)),
+            "entry_mode": entry_mode_final,
+            "tags": [],
+            "obi": float(obi),
+            "spread_ticks": float(spread_ticks_now),
         }
 
 # =========================
@@ -841,13 +917,26 @@ async def tg_updates_loop(app: web.Application) -> None:
                 if not isinstance(chat_id, int) or not text.startswith("/"): continue
                 if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS: continue
                 cmd = text.split()[0].lower()
+
                 if cmd == "/help":
-                    await tg.send(chat_id, "Команды:\n/universe — список символов\n/ping — связь\n/status — статус\n/jobs — фоновые задачи\n/diag — диагностика\n/healthz — проверка здоровья сервиса")
+                    kb = [
+                        ["/ping", "/status"],
+                        ["/healthz", "/diag"],
+                        ["/jobs"]
+                    ]
+                    await tg.send_with_keyboard(
+                        chat_id,
+                        "Команды:\n/ping — связь\n/status — статус\n/healthz — проверка здоровья\n/diag — диагностика\n/jobs — фоновые задачи",
+                        kb
+                    )
+
                 elif cmd == "/universe":
                     await tg.send(chat_id, "Подписаны символы:\n" + ", ".join(app.get("symbols", [])))
+
                 elif cmd == "/ping":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(app.get('symbols', []))}")
+
                 elif cmd == "/status":
                     ago = (now_ts_ms() - mkt.last_ws_msg_ts)/1000.0
                     silent_min = (now_ts_ms() - mkt.last_signal_sent_ts)/60000.0 if mkt.last_signal_sent_ts else 1e9
@@ -856,6 +945,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, f"✅ Online\nWS: ok (last {ago:.1f}s)\nSymbols: {len(app.get('symbols', []))}\n"
                                            f"Mode: {mode}\nProb profile: {'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'}\n"
                                            f"Min TP filter: ≥{pct(MIN_PROFIT_PCT)}\nSilent (signals): {silent_min:.1f}m\nStall risk: {stall_risk}")
+
                 elif cmd in ("/diag", "/debug"):
                     syms = app.get("symbols", [])
                     k1 = sum(len(mkt.kline['1'].get(s, [])) for s in syms)
@@ -864,6 +954,7 @@ async def tg_updates_loop(app: web.Application) -> None:
                     silent_min = (now_ts_ms() - mkt.last_signal_sent_ts)/60000.0 if mkt.last_signal_sent_ts else 1e9
                     await tg.send(chat_id, f"Diag:\n1m buffers: {k1} pts\n5m buffers: {k5} pts\nCooldowns: {len(mkt.cooldown)}\nLast signal ts: {mkt.last_signal_sent_ts}\n"
                                            f"WS last msg age: {ago:.1f}s\nSilent minutes: {silent_min:.1f}")
+
                 elif cmd == "/jobs":
                     ws_alive = bool(ws.ws and not ws.ws.closed)
                     tasks = {k: (not app[k].done()) if app.get(k) else False for k in
@@ -871,13 +962,16 @@ async def tg_updates_loop(app: web.Application) -> None:
                     await tg.send(chat_id, "Jobs:\n"
                                      f"WS connected: {ws_alive}\n" +
                                      "\n".join(f"{k}: {'running' if v else 'stopped'}" for k,v in tasks.items()))
+
                 elif cmd == "/healthz":
                     t0 = app.get("start_ts") or time.monotonic()
                     uptime = int(time.monotonic() - t0)
                     last_age = int((now_ts_ms() - mkt.last_ws_msg_ts)/1000.0)
                     await tg.send(chat_id, f"ok: true\nuptime_sec: {uptime}\nlast_ws_msg_age_sec: {last_age}\nsymbols: {len(app.get('symbols', []))}")
+
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /help")
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -987,4 +1081,206 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     topic = data.get("topic") or ""
     if topic.startswith("tickers."):
         d = data.get("data") or {}
-       
+        if isinstance(d, dict): mkt.note_ticker(d)
+
+    elif topic.startswith("kline.1."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("1", sym, payload)
+            if any(x.get("confirm") for x in payload):
+                sig = eng.on_kline_closed_1m(sym)
+                if sig:
+                    text = format_signal(sig)
+                    chats = PRIMARY_RECIPIENTS if ONLY_CHANNEL else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)
+                    for chat_id in chats:
+                        with contextlib.suppress(Exception):
+                            await tg.send(chat_id, text)
+                            logger.info(f"signal sent: {sym} {sig['side']}")
+                    mkt.last_signal_sent_ts = now_ts_ms()
+
+    elif topic.startswith("kline.5."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("5", sym, payload)
+
+    elif topic.startswith("kline.60."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("60", sym, payload)
+
+    elif topic.startswith("kline.240."):
+        payload = data.get("data") or []
+        if payload:
+            sym = payload[0].get("symbol") or topic.split(".")[-1]
+            mkt.note_kline("240", sym, payload)
+
+    elif topic.startswith("liquidation."):
+        # для диагностики; не используем в сигналах
+        arr = data.get("data") or []
+        for liq in arr:
+            if not isinstance(liq, dict): continue
+            sym = (liq.get("s") or liq.get("symbol"))
+            ts = int(liq.get("T") or data.get("ts") or now_ts_ms())
+            if sym: mkt.note_liq(sym, ts)
+
+    elif topic.startswith("orderbook.50."):
+        d = data.get("data") or {}
+        if not isinstance(d, dict):
+            return
+        sym = (d.get("s") or d.get("symbol") or topic.split(".")[-1])
+        typ = (d.get("type") or data.get("type") or "").lower()
+        bids = d.get("b") or d.get("bids") or []
+        asks = d.get("a") or d.get("asks") or []
+        seq = d.get("u") or d.get("seq") or d.get("update") or None
+        def _to_pairs(arr: Iterable[List[str]]) -> List[Tuple[float,float]]:
+            out: List[Tuple[float,float]] = []
+            for it in arr:
+                if not it: continue
+                try:
+                    if isinstance(it, dict):
+                        p = float(it.get("price") or it.get("p")); s = float(it.get("size") or it.get("s"))
+                    else:
+                        p = float(it[0]); s = float(it[1])
+                except Exception:
+                    continue
+                out.append((p, s))
+            return out
+        bids = _to_pairs(bids); asks = _to_pairs(asks)
+        instr = mkt.instruments.get(sym) or {}
+        tick = float(instr.get("priceFilter", {}).get("tickSize") or instr.get("tickSize") or 0.0) or 1e-6
+        if typ == "snapshot":
+            obm.note_snapshot(sym, tick, bids, asks, seq)
+        else:
+            obm.note_delta(sym, tick, bids, asks, seq)
+
+# =========================
+# Web-приложение
+# =========================
+async def handle_health(request: web.Request) -> web.Response:
+    app = request.app
+    t0 = app.get("start_ts") or time.monotonic()
+    uptime = time.monotonic() - t0
+    mkt: MarketState = app.get("mkt")
+    last_msg_age = int((now_ts_ms() - mkt.last_ws_msg_ts) / 1000) if mkt else None
+    return web.json_response({
+        "ok": True,
+        "uptime_sec": int(uptime),
+        "symbols": app.get("symbols", []),
+        "last_ws_msg_age_sec": last_msg_age,
+    })
+
+async def on_startup(app: web.Application) -> None:
+    setup_logging(LOG_LEVEL)
+    logger.info("startup.")
+
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("Не задан TELEGRAM_TOKEN")
+
+    http = aiohttp.ClientSession()
+    app["http"] = http
+    app["tg"] = Tg(token, http)
+    app["public_url"] = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+
+    rest = BybitRest(BYBIT_REST, http); app["rest"] = rest
+    tickers = await rest.tickers_linear()
+
+    primary: List[Tuple[str, float]] = []
+    fallback: List[Tuple[str, float]] = []
+    for t in tickers:
+        sym = t.get("symbol") or ""
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            turn = float(t.get("turnover24h") or 0.0)
+            chg  = float(t.get("price24hPcnt") or 0.0)
+        except Exception:
+            continue
+        if turn >= TURNOVER_MIN_USD:
+            fallback.append((sym, turn))
+            if abs(chg) >= CHANGE24H_MIN_ABS:
+                primary.append((sym, turn))
+
+    primary.sort(key=lambda x: x[1], reverse=True)
+    fallback.sort(key=lambda x: x[1], reverse=True)
+
+    symbols = dedup_preserve(
+        CORE_SYMBOLS + [s for s,_ in primary] + [s for s,_ in fallback]
+    )[:ACTIVE_SYMBOLS]
+    if not symbols:
+        symbols = CORE_SYMBOLS[:ACTIVE_SYMBOLS]
+    app["symbols"] = symbols
+    logger.info(f"symbols: {symbols}")
+
+    mkt = MarketState(); app["mkt"] = mkt
+    for s in symbols:
+        with contextlib.suppress(Exception):
+            info = await rest.instrument_info(s)
+            if info:
+                pf = info.get("priceFilter") or {}
+                tick_sz = float(pf.get("tickSize") or info.get("tickSize") or 0.0) or 1e-6
+                mkt.instruments[s] = {"priceFilter": {"tickSize": tick_sz}}
+
+    obm = OrderBookManager(); app["obm"] = obm
+    app["engine"] = Engine(mkt, obm)
+
+    ws = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http); app["ws"] = ws
+    async def _on_msg(msg: Dict[str, Any]) -> None: await ws_on_message(app, msg)
+    ws.on_message = _on_msg
+    await ws.connect()
+
+    args: List[str] = []
+    for s in symbols:
+        args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
+    await ws.subscribe(args)
+
+    app["ws_task"] = asyncio.create_task(ws.run())
+    app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
+    app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
+    app["tg_updates_task"] = asyncio.create_task(tg_updates_loop(app))
+    app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
+
+async def on_cleanup(app: web.Application) -> None:
+    for key in ("ws_task","keepalive_task","watchdog_task","tg_updates_task","universe_task"):
+        t = app.get(key)
+        if t:
+            t.cancel()
+            with contextlib.suppress(Exception):
+                await t
+    ws: BybitWS = app.get("ws")
+    if ws and ws.ws and not ws.ws.closed:
+        await ws.ws.close()
+    http: aiohttp.ClientSession = app.get("http")
+    if http:
+        await http.close()
+
+def make_app() -> web.Application:
+    app = web.Application()
+    app["start_ts"] = time.monotonic()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/healthz", handle_health)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+def main() -> None:
+    setup_logging(LOG_LEVEL)
+    logger.info(
+        f"cfg: ws={BYBIT_WS_PUBLIC_LINEAR} | active={ACTIVE_SYMBOLS} | "
+        f"tp=[{TP_MIN_PCT:.1%}..{TP_MAX_PCT:.1%}] | rr≥{RR_TARGET:.2f} | "
+        f"min_tp_filter=≥{MIN_PROFIT_PCT:.1%} | "
+        f"prob_profile={'STRICT 70%' if USE_PROB_70_STRICT else 'Balanced'} | "
+        f"mode=SCALP RETEST+DENSITY (safe loosen) | universe=USDT only (≥75M turn, ≥0.5% chg; fill-to-target)"
+    )
+    app = make_app()
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        logging.exception("FATAL: app crashed on startup")
+        raise
