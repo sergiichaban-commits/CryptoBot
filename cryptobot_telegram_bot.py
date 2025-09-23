@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-v3.5 — No-heartbeat + Reply Keyboard + Hard-watchdog
-  • Убран heartbeat-цикл (никаких “я жив” сообщений).
-  • Добавлена reply-клавиатура под /help: /ping /status /healthz /diag /jobs.
-  • Жёсткий сторожок: os._exit(3), если WS залип > STALL_EXIT_SEC.
-  • Сообщения сигналов — без упоминаний ликвидаций.
+v3.6 — Startup notify + faster watchdog (no heartbeat)
+  • Убран heartbeat (как просил).
+  • Одноразовое Telegram-уведомление при старте контейнера.
+  • Жёсткий сторожок по умолчанию 240s (меняется ENV STALL_EXIT_SEC).
+  • Кнопки /ping /status /healthz /diag /jobs через reply-клавиатуру (/help).
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ KEEPALIVE_SEC = 13 * 60
 
 # ---- Жёсткий сторожок
 WATCHDOG_SEC = 60
-STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "420"))  # 7 мин по умолчанию
+STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "240"))  # 4 мин по умолчанию (можно увеличить через ENV)
 
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -183,7 +183,6 @@ class Tg:
             await r.json()
 
     async def send_with_keyboard(self, chat_id: int, text: str, buttons: List[List[str]]) -> None:
-        # reply-клавиатура: список строк, каждая строка — список текстов кнопок
         keyboard = [[{"text": b} for b in row] for row in buttons]
         payload = {
             "chat_id": chat_id,
@@ -609,7 +608,6 @@ class Engine:
         self.pending: Dict[str, Dict[str, Any]] = {}
 
     def _probability(self, body_ratio: float, vol_ok: bool, liq_cnt: int, confluence: int, mom_ok: bool, ob_bonus: float=0.0) -> float:
-        # Ликвидации в вероятности не учитываем
         p = 0.45
         p += min(0.3, max(0.0, body_ratio - BODY_ATR_MULT) * 0.25)
         if vol_ok: p += 0.12
@@ -1237,11 +1235,20 @@ async def on_startup(app: web.Application) -> None:
         args += [f"tickers.{s}", f"kline.1.{s}", f"kline.5.{s}", f"kline.60.{s}", f"kline.240.{s}", f"liquidation.{s}", f"orderbook.50.{s}"]
     await ws.subscribe(args)
 
+    # Фоновые задачи
     app["ws_task"] = asyncio.create_task(ws.run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
     app["tg_updates_task"] = asyncio.create_task(tg_updates_loop(app))
     app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
+
+    # Одноразовое сообщение о запуске (не хартбит)
+    try:
+        tg: Tg = app["tg"]
+        for chat_id in PRIMARY_RECIPIENTS:
+            await tg.send(chat_id, "🟢 Cryptobot запущен")
+    except Exception:
+        logger.warning("startup notify failed")
 
 async def on_cleanup(app: web.Application) -> None:
     for key in ("ws_task","keepalive_task","watchdog_task","tg_updates_task","universe_task"):
