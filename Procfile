@@ -1,1 +1,1 @@
-python cryptobot_telegram_bot.py
+web: python cryptobot_telegram_bot.py
