@@ -1,33 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v5.0 — Полная пересборка под деривативы (Funding, Open Interest, All-Liquidations)
-
-Ключевая логика (согласно файлу «Изменение логики.xlsx»):
-  • Фокус на деривативах USDT: Funding Rate, Open Interest (OI), кластеры ликвидаций (heatmap).
-  • Сигналы на закрытии 15m (контекст), уточнение 5m (для более точного SL/входа).
-  • Фильтр вселенной: символ есть на споте (USDT) и в USDT-перпетуалах, объём/оборот > $100M за 24ч.
-  • Избегаем лонгов при экстремально положительном фандинге (> +0.05%), избегаем шортов при сильно отрицательном (< -0.05%).
-  • Интерпретация OI:
-      ↑Цена + ↑OI   → тренд усиливается (продолжение вероятнее).
-      ↑Цена + ↓OI   → слабость/шортовый шанс (въедание в шорты закрытием).
-      ↓Цена + ↑OI   → шортовый тренд усиливается (продолжение).
-      ↓Цена + ↓OI   → де-левередж, возможен отскок (лонг-шанс).
-  • Кластеры ликвидаций (WS: allLiquidation.{symbol}): держим тепловую карту за последние ~2 часа;
-    выбираем TP около ближайшего крупного кластера противоположной стороны.
-  • Примерный риск-менеджмент: SL за локальный экстремум / ~0.8–1.2×ATR(15m). TP1 0.7–1.5%, TP2 — крупный кластер.
-  • Технические подсказки: VWAP(15m) как мягкий фильтр, EMA100(1H) для направления; объём ≥1.5×SMA20(15m) для подтверждения.
-  • Формат алерта включает: Funding, OI-тенденцию (5m/15m), Heatmap-кластер, Entry/SL/TP, обоснование, предупреждение о следующем фандинге.
-
-Bybit v5 источники (публичные):
-  • REST:
-      /v5/market/tickers (fundingRate, nextFundingTime, openInterest, turnover24h, volume24h)
-      /v5/market/open-interest (история OI)
-      /v5/market/kline (исторические свечи)
-      /v5/market/instruments-info (категории spot/linear)
-  • WS (public):
-      wss://stream.bybit.com/v5/public/linear
-      topics: ticker.{SYMBOL}, kline.15.{SYMBOL}, kline.5.{SYMBOL}, allLiquidation.{SYMBOL}, orderbook.50.{SYMBOL}
+v5.1 — фиксы вселенной, Telegram-диагностика (/diag, /jobs), нормальный вывод Silent
 """
 
 from __future__ import annotations
@@ -36,10 +10,9 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import os
 import time
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,36 +35,35 @@ ONLY_CHANNEL = True
 
 # Вселенная: фильтры
 UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = 100_000_000.0   # из файла: >100M
-VOLUME_MIN_USD = 100_000_000.0     # подстраховка
+TURNOVER_MIN_USD = 100_000_000.0   # >$100M
+VOLUME_MIN_USD = 100_000_000.0
 ACTIVE_SYMBOLS = 60
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
 # Таймфреймы
 EXEC_TF_MAIN = "15"               # базовый сигнал — 15m close
 EXEC_TF_AUX  = "5"                # уточнение — 5m close
-CONTEXT_TF   = "60"               # контекст EMA100/RSI/VWAP
+CONTEXT_TF   = "60"               # контекст EMA/VWAP (1H)
 
 # Индикаторы / пороги
 ATR_PERIOD_15 = 14
 VOL_SMA_15 = 20
 VOL_MULT_ENTRY = 1.5
-
 EMA_PERIOD_1H = 100
 VWAP_WINDOW_15 = 60
 
 FUNDING_EXTREME_POS = 0.0005      # +0.05%
 FUNDING_EXTREME_NEG = -0.0005     # -0.05%
 
-OI_WINDOW_MIN = 15                # для %Δ OI
+OI_WINDOW_MIN = 15
 OI_SHORT_MIN = 5
 
-HEATMAP_WINDOW_SEC = 2 * 60 * 60  # накапливаем ликвидации ~2ч
-HEATMAP_BIN_BPS = 25              # ширина бина ≈ 0.25% (25 б.п.)
+HEATMAP_WINDOW_SEC = 2 * 60 * 60
+HEATMAP_BIN_BPS = 25
 HEATMAP_TOP_K = 3
 
-TP_MIN_PCT = 0.007                # 0.7%
-TP_MAX_PCT = 0.02                 # 2.0%
+TP_MIN_PCT = 0.007
+TP_MAX_PCT = 0.02
 RR_MIN = 1.2
 
 SIGNAL_COOLDOWN_SEC = 30
@@ -100,7 +72,7 @@ WATCHDOG_SEC = 60
 STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "240"))
 
 # =========================
-# Утилиты
+# Утилиты/логгер
 # =========================
 def now_ms() -> int: return int(time.time() * 1000)
 def pct(x: float) -> str: return f"{x:.2%}"
@@ -188,14 +160,16 @@ class BybitWS:
     async def subscribe(self, args: List[str]) -> None:
         for a in args: self._subs.add(a)
         if not self.ws or self.ws.closed: await self.connect()
-        await self.ws.send_json({"op":"subscribe","args":args})
-        logger.info(f"WS subscribed: {args}")
+        if args:
+            await self.ws.send_json({"op":"subscribe","args":args})
+            logger.info(f"WS subscribed: {args}")
 
     async def unsubscribe(self, args: List[str]) -> None:
         for a in args: self._subs.discard(a)
         if not self.ws or self.ws.closed: return
-        await self.ws.send_json({"op":"unsubscribe","args":args})
-        logger.info(f"WS unsubscribed: {args}")
+        if args:
+            await self.ws.send_json({"op":"unsubscribe","args":args})
+            logger.info(f"WS unsubscribed: {args}")
 
     async def run(self) -> None:
         assert self.ws is not None
@@ -262,15 +236,10 @@ class SymbolState:
     k15: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
     k5:  List[Tuple[float,float,float,float,float]] = field(default_factory=list)
     k60: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
-
     funding_rate: float = 0.0
     next_funding_ms: Optional[int] = None
-
     oi_points: deque = field(default_factory=lambda: deque(maxlen=120))  # (ts_ms, oi_float)
-
-    # Ликвидации: [ (ts_ms, price, side_str('Buy'|'Sell'), qty) ]
-    liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))
-
+    liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))  # (ts, price, side, notional)
     last_signal_ts: int = 0
     cooldown_ts: Dict[str, int] = field(default_factory=dict)
 
@@ -282,29 +251,23 @@ class Market:
         self.last_signal_sent_ts: int = 0
 
 # =========================
-# Heatmap кластеризация
+# Heatmap
 # =========================
 def price_bin(price: float, bin_bps: int) -> float:
-    # Бин на основе процентов (б.п.)
-    # шаг = price * (bin_bps / 10_000)
     step = max(1e-6, price * (bin_bps / 10000.0))
     bins = round(price / step)
     return bins * step
 
 def heatmap_top_clusters(st: SymbolState, last_price: float) -> Tuple[List[Tuple[float,float]], List[Tuple[float,float]]]:
-    # Возвращаем топ HEATMAP_TOP_K по обе стороны: (price_bin, notional_sum)
     cutoff = now_ms() - HEATMAP_WINDOW_SEC * 1000
-    by_bin_buy: Dict[float, float] = defaultdict(float)   # Buy → ликвидации шортов (вверх)
-    by_bin_sell: Dict[float, float] = defaultdict(float)  # Sell → ликвидации лонгов (вниз)
+    by_bin_buy: Dict[float, float] = defaultdict(float)
+    by_bin_sell: Dict[float, float] = defaultdict(float)
     for ts, p, side, notional in st.liq_events:
         if ts < cutoff: continue
         b = price_bin(p, HEATMAP_BIN_BPS)
-        if side == "Buy":
-            by_bin_buy[b] += notional
-        elif side == "Sell":
-            by_bin_sell[b] += notional
-
-    ups  = sorted([(b, v) for b,v in by_bin_buy.items() if b > last_price], key=lambda x: abs(x[0]-last_price))[:HEATMAP_TOP_K]
+        if side == "Buy":  by_bin_buy[b]  += notional
+        if side == "Sell": by_bin_sell[b] += notional
+    ups  = sorted([(b, v) for b,v in by_bin_buy.items()  if b > last_price], key=lambda x: abs(x[0]-last_price))[:HEATMAP_TOP_K]
     dows = sorted([(b, v) for b,v in by_bin_sell.items() if b < last_price], key=lambda x: abs(x[0]-last_price))[:HEATMAP_TOP_K]
     return ups, dows
 
@@ -317,9 +280,7 @@ class Engine:
 
     def _oi_delta(self, st: SymbolState, minutes: int) -> float:
         if len(st.oi_points) < 2: return 0.0
-        now_t = now_ms()
-        # ищем точку ~minutes назад
-        target = now_t - minutes*60*1000
+        target = now_ms() - minutes*60*1000
         prev = None; last = st.oi_points[-1]
         for i in range(len(st.oi_points)-1, -1, -1):
             ts, v = st.oi_points[i]
@@ -330,36 +291,25 @@ class Engine:
         if oi0 <= 0: return 0.0
         return (oi1 - oi0) / oi0
 
-    def _side_bias_from_oi_price(self, oi_pct_15: float, oi_pct_5: float, c15_prev: float, c15_now: float) -> str:
-        price_up = c15_now > c15_prev
-        # простая матрица
+    def _side_bias(self, oi_pct_15: float, c_prev: float, c_now: float) -> str:
+        price_up = c_now > c_prev
         if price_up and oi_pct_15 > 0:  return "CONT_UP"
         if price_up and oi_pct_15 <= 0: return "REV_DOWN"
         if not price_up and oi_pct_15 > 0: return "CONT_DOWN"
-        if not price_up and oi_pct_15 <= 0: return "REV_UP"
-        return "NEUTRAL"
+        return "REV_UP"  # not price_up and oi<=0
 
     def _rr(self, entry: float, tp: float, sl: float, side: str) -> float:
         reward = (tp - entry) if side == "LONG" else (entry - tp)
         risk   = (entry - sl) if side == "LONG" else (sl - entry)
         return (reward / risk) if risk > 0 else 0.0
 
-    def _pick_tps(self, side: str, entry: float, atr15: float, clusters_up: List[Tuple[float,float]], clusters_dn: List[Tuple[float,float]]) -> Tuple[float, Optional[float]]:
-        # TP1: >= TP_MIN_PCT либо ближайший кластер противоположной стороны
+    def _pick_tps(self, side: str, entry: float, atr15: float, clusters_up, clusters_dn) -> Tuple[float, Optional[float]]:
         if side == "LONG":
-            if clusters_up:
-                tp1 = clusters_up[0][0]
-            else:
-                tp1 = entry * (1.0 + max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
+            tp1 = clusters_up[0][0] if clusters_up else entry * (1.0 + max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
+            tp2 = clusters_up[1][0] if len(clusters_up) > 1 else None
         else:
-            if clusters_dn:
-                tp1 = clusters_dn[0][0]
-            else:
-                tp1 = entry * (1.0 - max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
-        # TP2: следующий крупный кластер
-        tp2 = None
-        if side == "LONG" and len(clusters_up) > 1: tp2 = clusters_up[1][0]
-        if side == "SHORT" and len(clusters_dn) > 1: tp2 = clusters_dn[1][0]
+            tp1 = clusters_dn[0][0] if clusters_dn else entry * (1.0 - max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
+            tp2 = clusters_dn[1][0] if len(clusters_dn) > 1 else None
         return tp1, tp2
 
     def on_15m_close(self, sym: str) -> Optional[Dict[str, Any]]:
@@ -379,69 +329,46 @@ class Engine:
         vwap_bias_up = (c > vwap15 and vwap_slope > 0)
         vwap_bias_dn = (c < vwap15 and vwap_slope < 0)
 
-        # Funding / OI
         fr = st.funding_rate
         oi_pct_15 = self._oi_delta(st, OI_WINDOW_MIN)
-        oi_pct_5  = self._oi_delta(st, OI_SHORT_MIN)
 
         c_prev = K15[-2][3]
-        bias = self._side_bias_from_oi_price(oi_pct_15, oi_pct_5, c_prev, c)
+        bias = self._side_bias(oi_pct_15, c_prev, c)
 
-        # Heatmap clusters
         ups, dns = heatmap_top_clusters(st, c)
 
-        # Предвзятость сторон
-        long_block  = fr >= FUNDING_EXTREME_POS     # слишком дорого держать лонг
-        short_block = fr <= FUNDING_EXTREME_NEG     # слишком дорого держать шорт
+        long_block  = fr >= FUNDING_EXTREME_POS
+        short_block = fr <= FUNDING_EXTREME_NEG
 
-        # Базовые сценарии (простой и прозрачный набор):
         side: Optional[str] = None
         reason: List[str] = []
 
-        # CONT_UP: продолжение вверх (↑цена + ↑OI)
-        if bias == "CONT_UP" and not long_block:
-            # желательно поддержка VWAP и EMA100(1H)
-            if vwap_bias_up or (c > ema100_1h):
-                side = "LONG"; reason += ["Продолжение тренда: ↑цена + ↑OI", "VWAP/EMA100 поддерживают рост"]
+        if bias == "CONT_UP" and not long_block and (vwap_bias_up or c > ema100_1h):
+            side = "LONG"; reason += ["Продолжение: ↑цена + ↑OI", "VWAP/EMA100 поддерживают рост"]
+        if not side and bias == "CONT_DOWN" and not short_block and (vwap_bias_dn or c < ema100_1h):
+            side = "SHORT"; reason += ["Продолжение: ↓цена + ↑OI", "VWAP/EMA100 поддерживают падение"]
+        if not side and bias == "REV_UP" and not long_block and vol_ok:
+            side = "LONG"; reason += ["Де-левередж на падении: ↓цена + ↓OI", "Объём подтверждает отскок"]
+        if not side and bias == "REV_DOWN" and not short_block and vol_ok:
+            side = "SHORT"; reason += ["Слабость роста: ↑цена + ↓OI", "Объём подтверждает разворот"]
 
-        # CONT_DOWN: продолжение вниз (↓цена + ↑OI)
-        if not side and bias == "CONT_DOWN" and not short_block:
-            if vwap_bias_dn or (c < ema100_1h):
-                side = "SHORT"; reason += ["Продолжение падения: ↓цена + ↑OI", "VWAP/EMA100 поддерживают падение"]
+        if not side: return None
 
-        # REV_UP: де-левередж на падении (↓цена + ↓OI) → возможен отскок
-        if not side and bias == "REV_UP" and not long_block:
-            if vol_ok:  # нужен объём
-                side = "LONG"; reason += ["Де-левередж на падении: ↓цена + ↓OI", "Объём подтверждает отскок"]
-
-        # REV_DOWN: слабость роста (↑цена + ↓OI) → разворот вниз
-        if not side and bias == "REV_DOWN" and not short_block:
-            if vol_ok:
-                side = "SHORT"; reason += ["Слабость роста: ↑цена + ↓OI", "Объём подтверждает разворот"]
-
-        if not side:
-            return None
-
-        # SL: за экстремум 15m / ATR
         if side == "LONG":
             sl = min(l - 0.2*atr15, c - 0.8*atr15)
         else:
             sl = max(h + 0.2*atr15, c + 0.8*atr15)
 
-        # TP1/TP2: от кластеров противоположной стороны
         tp1, tp2 = self._pick_tps(side, c, atr15, ups, dns)
         tp_pct = (tp1 - c)/c if side=="LONG" else (c - tp1)/c
-        if tp_pct < TP_MIN_PCT:  # слишком маленький потенциал
-            return None
-        if tp_pct > TP_MAX_PCT:  # слишком далеко — урежем
-            if side=="LONG": tp1 = c * (1.0 + TP_MAX_PCT)
-            else:            tp1 = c * (1.0 - TP_MAX_PCT)
+        if tp_pct < TP_MIN_PCT: return None
+        if tp_pct > TP_MAX_PCT:
+            tp1 = c * (1.0 + TP_MAX_PCT) if side=="LONG" else c * (1.0 - TP_MAX_PCT)
 
         rr = self._rr(c, tp1, sl, side)
-        if rr < RR_MIN:
-            return None
+        if rr < RR_MIN: return None
 
-        # Кулдаун
+        # кулдаун на сторону
         nowt = now_ms()
         last = st.cooldown_ts.get(side, 0)
         if nowt - last < SIGNAL_COOLDOWN_SEC * 1000:
@@ -452,7 +379,7 @@ class Engine:
             "symbol": sym, "side": side, "entry": float(c),
             "tp1": float(tp1), "tp2": float(tp2) if tp2 else None,
             "sl": float(sl), "rr": float(rr),
-            "funding": float(fr), "oi15": float(oi_pct_15), "oi5": float(oi_pct_5),
+            "funding": float(fr), "oi15": float(oi_pct_15),
             "vwap_bias": ("UP" if vwap_bias_up else ("DOWN" if vwap_bias_dn else "NEUTRAL")),
             "ema100_1h": float(ema100_1h),
             "heat_up": ups, "heat_dn": dns,
@@ -469,48 +396,36 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
     tp1_pct = (tp1 - entry)/entry if side=="LONG" else (entry - tp1)/entry
     tp2 = sig.get("tp2")
     fr = sig.get("funding", 0.0)
-    oi15 = sig.get("oi15", 0.0); oi5 = sig.get("oi5", 0.0)
-    heat_up = sig.get("heat_up") or []; heat_dn = sig.get("heat_dn") or []
+    ups = sig.get("heat_up") or []; dns = sig.get("heat_dn") or []
     next_f = sig.get("next_funding_ms")
     nf = ""
     if next_f:
-        mins = max(0, int((next_f - now_ms())/60000))
-        nf = f" (через ~{mins} мин)" if mins else " (скоро)"
-
-    # ближайший кластер
+        mins = max(0, int((next_f - now_ms())/60000)); nf = f" (через ~{mins} мин)" if mins else " (скоро)"
     heat_line = "Heatmap: "
-    if side=="LONG":
-        heat_line += ("вверху≈" + ", ".join(f"{p:g}" for p,_ in heat_up[:2]) if heat_up else "—")
-    else:
-        heat_line += ("внизу≈" + ", ".join(f"{p:g}" for p,_ in heat_dn[:2]) if heat_dn else "—")
+    heat_line += ("вверху≈" + ", ".join(f"{p:g}" for p,_ in ups[:2]) if side=="LONG" else
+                  "внизу≈" + ", ".join(f"{p:g}" for p,_ in dns[:2]))
 
-    reason = sig.get("reason", [])
-    reasons = "".join(f"\n- {r}" for r in reason)
-
+    reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
     warn_lines = []
-    if fr >= FUNDING_EXTREME_POS: warn_lines.append("Экстремально высокий фандинг, лонги дороже.")
-    if fr <= FUNDING_EXTREME_NEG: warn_lines.append("Экстремально низкий фандинг, шорты дороже.")
+    if fr >= FUNDING_EXTREME_POS: warn_lines.append("Высокий фандинг — лонги дороже.")
+    if fr <= FUNDING_EXTREME_NEG: warn_lines.append("Низкий фандинг — шорты дороже.")
 
     lines = [
         f"🎯 <b>ФЬЮЧЕРСЫ | {side} SIGNAL</b> на <b>[{sym}]</b> (15m/5m)",
-        "<b>Параметры деривативов:</b>",
+        "<b>Параметры:</b>",
         f"- <b>Funding Rate:</b> {fr:+.4%}{nf}",
-        f"- <b>Open Interest:</b> 15m {oi15:+.2%} • 5m {oi5:+.2%}",
         f"- {heat_line}",
         f"<b>Вход:</b> {entry:g}",
         f"<b>Стоп-Лосс:</b> {sl:g}",
         f"<b>Тейк-Профит 1:</b> {tp1:g} ({pct(tp1_pct)})" + (f"\n<b>Тейк-Профит 2:</b> {tp2:g}" if tp2 else ""),
         "<b>Обоснование:</b>" + reasons if reasons else None,
-        "<b>ВНИМАНИЕ:</b>",
-        "- Следующий фандинг учтите в расчётах." + (f" До пересчёта{nf}." if nf else ""),
-        "- Плечо: не более x10.",
-        "- Риск: 1% от депозита.",
+        "<b>Риск:</b> плечо ≤ x10; риск ≤ 1% депозита.",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     return "\n".join([x for x in lines if x])
 
 # =========================
-# Команды TG
+# TG команды
 # =========================
 async def tg_loop(app: web.Application) -> None:
     tg: Tg = app["tg"]; mkt: Market = app["mkt"]
@@ -520,29 +435,57 @@ async def tg_loop(app: web.Application) -> None:
             resp = await tg.updates(offset=offset, timeout=25)
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("channel_post"); 
+                msg = upd.get("message") or upd.get("channel_post")
                 if not msg: continue
                 chat_id = msg.get("chat", {}).get("id")
-                text = msg.get("text") or ""
+                text = (msg.get("text") or "").strip()
                 if not isinstance(chat_id, int) or not text.startswith("/"): continue
                 if chat_id not in ALLOWED_CHAT_IDS and chat_id not in PRIMARY_RECIPIENTS: continue
                 cmd = text.split()[0].lower()
+
                 if cmd == "/ping":
                     ago = (now_ms() - mkt.last_ws_msg_ts)/1000.0
                     await tg.send(chat_id, f"pong • WS last msg {ago:.1f}s ago • symbols={len(mkt.symbols)}")
+
                 elif cmd == "/status":
-                    silent_min = (now_ms() - mkt.last_signal_sent_ts)/60000.0 if mkt.last_signal_sent_ts else 1e9
-                    await tg.send(chat_id, "✅ Online\n"
-                                  f"Symbols: {len(mkt.symbols)}\n"
-                                  "Mode: Derivatives (Funding + OI + All-Liquidations)\n"
-                                  f"TP≥{pct(TP_MIN_PCT)} • RR≥{RR_MIN:.2f}\n"
-                                  f"Silent (signals): {silent_min:.1f}m\n")
+                    silent_line = "—" if mkt.last_signal_sent_ts == 0 else f"{(now_ms()-mkt.last_signal_sent_ts)/60000.0:.1f}m"
+                    await tg.send(chat_id,
+                        "✅ Online\n"
+                        f"Symbols: {len(mkt.symbols)}\n"
+                        "Mode: Derivatives (Funding + OI + All-Liquidations)\n"
+                        f"TP≥{pct(TP_MIN_PCT)} • RR≥{RR_MIN:.2f}\n"
+                        f"Silent (signals): {silent_line}")
+
                 elif cmd == "/help":
                     await tg.send(chat_id,
                         "Команды:\n"
                         "/ping — пинг\n"
                         "/status — статус\n"
-                        "/metrics <SYMBOL> — Funding/OI/Heatmap\n")
+                        "/diag — диагностика буферов и метрик\n"
+                        "/jobs — фоновые задачи\n"
+                        "/metrics <SYMBOL> — Funding/OI/Heatmap")
+
+                elif cmd == "/jobs":
+                    jobs = []
+                    for k in ("ws_task","keepalive_task","watchdog_task","tg_task","universe_task"):
+                        t = app.get(k); jobs.append(f"{k}: {'running' if (t and not t.done()) else 'stopped'}")
+                    await tg.send(chat_id, "Jobs:\n" + "\n".join(jobs))
+
+                elif cmd == "/diag":
+                    # краткая диагностика
+                    k15_pts = sum(len(mkt.state[s].k15) for s in mkt.symbols)
+                    k5_pts  = sum(len(mkt.state[s].k5) for s in mkt.symbols)
+                    k60_pts = sum(len(mkt.state[s].k60) for s in mkt.symbols)
+                    ago = (now_ms() - mkt.last_ws_msg_ts)/1000.0
+                    silent_line = "—" if mkt.last_signal_sent_ts == 0 else f"{(now_ms()-mkt.last_signal_sent_ts)/60000.0:.1f}m"
+                    head = ", ".join(mkt.symbols[:10]) if mkt.symbols else "—"
+                    await tg.send(chat_id,
+                        "Diag:\n"
+                        f"WS last msg: {ago:.1f}s ago\n"
+                        f"Symbols: {len(mkt.symbols)} (head: {head})\n"
+                        f"Kline buffers: 15m={k15_pts} • 5m={k5_pts} • 60m={k60_pts}\n"
+                        f"Silent (signals): {silent_line}")
+
                 elif cmd.startswith("/metrics"):
                     parts = text.split()
                     if len(parts) < 2:
@@ -550,13 +493,12 @@ async def tg_loop(app: web.Application) -> None:
                     else:
                         s = parts[1].upper()
                         st = mkt.state.get(s)
-                        if not st: 
-                            await tg.send(chat_id, "Нет данных. Подожди, наполняем буферы.")
+                        if not st or not st.k15:
+                            await tg.send(chat_id, "Нет данных. Буферы ещё наполняются.")
                         else:
-                            oi15 = Engine(mkt)._oi_delta(st, OI_WINDOW_MIN)
-                            oi5  = Engine(mkt)._oi_delta(st, OI_SHORT_MIN)
-                            last = st.k15[-1][3] if st.k15 else 0.0
-                            ups, dns = heatmap_top_clusters(st, last)
+                            # простая сводка
+                            oi_15 = Engine(mkt)._oi_delta(st, OI_WINDOW_MIN)
+                            ups, dns = heatmap_top_clusters(st, st.k15[-1][3])
                             hf = lambda arr: ", ".join(f"{p:g}" for p,_ in arr) if arr else "—"
                             next_f = ""
                             if st.next_funding_ms:
@@ -564,10 +506,12 @@ async def tg_loop(app: web.Application) -> None:
                                 next_f = f"через ~{mins} мин"
                             await tg.send(chat_id,
                                 f"📈 <b>{s}</b>\nFunding: {st.funding_rate:+.4%} {('('+next_f+')' if next_f else '')}\n"
-                                f"OIΔ: 15m {oi15:+.2%} • 5m {oi5:+.2%}\n"
-                                f"Heatmap up: {hf(ups)}\nHeatmap down: {hf(dns)}\n")
+                                f"OIΔ(15m): {oi_15:+.2%}\n"
+                                f"Heatmap up: {hf(ups)}\nHeatmap down: {hf(dns)}")
+
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /help")
+
         except asyncio.CancelledError:
             break
         except Exception:
@@ -583,25 +527,19 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     topic = data.get("topic") or ""
     mkt.last_ws_msg_ts = now_ms()
 
-    # TICKER (fundingRate, nextFundingTime, openInterest)
     if topic.startswith("tickers."):
         d = data.get("data") or {}
         sym = d.get("symbol")
         if not sym: return
         st = mkt.state[sym]
-        try:
-            fr = float(d.get("fundingRate") or 0.0)
-            st.funding_rate = fr
-        except Exception: pass
-        try:
+        with contextlib.suppress(Exception):
+            st.funding_rate = float(d.get("fundingRate") or 0.0)
+        with contextlib.suppress(Exception):
             st.next_funding_ms = int(d.get("nextFundingTime")) if d.get("nextFundingTime") else None
-        except Exception: pass
-        try:
+        with contextlib.suppress(Exception):
             oi = float(d.get("openInterest") or 0.0)
             st.oi_points.append((now_ms(), oi))
-        except Exception: pass
 
-    # KLINE 15m
     elif topic.startswith(f"kline.{EXEC_TF_MAIN}."):
         payload = data.get("data") or []
         if payload:
@@ -614,7 +552,6 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                 else:
                     st.k15.append((o,h,l,c,v))
                     if len(st.k15) > 900: st.k15 = st.k15[-900:]
-                # на закрытии 15m — генерим сигнал
                 if p.get("confirm") is True:
                     sig = eng.on_15m_close(sym)
                     if sig:
@@ -625,7 +562,6 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                         mkt.last_signal_sent_ts = now_ms()
                         mkt.state[sym].last_signal_ts = now_ms()
 
-    # KLINE 5m
     elif topic.startswith(f"kline.{EXEC_TF_AUX}."):
         payload = data.get("data") or []
         if payload:
@@ -639,7 +575,6 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     st.k5.append((o,h,l,c,v))
                     if len(st.k5) > 900: st.k5 = st.k5[-900:]
 
-    # KLINE 60m
     elif topic.startswith("kline.60."):
         payload = data.get("data") or []
         if payload:
@@ -653,10 +588,8 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     st.k60.append((o,h,l,c,v))
                     if len(st.k60) > 900: st.k60 = st.k60[-900:]
 
-    # All Liquidations (все ликвидации по символу)
     elif topic.startswith("allLiquidation."):
         d = data.get("data") or []
-        # массив объектов: { "symbol": "...", "price": "...", "side": "Buy|Sell", "qty": "...", "timestamp": "..." }
         for it in d:
             try:
                 sym = it.get("symbol") or topic.split(".")[-1]
@@ -666,14 +599,9 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                 qty = float(it.get("qty") or it.get("size") or 0.0)
                 ts  = int(it.get("timestamp") or now_ms())
                 if p>0 and side in ("Buy","Sell") and qty>0:
-                    # считаем нотионал приблизительно как price*qty
                     st.liq_events.append((ts, p, side, p*qty))
             except Exception:
                 continue
-
-    # ORDERBOOK (опционально — сейчас не используем жёстко, оставлено для будущих фильтров)
-    elif topic.startswith("orderbook."):
-        pass
 
 # =========================
 # Фоновые задачи
@@ -707,37 +635,52 @@ async def watchdog_loop(app: web.Application) -> None:
         except Exception:
             logger.exception("watchdog error")
 
+# -------- Вселенная символов
+async def build_universe_once(rest: BybitRest) -> List[str]:
+    """Надёжное построение вселенной c фолбэком на CORE_SYMBOLS.
+       Spot-верификация — опциональна (если упала, не блокируем)."""
+    symbols: List[str] = []
+    try:
+        tickers = await rest.tickers_linear()
+        pool: List[str] = []
+        for t in tickers:
+            sym = t.get("symbol") or ""
+            if not sym.endswith("USDT"):  # работаем с USDT-перпами
+                continue
+            try:
+                turn = float(t.get("turnover24h") or 0.0)
+                vol  = float(t.get("volume24h") or 0.0)
+            except Exception:
+                continue
+            if turn >= TURNOVER_MIN_USD or vol >= VOLUME_MIN_USD:
+                pool.append(sym)
+
+        # пробуем SPOT-верификацию, но не делаем её блокирующей
+        verified: List[str] = []
+        try:
+            for s in pool:
+                with contextlib.suppress(Exception):
+                    spot = await rest.instruments_info("spot", s)
+                    if spot: verified.append(s)
+        except Exception:
+            verified = pool[:]  # если упала — берём без проверки
+
+        symbols = CORE_SYMBOLS + [x for x in verified if x not in CORE_SYMBOLS]
+        symbols = symbols[:ACTIVE_SYMBOLS]
+    except Exception:
+        logger.exception("build_universe_once error")
+        symbols = CORE_SYMBOLS[:ACTIVE_SYMBOLS]
+
+    if not symbols:
+        symbols = CORE_SYMBOLS[:ACTIVE_SYMBOLS]
+    return symbols
+
 async def universe_refresh_loop(app: web.Application) -> None:
     rest: BybitRest = app["rest"]; ws: BybitWS = app["ws"]; mkt: Market = app["mkt"]
     while True:
         try:
             await asyncio.sleep(UNIVERSE_REFRESH_SEC)
-            tickers = await rest.tickers_linear()
-            # первичный пул по обороту/объёму
-            pool: List[str] = []
-            for t in tickers:
-                sym = t.get("symbol") or ""
-                if not sym.endswith("USDT"): continue
-                try:
-                    turn = float(t.get("turnover24h") or 0.0)
-                    vol  = float(t.get("volume24h") or 0.0)
-                except Exception:
-                    continue
-                if turn >= TURNOVER_MIN_USD or vol >= VOLUME_MIN_USD:
-                    pool.append(sym)
-
-            # верификация наличия на SPOT
-            valid: List[str] = []
-            for s in pool:
-                with contextlib.suppress(Exception):
-                    spot = await rest.instruments_info("spot", s)
-                    if not spot: 
-                        continue
-                    valid.append(s)
-
-            # итоговый список
-            symbols_new = CORE_SYMBOLS + [x for x in valid if x not in CORE_SYMBOLS]
-            symbols_new = symbols_new[:ACTIVE_SYMBOLS]
+            symbols_new = await build_universe_once(rest)
             symbols_old = set(mkt.symbols)
             add = [s for s in symbols_new if s not in symbols_old]
             rem = [s for s in mkt.symbols if s not in set(symbols_new)]
@@ -745,12 +688,12 @@ async def universe_refresh_loop(app: web.Application) -> None:
                 if rem:
                     args = []
                     for s in rem:
-                        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}", f"orderbook.50.{s}"]
+                        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
                     await ws.unsubscribe(args)
                 if add:
                     args = []
                     for s in add:
-                        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}", f"orderbook.50.{s}"]
+                        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
                     await ws.subscribe(args)
                 mkt.symbols = symbols_new
                 logger.info(f"[universe] +{len(add)} / -{len(rem)} • total={len(mkt.symbols)}")
@@ -783,19 +726,26 @@ async def on_startup(app: web.Application) -> None:
     app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: ws_on_message(app, data)
 
-    # начальная вселенная
-    try:
-        await universe_refresh_loop.__wrapped__(app)  # один прогон синхронно
-    except Exception:
-        logger.exception("initial universe build failed")
+    # Надёжная инициализация вселенной
+    symbols = await build_universe_once(app["rest"])
+    app["mkt"].symbols = symbols
+    logger.info(f"symbols: {symbols}")
 
-    # подписки
-    args = []
-    for s in app["mkt"].symbols:
-        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}", f"orderbook.50.{s}"]
+    # Подключение WS и подписки
     await app["ws"].connect()
+    args = []
+    for s in symbols:
+        args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
     if args:
         await app["ws"].subscribe(args)
+    else:
+        # страховка: подписываемся хотя бы на CORE_SYMBOLS
+        fallback = CORE_SYMBOLS[:]
+        app["mkt"].symbols = fallback
+        fargs = []
+        for s in fallback:
+            fargs += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
+        await app["ws"].subscribe(fargs)
 
     # фоновые таски
     app["ws_task"] = asyncio.create_task(app["ws"].run())
@@ -807,7 +757,7 @@ async def on_startup(app: web.Application) -> None:
     # привет
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, "🟢 Cryptobot v5 запущен: деривативы (Funding + OI + All-Liquidations)")
+            await app["tg"].send(chat_id, "🟢 Cryptobot v5.1 запущен: деривативы (Funding + OI + All-Liquidations)")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -823,17 +773,4 @@ async def on_cleanup(app: web.Application) -> None:
         await app["http"].close()
 
 def make_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    app.router.add_get("/healthz", handle_health)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    return app
-
-def main() -> None:
-    setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v5 — Derivatives Core (Funding/OI/Liquidations), TF=15m/5m, Context=1H")
-    web.run_app(make_app(), host="0.0.0.0", port=PORT)
-
-if __name__ == "__main__":
-    main()
+    app
