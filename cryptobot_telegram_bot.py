@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Telegram сигналы (Bybit V5 WebSocket)
-v3.6 — Startup notify + faster watchdog (no heartbeat)
-  • Убран heartbeat (как просил).
-  • Одноразовое Telegram-уведомление при старте контейнера.
-  • Жёсткий сторожок по умолчанию 240s (меняется ENV STALL_EXIT_SEC).
-  • Кнопки /ping /status /healthz /diag /jobs через reply-клавиатуру (/help).
+v3.7 — + /levels (поддержка/сопротивление)
+  • Команда /levels <SYMBOL> [tf] (tf: 1|5|60|240; по умолчанию 60).
+  • Уровни считаются из свингов (swing high/low), + VWAP и «стены» стакана.
+  • Остальной функционал — как в v3.6: без heartbeat, сторожок и т.д.
 """
 
 from __future__ import annotations
@@ -898,6 +897,87 @@ def format_signal(sig: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 # =========================
+# Уровни S/R для команды /levels
+# =========================
+def calc_levels(app: web.Application, sym: str, tf: str = "60") -> Optional[str]:
+    mkt: MarketState = app["mkt"]
+    obm: OrderBookManager = app["obm"]
+
+    rows = mkt.kline.get(tf, {}).get(sym) or []
+    if len(rows) < 60:
+        return None
+
+    # Метрики
+    a = atr(rows, ATR_PERIOD_1M if tf == "1" else 14)
+    vwap_now, vwap_slope = rolling_vwap(rows, VWAP_WINDOW)
+    last = rows[-1][3]
+
+    # Свинги
+    SH, SL = find_swings(rows, SWING_FRAC)
+    highs = [rows[i][1] for i in SH][-5:]
+    lows  = [rows[i][2] for i in SL][-5:]
+
+    def nearest_levels(levels, above: bool, n=3):
+        if not levels: return []
+        if above:
+            arr = sorted([x for x in levels if x > last])[:n]
+        else:
+            arr = sorted([x for x in levels if x < last], reverse=True)[:n]
+        return arr
+
+    R_from_swings = nearest_levels(highs, above=True, n=3)
+    S_from_swings = nearest_levels(lows,  above=False, n=3)
+
+    # Плотности/стены из стакана
+    instr = mkt.instruments.get(sym) or {}
+    tick = float(instr.get("priceFilter", {}).get("tickSize") or 1e-6) or 1e-6
+    ladder = AutoLadder(tick=tick, bps=LADDER_BPS_DEFAULT if (sym.startswith("BTC") or sym.startswith("ETH")) else LADDER_BPS_ALT)
+    obf = obm.features(sym, ladder)
+
+    walls_up: List[float] = []
+    walls_dn: List[float] = []
+    if obf:
+        c = last
+        walls_bid = obf.get("walls_bid") or []
+        walls_ask = obf.get("walls_ask") or []
+        walls_dn = [p for p, s in walls_bid if p < c]
+        walls_up = [p for p, s in walls_ask if p > c]
+        walls_up = sorted(walls_up)[:3]
+        walls_dn = sorted(walls_dn, reverse=True)[:3]
+
+    # Склейка уровней с толерансом ~0.15%
+    def merge_levels(arrs, tol=0.0015):
+        out: List[float] = []
+        for arr in arrs:
+            for x in arr:
+                if not out:
+                    out.append(x); continue
+                if all(abs(x - y) / max(1e-9, y) > tol for y in out):
+                    out.append(x)
+        return sorted(out)
+
+    R = merge_levels([R_from_swings, walls_up])[:3]
+    S = merge_levels([S_from_swings, walls_dn])[:3]
+
+    def fmt_levels(name, lvls):
+        if not lvls: return f"{name}: —"
+        return f"{name}: " + ", ".join(f"{v:g}" for v in lvls)
+
+    vwap_line = f"VWAP: {vwap_now:g} ({'↗' if vwap_slope>0 else ('↘' if vwap_slope<0 else '→')})" if vwap_now else "VWAP: —"
+    atr_line  = f"ATR({ATR_PERIOD_1M if tf=='1' else 14}): {a:g}"
+
+    lines = [
+        f"📊 <b>Уровни {sym} [{tf}m]</b>",
+        f"Цена: <b>{last:g}</b>",
+        fmt_levels("Сопротивления", R),
+        fmt_levels("Поддержки",    S),
+        vwap_line + f" • {atr_line}",
+        f"Стены: ask≈{', '.join(f'{x:g}' for x in walls_up) or '—'} | bid≈{', '.join(f'{x:g}' for x in walls_dn) or '—'}",
+        "Источник: свинги (локальные экстремумы), VWAP и плотности стакана",
+    ]
+    return "\n".join(lines)
+
+# =========================
 # Командный интерфейс (Telegram)
 # =========================
 async def tg_updates_loop(app: web.Application) -> None:
@@ -920,11 +1000,17 @@ async def tg_updates_loop(app: web.Application) -> None:
                     kb = [
                         ["/ping", "/status"],
                         ["/healthz", "/diag"],
-                        ["/jobs"]
+                        ["/jobs", "/levels BTCUSDT 60"]
                     ]
                     await tg.send_with_keyboard(
                         chat_id,
-                        "Команды:\n/ping — связь\n/status — статус\n/healthz — проверка здоровья\n/diag — диагностика\n/jobs — фоновые задачи",
+                        "Команды:\n"
+                        "/ping — связь\n"
+                        "/status — статус\n"
+                        "/healthz — проверка здоровья\n"
+                        "/diag — диагностика\n"
+                        "/jobs — фоновые задачи\n"
+                        "/levels <SYMBOL> [tf] — уровни S/R (tf: 1|5|60|240; по умолчанию 60)",
                         kb
                     )
 
@@ -966,6 +1052,19 @@ async def tg_updates_loop(app: web.Application) -> None:
                     uptime = int(time.monotonic() - t0)
                     last_age = int((now_ts_ms() - mkt.last_ws_msg_ts)/1000.0)
                     await tg.send(chat_id, f"ok: true\nuptime_sec: {uptime}\nlast_ws_msg_age_sec: {last_age}\nsymbols: {len(app.get('symbols', []))}")
+
+                elif cmd.startswith("/levels"):
+                    parts = text.split()
+                    sym = parts[1].upper() if len(parts) >= 2 else None
+                    tf = parts[2] if len(parts) >= 3 else "60"
+                    if not sym or tf not in ("1","5","60","240"):
+                        await tg.send(chat_id, "Формат: /levels <SYMBOL> [tf]\nНапример: /levels BTCUSDT 60")
+                    else:
+                        msg = calc_levels(app, sym, tf)
+                        if msg:
+                            await tg.send(chat_id, msg)
+                        else:
+                            await tg.send(chat_id, "Недостаточно данных для расчёта уровней. Подождите, наполняются буферы.")
 
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /help")
