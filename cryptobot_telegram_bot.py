@@ -773,4 +773,17 @@ async def on_cleanup(app: web.Application) -> None:
         await app["http"].close()
 
 def make_app() -> web.Application:
-    app
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/healthz", handle_health)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+def main() -> None:
+    setup_logging(LOG_LEVEL)
+    logger.info("Starting Cryptobot v5.1 — Derivatives Core (Funding/OI/Liquidations), TF=15m/5m, Context=1H")
+    web.run_app(make_app(), host="0.0.0.0", port=PORT)
+
+if __name__ == "__main__":
+    main()
