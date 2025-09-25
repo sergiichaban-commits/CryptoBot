@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v5.1 — фиксы вселенной, Telegram-диагностика (/diag, /jobs), нормальный вывод Silent
+v5.2 — упрощённые тест-сигналы, мягче фильтры ликвидности и сигналов, расширенная диагностика
 """
 
 from __future__ import annotations
@@ -33,10 +33,10 @@ ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
 ONLY_CHANNEL = True
 
-# Вселенная: фильтры
+# Вселенная: фильтры — СМЯГЧЕНО
 UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = 100_000_000.0   # >$100M
-VOLUME_MIN_USD = 100_000_000.0
+TURNOVER_MIN_USD = 5_000_000.0   # ↓ было 100M
+VOLUME_MIN_USD  = 5_000_000.0    # ↓ было 100M
 ACTIVE_SYMBOLS = 60
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
@@ -45,10 +45,10 @@ EXEC_TF_MAIN = "15"               # базовый сигнал — 15m close
 EXEC_TF_AUX  = "5"                # уточнение — 5m close
 CONTEXT_TF   = "60"               # контекст EMA/VWAP (1H)
 
-# Индикаторы / пороги
+# Индикаторы / пороги — СМЯГЧЕНО
 ATR_PERIOD_15 = 14
 VOL_SMA_15 = 20
-VOL_MULT_ENTRY = 1.5
+VOL_MULT_ENTRY = 1.2              # ↓ было 1.5
 EMA_PERIOD_1H = 100
 VWAP_WINDOW_15 = 60
 
@@ -62,9 +62,9 @@ HEATMAP_WINDOW_SEC = 2 * 60 * 60
 HEATMAP_BIN_BPS = 25
 HEATMAP_TOP_K = 3
 
-TP_MIN_PCT = 0.007
-TP_MAX_PCT = 0.02
-RR_MIN = 1.2
+TP_MIN_PCT = 0.003                # ↓ было 0.007 (=0.7%)
+TP_MAX_PCT = 0.015                # ↓ было 0.02  (=2.0%)
+RR_MIN = 1.0                      # ↓ было 1.2
 
 SIGNAL_COOLDOWN_SEC = 30
 KEEPALIVE_SEC = 13 * 60
@@ -236,10 +236,13 @@ class SymbolState:
     k15: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
     k5:  List[Tuple[float,float,float,float,float]] = field(default_factory=list)
     k60: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
+
     funding_rate: float = 0.0
     next_funding_ms: Optional[int] = None
+
     oi_points: deque = field(default_factory=lambda: deque(maxlen=120))  # (ts_ms, oi_float)
     liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))  # (ts, price, side, notional)
+
     last_signal_ts: int = 0
     cooldown_ts: Dict[str, int] = field(default_factory=dict)
 
@@ -272,7 +275,7 @@ def heatmap_top_clusters(st: SymbolState, last_price: float) -> Tuple[List[Tuple
     return ups, dows
 
 # =========================
-# Сигнальный движок (15m)
+# Сигнальный движок (15m) — УПРОЩЁН ДЛЯ ТЕСТА
 # =========================
 class Engine:
     def __init__(self, mkt: Market):
@@ -291,101 +294,50 @@ class Engine:
         if oi0 <= 0: return 0.0
         return (oi1 - oi0) / oi0
 
-    def _side_bias(self, oi_pct_15: float, c_prev: float, c_now: float) -> str:
-        price_up = c_now > c_prev
-        if price_up and oi_pct_15 > 0:  return "CONT_UP"
-        if price_up and oi_pct_15 <= 0: return "REV_DOWN"
-        if not price_up and oi_pct_15 > 0: return "CONT_DOWN"
-        return "REV_UP"  # not price_up and oi<=0
-
-    def _rr(self, entry: float, tp: float, sl: float, side: str) -> float:
-        reward = (tp - entry) if side == "LONG" else (entry - tp)
-        risk   = (entry - sl) if side == "LONG" else (sl - entry)
-        return (reward / risk) if risk > 0 else 0.0
-
-    def _pick_tps(self, side: str, entry: float, atr15: float, clusters_up, clusters_dn) -> Tuple[float, Optional[float]]:
-        if side == "LONG":
-            tp1 = clusters_up[0][0] if clusters_up else entry * (1.0 + max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
-            tp2 = clusters_up[1][0] if len(clusters_up) > 1 else None
-        else:
-            tp1 = clusters_dn[0][0] if clusters_dn else entry * (1.0 - max(TP_MIN_PCT, 0.6 * atr15 / max(1e-9, entry)))
-            tp2 = clusters_dn[1][0] if len(clusters_dn) > 1 else None
-        return tp1, tp2
-
     def on_15m_close(self, sym: str) -> Optional[Dict[str, Any]]:
+        """
+        ВРЕМЕННАЯ ПРОСТАЯ ЛОГИКА ДЛЯ ОТЛАДКИ:
+        - Требуем минимум 20 15m-свечей.
+        - Если последняя свеча закрылась > +0.1% от предыдущей — LONG (SL -0.5%, TP +1%).
+        - Если < -0.1% — SHORT (SL +0.5%, TP -1%).
+        """
         st = self.mkt.state[sym]
-        K15 = st.k15; K60 = st.k60
-        if len(K15) < max(ATR_PERIOD_15+2, VOL_SMA_15+2) or len(K60) < EMA_PERIOD_1H+2:
+        K15 = st.k15
+        if len(K15) < 20:
             return None
 
-        o,h,l,c,v = K15[-1]
-        atr15 = atr(K15, ATR_PERIOD_15)
-        vols = [x[4] for x in K15]; v_sma = sma(vols, VOL_SMA_15)
-        vol_ok = v_sma > 0 and v >= VOL_MULT_ENTRY * v_sma
-
-        closes_1h = [x[3] for x in K60]
-        ema100_1h = ema(closes_1h, EMA_PERIOD_1H)
-        vwap15, vwap_slope = rolling_vwap(K15, VWAP_WINDOW_15)
-        vwap_bias_up = (c > vwap15 and vwap_slope > 0)
-        vwap_bias_dn = (c < vwap15 and vwap_slope < 0)
-
-        fr = st.funding_rate
-        oi_pct_15 = self._oi_delta(st, OI_WINDOW_MIN)
-
+        o, h, l, c, v = K15[-1]
         c_prev = K15[-2][3]
-        bias = self._side_bias(oi_pct_15, c_prev, c)
-
-        ups, dns = heatmap_top_clusters(st, c)
-
-        long_block  = fr >= FUNDING_EXTREME_POS
-        short_block = fr <= FUNDING_EXTREME_NEG
-
-        side: Optional[str] = None
-        reason: List[str] = []
-
-        if bias == "CONT_UP" and not long_block and (vwap_bias_up or c > ema100_1h):
-            side = "LONG"; reason += ["Продолжение: ↑цена + ↑OI", "VWAP/EMA100 поддерживают рост"]
-        if not side and bias == "CONT_DOWN" and not short_block and (vwap_bias_dn or c < ema100_1h):
-            side = "SHORT"; reason += ["Продолжение: ↓цена + ↑OI", "VWAP/EMA100 поддерживают падение"]
-        if not side and bias == "REV_UP" and not long_block and vol_ok:
-            side = "LONG"; reason += ["Де-левередж на падении: ↓цена + ↓OI", "Объём подтверждает отскок"]
-        if not side and bias == "REV_DOWN" and not short_block and vol_ok:
-            side = "SHORT"; reason += ["Слабость роста: ↑цена + ↓OI", "Объём подтверждает разворот"]
-
-        if not side: return None
-
-        if side == "LONG":
-            sl = min(l - 0.2*atr15, c - 0.8*atr15)
-        else:
-            sl = max(h + 0.2*atr15, c + 0.8*atr15)
-
-        tp1, tp2 = self._pick_tps(side, c, atr15, ups, dns)
-        tp_pct = (tp1 - c)/c if side=="LONG" else (c - tp1)/c
-        if tp_pct < TP_MIN_PCT: return None
-        if tp_pct > TP_MAX_PCT:
-            tp1 = c * (1.0 + TP_MAX_PCT) if side=="LONG" else c * (1.0 - TP_MAX_PCT)
-
-        rr = self._rr(c, tp1, sl, side)
-        if rr < RR_MIN: return None
-
-        # кулдаун на сторону
-        nowt = now_ms()
-        last = st.cooldown_ts.get(side, 0)
-        if nowt - last < SIGNAL_COOLDOWN_SEC * 1000:
+        if c_prev <= 0: 
             return None
-        st.cooldown_ts[side] = nowt
 
-        return {
-            "symbol": sym, "side": side, "entry": float(c),
-            "tp1": float(tp1), "tp2": float(tp2) if tp2 else None,
-            "sl": float(sl), "rr": float(rr),
-            "funding": float(fr), "oi15": float(oi_pct_15),
-            "vwap_bias": ("UP" if vwap_bias_up else ("DOWN" if vwap_bias_dn else "NEUTRAL")),
-            "ema100_1h": float(ema100_1h),
-            "heat_up": ups, "heat_dn": dns,
-            "reason": reason,
-            "next_funding_ms": st.next_funding_ms,
-        }
+        price_change = (c - c_prev) / c_prev
+
+        if price_change > 0.001:  # +0.1%
+            sl = c * 0.995     # -0.5%
+            tp = c * 1.010     # +1.0%
+            return {
+                "symbol": sym, "side": "LONG", "entry": float(c),
+                "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": 2.0,
+                "funding": st.funding_rate, "oi15": 0.0, "vwap_bias": "UP",
+                "ema100_1h": c, "heat_up": [], "heat_dn": [],
+                "reason": ["Тестовый сигнал: рост цены > 0.1%"],
+                "next_funding_ms": st.next_funding_ms,
+            }
+
+        if price_change < -0.001:  # -0.1%
+            sl = c * 1.005     # +0.5%
+            tp = c * 0.990     # -1.0%
+            return {
+                "symbol": sym, "side": "SHORT", "entry": float(c),
+                "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": 2.0,
+                "funding": st.funding_rate, "oi15": 0.0, "vwap_bias": "DOWN",
+                "ema100_1h": c, "heat_up": [], "heat_dn": [],
+                "reason": ["Тестовый сигнал: падение цены > 0.1%"],
+                "next_funding_ms": st.next_funding_ms,
+            }
+
+        return None
 
 # =========================
 # Формат сообщения
@@ -406,10 +358,6 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
                   "внизу≈" + ", ".join(f"{p:g}" for p,_ in dns[:2]))
 
     reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
-    warn_lines = []
-    if fr >= FUNDING_EXTREME_POS: warn_lines.append("Высокий фандинг — лонги дороже.")
-    if fr <= FUNDING_EXTREME_NEG: warn_lines.append("Низкий фандинг — шорты дороже.")
-
     lines = [
         f"🎯 <b>ФЬЮЧЕРСЫ | {side} SIGNAL</b> на <b>[{sym}]</b> (15m/5m)",
         "<b>Параметры:</b>",
@@ -527,6 +475,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     topic = data.get("topic") or ""
     mkt.last_ws_msg_ts = now_ms()
 
+    # TICKER (fundingRate, nextFundingTime, openInterest)
     if topic.startswith("tickers."):
         d = data.get("data") or {}
         sym = d.get("symbol")
@@ -540,6 +489,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             oi = float(d.get("openInterest") or 0.0)
             st.oi_points.append((now_ms(), oi))
 
+    # KLINE 15m
     elif topic.startswith(f"kline.{EXEC_TF_MAIN}."):
         payload = data.get("data") or []
         if payload:
@@ -552,6 +502,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                 else:
                     st.k15.append((o,h,l,c,v))
                     if len(st.k15) > 900: st.k15 = st.k15[-900:]
+                # На закрытии 15m — генерим сигнал
                 if p.get("confirm") is True:
                     sig = eng.on_15m_close(sym)
                     if sig:
@@ -561,7 +512,14 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                                 await tg.send(chat_id, text)
                         mkt.last_signal_sent_ts = now_ms()
                         mkt.state[sym].last_signal_ts = now_ms()
+            # Диагностика буфера 15m каждые 50 свечей
+            try:
+                if len(st.k15) % 50 == 0:
+                    logger.info(f"[DATA] {sym} 15m buffer: {len(st.k15)} candles")
+            except Exception:
+                pass
 
+    # KLINE 5m
     elif topic.startswith(f"kline.{EXEC_TF_AUX}."):
         payload = data.get("data") or []
         if payload:
@@ -575,6 +533,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     st.k5.append((o,h,l,c,v))
                     if len(st.k5) > 900: st.k5 = st.k5[-900:]
 
+    # KLINE 60m
     elif topic.startswith("kline.60."):
         payload = data.get("data") or []
         if payload:
@@ -588,6 +547,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     st.k60.append((o,h,l,c,v))
                     if len(st.k60) > 900: st.k60 = st.k60[-900:]
 
+    # All Liquidations (все ликвидации по символу)
     elif topic.startswith("allLiquidation."):
         d = data.get("data") or []
         for it in d:
@@ -695,6 +655,8 @@ async def universe_refresh_loop(app: web.Application) -> None:
                     for s in add:
                         args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
                     await ws.subscribe(args)
+                    # Диагностика подписок
+                    logger.info(f"[WS] Subscribed to {len(args)} topics for {len(add)} symbols")
                 mkt.symbols = symbols_new
                 logger.info(f"[universe] +{len(add)} / -{len(rem)} • total={len(mkt.symbols)}")
         except asyncio.CancelledError:
@@ -738,6 +700,7 @@ async def on_startup(app: web.Application) -> None:
         args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
     if args:
         await app["ws"].subscribe(args)
+        logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(symbols)} symbols")
     else:
         # страховка: подписываемся хотя бы на CORE_SYMBOLS
         fallback = CORE_SYMBOLS[:]
@@ -746,6 +709,7 @@ async def on_startup(app: web.Application) -> None:
         for s in fallback:
             fargs += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
         await app["ws"].subscribe(fargs)
+        logger.info(f"[WS] Fallback subscribed to {len(fargs)} topics for {len(fallback)} symbols")
 
     # фоновые таски
     app["ws_task"] = asyncio.create_task(app["ws"].run())
@@ -757,7 +721,7 @@ async def on_startup(app: web.Application) -> None:
     # привет
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, "🟢 Cryptobot v5.1 запущен: деривативы (Funding + OI + All-Liquidations)")
+            await app["tg"].send(chat_id, "🟢 Cryptobot v5.2 запущен: тест-сигналы (±0.1% 15m), снижены фильтры до $5M")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -782,7 +746,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v5.1 — Derivatives Core (Funding/OI/Liquidations), TF=15m/5m, Context=1H")
+    logger.info("Starting Cryptobot v5.2 — Test Signals, TF=15m/5m, Context=1H, Liquidity≥$5M")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
