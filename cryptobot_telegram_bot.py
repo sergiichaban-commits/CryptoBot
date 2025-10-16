@@ -564,7 +564,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             st = mkt.state[sym]
             for p in payload:
-                o,h,l,c,v = float(p["open"]), float(p["high"]), float(p["low"]), float(p["close"]), float(p.get("volume") or 0.0))
+                o,h,l,c,v = float(p["open"]), float(p["high"]), float(p["low"]), float(p["close"]), float(p.get("volume") or 0.0)
                 if p.get("confirm") is False and st.k60:
                     st.k60[-1] = (o,h,l,c,v)
                 else:
