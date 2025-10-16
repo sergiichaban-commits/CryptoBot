@@ -228,6 +228,24 @@ def rolling_vwap(rows: List[Tuple[float,float,float,float,float]], window: int) 
     vw_prev = sum(tp[-window-10+i] * v[-window-10+i] for i in range(window)) / max(1e-9, sum(v[-window-10+i] for i in range(window)))
     return vw_now, (vw_now - vw_prev)
 
+def rsi14(rows: List[Tuple[float, float, float, float, float]]) -> float:
+    """RSI(14) по закрытиям, расчёт по Wilder."""
+    period = 14
+    closes = [r[3] for r in rows]
+    if len(closes) <= period:
+        return 0.0
+    gains = [max(0.0, closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+    losses = [max(0.0, closes[i - 1] - closes[i]) for i in range(1, len(closes))]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
 # =========================
 # Рыночные данные / состояние
 # =========================
@@ -308,10 +326,11 @@ class Engine:
 
         o, h, l, c, v = K15[-1]
         c_prev = K15[-2][3]
-        if c_prev <= 0: 
+        if c_prev <= 0:
             return None
 
         price_change = (c - c_prev) / c_prev
+        rsi_val = rsi14(K15)
 
         if price_change > 0.001:  # +0.1%
             sl = c * 0.995     # -0.5%
@@ -323,6 +342,7 @@ class Engine:
                 "ema100_1h": c, "heat_up": [], "heat_dn": [],
                 "reason": ["Тестовый сигнал: рост цены > 0.1%"],
                 "next_funding_ms": st.next_funding_ms,
+                "rsi14": round(rsi_val, 2),
             }
 
         if price_change < -0.001:  # -0.1%
@@ -335,6 +355,7 @@ class Engine:
                 "ema100_1h": c, "heat_up": [], "heat_dn": [],
                 "reason": ["Тестовый сигнал: падение цены > 0.1%"],
                 "next_funding_ms": st.next_funding_ms,
+                "rsi14": round(rsi_val, 2),
             }
 
         return None
@@ -350,6 +371,8 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
     fr = sig.get("funding", 0.0)
     ups = sig.get("heat_up") or []; dns = sig.get("heat_dn") or []
     next_f = sig.get("next_funding_ms")
+    rsi_val = sig.get("rsi14")
+
     nf = ""
     if next_f:
         mins = max(0, int((next_f - now_ms())/60000)); nf = f" (через ~{mins} мин)" if mins else " (скоро)"
@@ -362,6 +385,7 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
         f"🎯 <b>ФЬЮЧЕРСЫ | {side} SIGNAL</b> на <b>[{sym}]</b> (15m/5m)",
         "<b>Параметры:</b>",
         f"- <b>Funding Rate:</b> {fr:+.4%}{nf}",
+        f"- <b>RSI(14):</b> {rsi_val:.2f}" if rsi_val is not None else None,
         f"- {heat_line}",
         f"<b>Вход:</b> {entry:g}",
         f"<b>Стоп-Лосс:</b> {sl:g}",
@@ -540,7 +564,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             st = mkt.state[sym]
             for p in payload:
-                o,h,l,c,v = float(p["open"]), float(p["high"]), float(p["low"]), float(p["close"]), float(p.get("volume") or 0.0)
+                o,h,l,c,v = float(p["open"]), float(p["high"]), float(p["low"]), float(p["close"]), float(p.get("volume") or 0.0))
                 if p.get("confirm") is False and st.k60:
                     st.k60[-1] = (o,h,l,c,v)
                 else:
@@ -731,7 +755,7 @@ async def on_cleanup(app: web.Application) -> None:
         if t:
             t.cancel()
             with contextlib.suppress(Exception): await t
-    if app.get("ws") and app["ws"].ws and not app["ws"].ws.closed:
+    if app.get("ws") and app["ws"].ws and not app["ws"].closed:
         await app["ws"].ws.close()
     if app.get("http"):
         await app["http"].close()
