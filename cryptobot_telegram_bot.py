@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v5.2 — упрощённые тест-сигналы, мягче фильтры ликвидности и сигналов, расширенная диагностика
+v6.1 — SMC-lite + OI + Liquidations + Impulse + VWAP + ATR targets + TREND mode
 """
 
 from __future__ import annotations
@@ -33,40 +33,51 @@ ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
 ONLY_CHANNEL = True
 
-# Вселенная: фильтры — СМЯГЧЕНО
+# Вселенная: мягкие фильтры (ENV)
 UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = 5_000_000.0   # ↓ было 100M
-VOLUME_MIN_USD  = 5_000_000.0    # ↓ было 100M
-ACTIVE_SYMBOLS = 60
+TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "5000000"))
+VOLUME_MIN_USD  = float(os.getenv("VOLUME_MIN_USD",  "5000000"))
+ACTIVE_SYMBOLS  = int(os.getenv("ACTIVE_SYMBOLS",     "60"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
 # Таймфреймы
-EXEC_TF_MAIN = "15"               # базовый сигнал — 15m close
-EXEC_TF_AUX  = "5"                # уточнение — 5m close
-CONTEXT_TF   = "60"               # контекст EMA/VWAP (1H)
+EXEC_TF_MAIN = "15"   # 15m close — вход
+EXEC_TF_AUX  = "5"    # 5m — уточнение/буфер
+CONTEXT_TF   = "60"   # 1h — буфер
 
-# Индикаторы / пороги — СМЯГЧЕНО
-ATR_PERIOD_15 = 14
-VOL_SMA_15 = 20
-VOL_MULT_ENTRY = 1.2              # ↓ было 1.5
-EMA_PERIOD_1H = 100
-VWAP_WINDOW_15 = 60
+# Индикаторные периоды (ENV)
+ATR_PERIOD_15   = int(os.getenv("ATR_PERIOD_15",   "14"))
+VOL_SMA_15      = int(os.getenv("VOL_SMA_15",      "20"))
+EMA_PERIOD_1H   = int(os.getenv("EMA_PERIOD_1H",   "100"))   # в коде пока не используем, оставлен на будущее
+VWAP_WINDOW_15  = int(os.getenv("VWAP_WINDOW_15",  "60"))    # 60×15m ≈ 15h
 
+# Пороги/режимы (ENV)
+IMPULSE_BODY_ATR     = float(os.getenv("IMPULSE_BODY_ATR",     "0.6"))
+VOLUME_SPIKE_MULT    = float(os.getenv("VOLUME_SPIKE_MULT",    "2.0"))
+CH_LEN               = int(os.getenv("CH_LEN",                 "12"))
+OI_WINDOW_MIN        = int(os.getenv("OI_WINDOW_MIN",          "15"))
+OI_DELTA_LONG_MAX    = float(os.getenv("OI_DELTA_LONG_MAX",    "-0.02"))  # ≤ -2% за 15м (deleverage)
+OI_DELTA_SHORT_MIN   = float(os.getenv("OI_DELTA_SHORT_MIN",   "0.02"))   # ≥ +2% за 15м (build-up)
+LIQ_SPIKE_MINUTES    = int(os.getenv("LIQ_SPIKE_MINUTES",      "15"))
+LIQ_SPIKE_WINDOW_MIN = int(os.getenv("LIQ_SPIKE_WINDOW_MIN",   "120"))
+LIQ_SPIKE_QUANTILE   = float(os.getenv("LIQ_SPIKE_QUANTILE",   "0.95"))
+
+# Trend mode (ENV): 1 — включён, допускаем сигналы по BOS+Импульс+VWAP без OI/Liq/Sweep
+MODE_TREND = int(os.getenv("MODE_TREND", "1"))
+
+# Funding «крайние» зоны — информативный «встречный ветер»
 FUNDING_EXTREME_POS = 0.0005      # +0.05%
 FUNDING_EXTREME_NEG = -0.0005     # -0.05%
 
-OI_WINDOW_MIN = 15
-OI_SHORT_MIN = 5
+# TP/SL и риск (ENV)
+ATR_SL_MULT  = float(os.getenv("ATR_SL_MULT",  "0.8"))
+ATR_TP_MULT  = float(os.getenv("ATR_TP_MULT",  "1.2"))
+TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.003"))   # 0.3%
+TP_MAX_PCT   = float(os.getenv("TP_MAX_PCT",   "0.015"))   # 1.5%
+RR_MIN       = float(os.getenv("RR_MIN",       "1.5"))
 
-HEATMAP_WINDOW_SEC = 2 * 60 * 60
-HEATMAP_BIN_BPS = 25
-HEATMAP_TOP_K = 3
-
-TP_MIN_PCT = 0.003                # ↓ было 0.007 (=0.7%)
-TP_MAX_PCT = 0.015                # ↓ было 0.02  (=2.0%)
-RR_MIN = 1.0                      # ↓ было 1.2
-
-SIGNAL_COOLDOWN_SEC = 30
+# Антиспам/надёжность (ENV)
+SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "90"))
 KEEPALIVE_SEC = 13 * 60
 WATCHDOG_SEC = 60
 STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "240"))
@@ -258,11 +269,11 @@ class SymbolState:
     funding_rate: float = 0.0
     next_funding_ms: Optional[int] = None
 
-    oi_points: deque = field(default_factory=lambda: deque(maxlen=120))  # (ts_ms, oi_float)
-    liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))  # (ts, price, side, notional)
+    oi_points: deque = field(default_factory=lambda: deque(maxlen=120))     # (ts_ms, oi_float)
+    liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))  # (ts_ms, price, side, notional)
 
     last_signal_ts: int = 0
-    cooldown_ts: Dict[str, int] = field(default_factory=dict)
+    cooldown_ts: Dict[str, int] = field(default_factory=dict)  # key=(side)
 
 class Market:
     def __init__(self):
@@ -272,7 +283,7 @@ class Market:
         self.last_signal_sent_ts: int = 0
 
 # =========================
-# Heatmap
+# Heatmap / Liquidations helpers
 # =========================
 def price_bin(price: float, bin_bps: int) -> float:
     step = max(1e-6, price * (bin_bps / 10000.0))
@@ -280,20 +291,50 @@ def price_bin(price: float, bin_bps: int) -> float:
     return bins * step
 
 def heatmap_top_clusters(st: SymbolState, last_price: float) -> Tuple[List[Tuple[float,float]], List[Tuple[float,float]]]:
-    cutoff = now_ms() - HEATMAP_WINDOW_SEC * 1000
+    cutoff = now_ms() - LIQ_SPIKE_WINDOW_MIN * 60_000
     by_bin_buy: Dict[float, float] = defaultdict(float)
     by_bin_sell: Dict[float, float] = defaultdict(float)
     for ts, p, side, notional in st.liq_events:
         if ts < cutoff: continue
-        b = price_bin(p, HEATMAP_BIN_BPS)
+        b = price_bin(p, 25)
         if side == "Buy":  by_bin_buy[b]  += notional
         if side == "Sell": by_bin_sell[b] += notional
-    ups  = sorted([(b, v) for b,v in by_bin_buy.items()  if b > last_price], key=lambda x: abs(x[0]-last_price))[:HEATMAP_TOP_K]
-    dows = sorted([(b, v) for b,v in by_bin_sell.items() if b < last_price], key=lambda x: abs(x[0]-last_price))[:HEATMAP_TOP_K]
+    ups  = sorted([(b, v) for b,v in by_bin_buy.items()  if b > last_price], key=lambda x: abs(x[0]-last_price))[:3]
+    dows = sorted([(b, v) for b,v in by_bin_sell.items() if b < last_price], key=lambda x: abs(x[0]-last_price))[:3]
     return ups, dows
 
+def _percentile(sorted_vals: List[float], q: float) -> float:
+    if not sorted_vals: return 0.0
+    if q <= 0: return sorted_vals[0]
+    if q >= 1: return sorted_vals[-1]
+    idx = int(q * (len(sorted_vals)-1))
+    return sorted_vals[idx]
+
+def liq_spike(st: SymbolState,
+              minutes: int = LIQ_SPIKE_MINUTES,
+              window_min: int = LIQ_SPIKE_WINDOW_MIN,
+              q: float = LIQ_SPIKE_QUANTILE) -> Tuple[bool, float, float]:
+    """Поминутные суммы ликвидаций за окно; проверяем, что последние <minutes> >= квантиля q."""
+    now = now_ms()
+    start = now - window_min * 60_000
+    bucket: Dict[int, float] = defaultdict(float)
+    recent_sum = 0.0
+    recent_from = now - minutes * 60_000
+    for ts, _, _, notional in st.liq_events:
+        if ts < start: continue
+        minute = ts // 60_000
+        bucket[minute] += float(notional)
+        if ts >= recent_from:
+            recent_sum += float(notional)
+    if not bucket:
+        return (False, 0.0, 0.0)
+    history = [v for m, v in bucket.items() if (m*60_000) < recent_from]
+    history.sort()
+    threshold = _percentile(history, q) if history else 0.0
+    return (recent_sum >= threshold and recent_sum > 0.0), recent_sum, threshold
+
 # =========================
-# Сигнальный движок (15m) — УПРОЩЁН ДЛЯ ТЕСТА
+# Сигнальный движок (15m)
 # =========================
 class Engine:
     def __init__(self, mkt: Market):
@@ -312,51 +353,138 @@ class Engine:
         if oi0 <= 0: return 0.0
         return (oi1 - oi0) / oi0
 
+    def _bos_flags(self, rows: List[Tuple[float,float,float,float,float]], lookback: int) -> Tuple[bool, bool]:
+        if len(rows) < lookback + 2: return False, False
+        highs = [r[1] for r in rows]
+        lows  = [r[2] for r in rows]
+        c = rows[-1][3]
+        bos_up = c > max(highs[-(lookback+1):-1])
+        bos_dn = c < min(lows[-(lookback+1):-1])
+        return bos_up, bos_dn
+
+    def _impulse_flags(self, rows: List[Tuple[float,float,float,float,float]]) -> Tuple[bool, bool, float, float, float]:
+        atr15 = atr(rows, ATR_PERIOD_15)
+        o,h,l,c,v = rows[-1]
+        body = abs(c - o)
+        vol_sma = sma([r[4] for r in rows], VOL_SMA_15)
+        imp_up = (c > o) and (atr15 > 0) and (body >= IMPULSE_BODY_ATR * atr15) and (v >= VOLUME_SPIKE_MULT * max(1e-9, vol_sma))
+        imp_dn = (c < o) and (atr15 > 0) and (body >= IMPULSE_BODY_ATR * atr15) and (v >= VOLUME_SPIKE_MULT * max(1e-9, vol_sma))
+        return imp_up, imp_dn, atr15, body, vol_sma
+
     def on_15m_close(self, sym: str) -> Optional[Dict[str, Any]]:
-        """
-        ВРЕМЕННАЯ ПРОСТАЯ ЛОГИКА ДЛЯ ОТЛАДКИ:
-        - Требуем минимум 20 15m-свечей.
-        - Если последняя свеча закрылась > +0.1% от предыдущей — LONG (SL -0.5%, TP +1%).
-        - Если < -0.1% — SHORT (SL +0.5%, TP -1%).
-        """
         st = self.mkt.state[sym]
         K15 = st.k15
-        if len(K15) < 20:
+        if len(K15) < max(20, VOL_SMA_15 + 2, ATR_PERIOD_15 + 2):
             return None
 
-        o, h, l, c, v = K15[-1]
+        # Кулдаун по символу/стороне
+        now_s = int(time.time())
+        def cooled(side: str) -> bool:
+            last = st.cooldown_ts.get(side, 0)
+            return (now_s - last) >= SIGNAL_COOLDOWN_SEC
+
+        # Индикаторы/контекст
         c_prev = K15[-2][3]
-        if c_prev <= 0:
-            return None
+        o,h,l,c,v = K15[-1]
+        if c_prev <= 0: return None
 
-        price_change = (c - c_prev) / c_prev
+        imp_up, imp_dn, atr15, body, vol_sma15 = self._impulse_flags(K15)
+        bos_up, bos_dn = self._bos_flags(K15, CH_LEN)
         rsi_val = rsi14(K15)
 
-        if price_change > 0.001:  # +0.1%
-            sl = c * 0.995     # -0.5%
-            tp = c * 1.010     # +1.0%
-            return {
-                "symbol": sym, "side": "LONG", "entry": float(c),
-                "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": 2.0,
-                "funding": st.funding_rate, "oi15": 0.0, "vwap_bias": "UP",
-                "ema100_1h": c, "heat_up": [], "heat_dn": [],
-                "reason": ["Тестовый сигнал: рост цены > 0.1%"],
-                "next_funding_ms": st.next_funding_ms,
-                "rsi14": round(rsi_val, 2),
-            }
+        vwap_now, vwap_slope = rolling_vwap(K15, VWAP_WINDOW_15)
+        above_vwap = c >= vwap_now if vwap_now > 0 else True
+        below_vwap = c <= vwap_now if vwap_now > 0 else True
 
-        if price_change < -0.001:  # -0.1%
-            sl = c * 1.005     # +0.5%
-            tp = c * 0.990     # -1.0%
-            return {
-                "symbol": sym, "side": "SHORT", "entry": float(c),
-                "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": 2.0,
-                "funding": st.funding_rate, "oi15": 0.0, "vwap_bias": "DOWN",
-                "ema100_1h": c, "heat_up": [], "heat_dn": [],
-                "reason": ["Тестовый сигнал: падение цены > 0.1%"],
-                "next_funding_ms": st.next_funding_ms,
-                "rsi14": round(rsi_val, 2),
-            }
+        oi15 = self._oi_delta(st, OI_WINDOW_MIN)
+        liq_ok, liq_recent, liq_thr = liq_spike(st)
+
+        # «смыв/вынос»: прокол экстремума предыдущих 5 свечей
+        sweep_down = l <= min(r[2] for r in K15[-6:-1])
+        sweep_up   = h >= max(r[1] for r in K15[-6:-1])
+
+        # Funding headwind (для информации)
+        funding = st.funding_rate
+        headwind_long  = funding >= FUNDING_EXTREME_POS
+        headwind_short = funding <= FUNDING_EXTREME_NEG
+
+        # ---- LONG SETUP ----
+        if cooled("LONG") and imp_up and bos_up and above_vwap and vwap_slope > 0:
+            cond_oi    = (oi15 <= OI_DELTA_LONG_MAX)
+            cond_sweep = sweep_down
+            cond_liq   = liq_ok
+            trend_gate = bool(MODE_TREND == 1)
+            if cond_oi or cond_sweep or cond_liq or trend_gate:
+                sl = max(1e-9, c - ATR_SL_MULT * atr15)
+                tp = c + ATR_TP_MULT * atr15
+                rr = (tp - c) / max(1e-9, (c - sl))
+                tp_pct = (tp - c) / c
+                if tp_pct < TP_MIN_PCT: tp = c * (1 + TP_MIN_PCT)
+                if tp_pct > TP_MAX_PCT: tp = c * (1 + TP_MAX_PCT)
+                rr = (tp - c) / max(1e-9, (c - sl))
+                if rr >= RR_MIN:
+                    reasons: List[str] = [
+                        f"Импульс UP: body={body:.4g} ≥ {IMPULSE_BODY_ATR}×ATR({atr15:.4g}), vol≥{VOLUME_SPIKE_MULT}×SMA20({vol_sma15:.4g})",
+                        f"BOS↑({CH_LEN}) и VWAP↑: c≥VWAP({vwap_now:.4g}), slope>0",
+                        f"RSI(14)={rsi_val:.2f}" + (" (отскок)" if rsi_val<40 else ""),
+                        f"OIΔ(15m)={oi15:+.2%} {'(deleverage)' if cond_oi else ''}",
+                        f"Liq spike: {liq_recent:,.0f} vs q{int(LIQ_SPIKE_QUANTILE*100)}={liq_thr:,.0f}" if cond_liq else "Liq spike: нет",
+                        f"Sweep↓={cond_sweep}"
+                    ]
+                    if trend_gate and not (cond_oi or cond_liq or cond_sweep):
+                        reasons.append("Mode: TREND (без OI/Liq/Sweep)")
+                    if headwind_long:
+                        reasons.append(f"⚠️ Funding {funding:+.4%} — встречный ветер для LONG")
+                    st.cooldown_ts["LONG"] = now_s
+                    return {
+                        "symbol": sym, "side": "LONG", "entry": float(c),
+                        "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": float(rr),
+                        "funding": funding, "oi15": float(oi15),
+                        "vwap_bias": "UP", "ema100_1h": c,
+                        "heat_up": [], "heat_dn": [],
+                        "reason": reasons,
+                        "next_funding_ms": st.next_funding_ms,
+                        "rsi14": round(rsi_val, 2),
+                    }
+
+        # ---- SHORT SETUP ----
+        if cooled("SHORT") and imp_dn and bos_dn and below_vwap and vwap_slope < 0:
+            cond_oi    = (oi15 >= OI_DELTA_SHORT_MIN)
+            cond_sweep = sweep_up
+            cond_liq   = liq_ok
+            trend_gate = bool(MODE_TREND == 1)
+            if cond_oi or cond_sweep or cond_liq or trend_gate:
+                sl = c + ATR_SL_MULT * atr15
+                tp = c - ATR_TP_MULT * atr15
+                rr = (c - tp) / max(1e-9, (sl - c))
+                tp_pct = (c - tp) / c
+                if tp_pct < TP_MIN_PCT: tp = c * (1 - TP_MIN_PCT)
+                if tp_pct > TP_MAX_PCT: tp = c * (1 - TP_MAX_PCT)
+                rr = (c - tp) / max(1e-9, (sl - c))
+                if rr >= RR_MIN:
+                    reasons: List[str] = [
+                        f"Импульс DOWN: body={body:.4g} ≥ {IMPULSE_BODY_ATR}×ATR({atr15:.4g}), vol≥{VOLUME_SPIKE_MULT}×SMA20({vol_sma15:.4g})",
+                        f"BOS↓({CH_LEN}) и VWAP↓: c≤VWAP({vwap_now:.4g}), slope<0",
+                        f"RSI(14)={rsi_val:.2f}" + (" (перекуплен)" if rsi_val>60 else ""),
+                        f"OIΔ(15m)={oi15:+.2%} {'(build-up)' if cond_oi else ''}",
+                        f"Liq spike: {liq_recent:,.0f} vs q{int(LIQ_SPIKE_QUANTILE*100)}={liq_thr:,.0f}" if cond_liq else "Liq spike: нет",
+                        f"Sweep↑={cond_sweep}"
+                    ]
+                    if trend_gate and not (cond_oi or cond_liq or cond_sweep):
+                        reasons.append("Mode: TREND (без OI/Liq/Sweep)")
+                    if headwind_short:
+                        reasons.append(f"⚠️ Funding {funding:+.4%} — встречный ветер для SHORT")
+                    st.cooldown_ts["SHORT"] = now_s
+                    return {
+                        "symbol": sym, "side": "SHORT", "entry": float(c),
+                        "tp1": float(tp), "tp2": None, "sl": float(sl), "rr": float(rr),
+                        "funding": funding, "oi15": float(oi15),
+                        "vwap_bias": "DOWN", "ema100_1h": c,
+                        "heat_up": [], "heat_dn": [],
+                        "reason": reasons,
+                        "next_funding_ms": st.next_funding_ms,
+                        "rsi14": round(rsi_val, 2),
+                    }
 
         return None
 
@@ -372,6 +500,7 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
     ups = sig.get("heat_up") or []; dns = sig.get("heat_dn") or []
     next_f = sig.get("next_funding_ms")
     rsi_val = sig.get("rsi14")
+    oi15 = sig.get("oi15", 0.0)
 
     nf = ""
     if next_f:
@@ -382,16 +511,17 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
 
     reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
     lines = [
-        f"🎯 <b>ФЬЮЧЕРСЫ | {side} SIGNAL</b> на <b>[{sym}]</b> (15m/5m)",
+        f"🎯 <b>DERIVATIVES | {side} SIGNAL</b> on <b>[{sym}]</b> (15m)",
         "<b>Параметры:</b>",
-        f"- <b>Funding Rate:</b> {fr:+.4%}{nf}",
+        f"- <b>Funding:</b> {fr:+.4%}{nf}",
+        f"- <b>OIΔ(15m):</b> {oi15:+.2%}",
         f"- <b>RSI(14):</b> {rsi_val:.2f}" if rsi_val is not None else None,
         f"- {heat_line}",
         f"<b>Вход:</b> {entry:g}",
         f"<b>Стоп-Лосс:</b> {sl:g}",
         f"<b>Тейк-Профит 1:</b> {tp1:g} ({pct(tp1_pct)})" + (f"\n<b>Тейк-Профит 2:</b> {tp2:g}" if tp2 else ""),
         "<b>Обоснование:</b>" + reasons if reasons else None,
-        "<b>Риск:</b> плечо ≤ x10; риск ≤ 1% депозита.",
+        f"<b>Риск:</b> RR≈{rr:.2f} • плечо ≤ x10; риск ≤ 1% депозита.",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     return "\n".join([x for x in lines if x])
@@ -424,7 +554,7 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id,
                         "✅ Online\n"
                         f"Symbols: {len(mkt.symbols)}\n"
-                        "Mode: Derivatives (Funding + OI + All-Liquidations)\n"
+                        f"Mode: Derivatives (OI + Liquidations + Impulse + VWAP) • TREND={'ON' if MODE_TREND==1 else 'OFF'}\n"
                         f"TP≥{pct(TP_MIN_PCT)} • RR≥{RR_MIN:.2f}\n"
                         f"Silent (signals): {silent_line}")
 
@@ -444,7 +574,6 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id, "Jobs:\n" + "\n".join(jobs))
 
                 elif cmd == "/diag":
-                    # краткая диагностика
                     k15_pts = sum(len(mkt.state[s].k15) for s in mkt.symbols)
                     k5_pts  = sum(len(mkt.state[s].k5) for s in mkt.symbols)
                     k60_pts = sum(len(mkt.state[s].k60) for s in mkt.symbols)
@@ -468,7 +597,6 @@ async def tg_loop(app: web.Application) -> None:
                         if not st or not st.k15:
                             await tg.send(chat_id, "Нет данных. Буферы ещё наполняются.")
                         else:
-                            # простая сводка
                             oi_15 = Engine(mkt)._oi_delta(st, OI_WINDOW_MIN)
                             ups, dns = heatmap_top_clusters(st, st.k15[-1][3])
                             hf = lambda arr: ", ".join(f"{p:g}" for p,_ in arr) if arr else "—"
@@ -536,7 +664,6 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                                 await tg.send(chat_id, text)
                         mkt.last_signal_sent_ts = now_ms()
                         mkt.state[sym].last_signal_ts = now_ms()
-            # Диагностика буфера 15m каждые 50 свечей
             try:
                 if len(st.k15) % 50 == 0:
                     logger.info(f"[DATA] {sym} 15m buffer: {len(st.k15)} candles")
@@ -571,7 +698,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     st.k60.append((o,h,l,c,v))
                     if len(st.k60) > 900: st.k60 = st.k60[-900:]
 
-    # All Liquidations (все ликвидации по символу)
+    # All Liquidations
     elif topic.startswith("allLiquidation."):
         d = data.get("data") or []
         for it in d:
@@ -621,15 +748,14 @@ async def watchdog_loop(app: web.Application) -> None:
 
 # -------- Вселенная символов
 async def build_universe_once(rest: BybitRest) -> List[str]:
-    """Надёжное построение вселенной c фолбэком на CORE_SYMBOLS.
-       Spot-верификация — опциональна (если упала, не блокируем)."""
+    """Строим вселенную c фолбэком на CORE_SYMBOLS. Spot-верификация — неблокирующая."""
     symbols: List[str] = []
     try:
         tickers = await rest.tickers_linear()
         pool: List[str] = []
         for t in tickers:
             sym = t.get("symbol") or ""
-            if not sym.endswith("USDT"):  # работаем с USDT-перпами
+            if not sym.endswith("USDT"):
                 continue
             try:
                 turn = float(t.get("turnover24h") or 0.0)
@@ -639,7 +765,6 @@ async def build_universe_once(rest: BybitRest) -> List[str]:
             if turn >= TURNOVER_MIN_USD or vol >= VOLUME_MIN_USD:
                 pool.append(sym)
 
-        # пробуем SPOT-верификацию, но не делаем её блокирующей
         verified: List[str] = []
         try:
             for s in pool:
@@ -647,7 +772,7 @@ async def build_universe_once(rest: BybitRest) -> List[str]:
                     spot = await rest.instruments_info("spot", s)
                     if spot: verified.append(s)
         except Exception:
-            verified = pool[:]  # если упала — берём без проверки
+            verified = pool[:]
 
         symbols = CORE_SYMBOLS + [x for x in verified if x not in CORE_SYMBOLS]
         symbols = symbols[:ACTIVE_SYMBOLS]
@@ -679,7 +804,6 @@ async def universe_refresh_loop(app: web.Application) -> None:
                     for s in add:
                         args += [f"tickers.{s}", f"kline.{EXEC_TF_MAIN}.{s}", f"kline.{EXEC_TF_AUX}.{s}", f"kline.60.{s}", f"allLiquidation.{s}"]
                     await ws.subscribe(args)
-                    # Диагностика подписок
                     logger.info(f"[WS] Subscribed to {len(args)} topics for {len(add)} symbols")
                 mkt.symbols = symbols_new
                 logger.info(f"[universe] +{len(add)} / -{len(rem)} • total={len(mkt.symbols)}")
@@ -712,12 +836,12 @@ async def on_startup(app: web.Application) -> None:
     app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: ws_on_message(app, data)
 
-    # Надёжная инициализация вселенной
+    # Вселенная
     symbols = await build_universe_once(app["rest"])
     app["mkt"].symbols = symbols
     logger.info(f"symbols: {symbols}")
 
-    # Подключение WS и подписки
+    # Подписки
     await app["ws"].connect()
     args = []
     for s in symbols:
@@ -726,7 +850,6 @@ async def on_startup(app: web.Application) -> None:
         await app["ws"].subscribe(args)
         logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(symbols)} symbols")
     else:
-        # страховка: подписываемся хотя бы на CORE_SYMBOLS
         fallback = CORE_SYMBOLS[:]
         app["mkt"].symbols = fallback
         fargs = []
@@ -735,7 +858,7 @@ async def on_startup(app: web.Application) -> None:
         await app["ws"].subscribe(fargs)
         logger.info(f"[WS] Fallback subscribed to {len(fargs)} topics for {len(fallback)} symbols")
 
-    # фоновые таски
+    # таски
     app["ws_task"] = asyncio.create_task(app["ws"].run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
@@ -745,7 +868,7 @@ async def on_startup(app: web.Application) -> None:
     # привет
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, "🟢 Cryptobot v5.2 запущен: тест-сигналы (±0.1% 15m), снижены фильтры до $5M")
+            await app["tg"].send(chat_id, f"🟢 Cryptobot v6.1: SMC-lite + OI + Liq + Impulse + VWAP + ATR targets • TREND={'ON' if MODE_TREND==1 else 'OFF'} • RR≥{RR_MIN}")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -770,7 +893,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v5.2 — Test Signals, TF=15m/5m, Context=1H, Liquidity≥$5M")
+    logger.info("Starting Cryptobot v6.1 — TF=15m/5m, Context=1H, OI+Liq+Impulse+VWAP, RR via ATR, TREND mode")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
