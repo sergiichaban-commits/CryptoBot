@@ -29,7 +29,7 @@ PORT = int(os.getenv("PORT", "10000"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or ""
 ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
-ONLY_CHANNEL = Tr
+ONLY_CHANNEL = True
 
 # =========================
 # Bybit REST
