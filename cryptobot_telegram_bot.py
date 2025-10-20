@@ -1,40 +1,282 @@
-# -*- coding: utf-8 -*-
-"""
-Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v7.0 — RSI 5m signals + ATR targets + price action confirmations
-"""
-from __future__ import annotations
-import asyncio
-import contextlib
-import json
-import logging
 import os
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import requests
+import sys
+import threading
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-import aiohttp
-from aiohttp import web
+# Load environment variables
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TELEGRAM_TOKEN:
+    raise Exception("TELEGRAM_TOKEN environment variable is required")
+ALLOWED_CHAT_IDS = []
+allowed_ids_env = os.getenv('ALLOWED_CHAT_IDS')
+if allowed_ids_env:
+    try:
+        ALLOWED_CHAT_IDS = [int(x) for x in allowed_ids_env.split(',')]
+    except:
+        ALLOWED_CHAT_IDS = []
+PUBLIC_URL = os.getenv('PUBLIC_URL')
+STALL_EXIT_SEC = int(os.getenv('STALL_EXIT_SEC', '0')) if os.getenv('STALL_EXIT_SEC') else 0
+UNIVERSE_REFRESH_SEC = int(os.getenv('UNIVERSE_REFRESH_SEC', '600')) if os.getenv('UNIVERSE_REFRESH_SEC') else 600
 
-# =========================
-# Конфиг
-# =========================
-BYBIT_REST = "https://api.bybit.com"
-BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+# Global cache for cryptocurrency data (the "universe" of tracked coins)
+universe_data = {}
 
-PORT = int(os.getenv("PORT", "10000"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or ""
-ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
-PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
-ONLY_CHANNEL = True
+def refresh_universe():
+    """Refresh the cached universe data (e.g., top 100 coins market data)."""
+    global universe_data
+    try:
+        response = requests.get(
+            'https://api.coingecko.com/api/v3/coins/markets',
+            params={
+                'vs_currency': 'usd',
+                'order': 'market_cap_desc',
+                'per_page': 100,
+                'page': 1,
+                'price_change_percentage': '24h'
+            }
+        )
+        if response.status_code == 200:
+            # Store data in dictionary with symbol as key for quick lookup
+            data = response.json()
+            universe_data = {coin['symbol'].lower(): coin for coin in data}
+        else:
+            print(f"Universe refresh failed with status {response.status_code}")
+    except Exception as e:
+        print(f"Universe refresh exception: {e}")
 
-# Вселенная: мягкие фильтры (ENV)
-UNIVERSE_REFRESH_SEC = 600
-TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "5000000"))
-VOLUME_MIN_USD  = float(os.getenv("VOLUME_MIN_USD",  "5000000"))
+# Watchdog for inactivity (stall exit)
+last_activity_time = time.time()
+
+def reset_watchdog():
+    global last_activity_time
+    last_activity_time = time.time()
+
+def watchdog_loop():
+    if STALL_EXIT_SEC <= 0:
+        return
+    while True:
+        time.sleep(1)
+        if time.time() - last_activity_time > STALL_EXIT_SEC:
+            print(f"No activity detected for {STALL_EXIT_SEC} seconds, exiting.")
+            sys.stdout.flush()
+            os._exit(1)
+
+if STALL_EXIT_SEC > 0:
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+
+# Telegram command and message handlers
+def start(update, context):
+    # Authorization check
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    context.bot.send_message(chat_id=update.effective_chat.id, text="👋 Hello! I'm a crypto bot. Use /help to see available commands.")
+    reset_watchdog()
+
+def help_command(update, context):
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    help_text = (
+        "Available commands:\n"
+        "/price <symbol> – Get the current price of a cryptocurrency (e.g. /price BTC)\n"
+        "/summary <symbol> – Get today's OHLC (open, high, low, close) summary for the coin\n"
+        "/global – Get global cryptocurrency market info\n"
+        "/help – Show this help message"
+    )
+    context.bot.send_message(chat_id=update.effective_chat.id, text=help_text)
+    reset_watchdog()
+
+def get_price(symbol):
+    """Fetch current USD price for the given coin symbol."""
+    symbol = symbol.lower()
+    try:
+        # Try cache first
+        if universe_data and symbol in universe_data:
+            coin = universe_data[symbol]
+            return coin.get('current_price')
+        # Fallback to live API if not in cache
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies=usd"
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            if symbol in data:
+                return data[symbol]['usd']
+    except Exception as e:
+        print(f"Error fetching price for {symbol}: {e}")
+    return None
+
+def price_command(update, context):
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    if not context.args:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Usage: /price <symbol>")
+        return
+    symbol = context.args[0]
+    price = get_price(symbol)
+    if price is None:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❗ Could not fetch price for {symbol.upper()}.")
+    else:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"💰 Current price of {symbol.upper()}: ${price}")
+    reset_watchdog()
+
+def summary_command(update, context):
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    if not context.args:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Usage: /summary <symbol>")
+        return
+    symbol = context.args[0].lower()
+    try:
+        # Determine coin ID for Coingecko
+        coin_id = None
+        if universe_data and symbol in universe_data:
+            coin_id = universe_data[symbol]['id']
+        if not coin_id:
+            # Search for coin ID via API if not in cache
+            search_resp = requests.get("https://api.coingecko.com/api/v3/coins/list")
+            if search_resp.status_code == 200:
+                for coin in search_resp.json():
+                    if coin['symbol'].lower() == symbol:
+                        coin_id = coin['id']
+                        break
+        if not coin_id:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f"❗ Could not find data for {symbol.upper()}.")
+            return
+        # Fetch OHLC data for the last 1 day
+        ohlc_resp = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days=1")
+        if ohlc_resp.status_code == 200:
+            ohlc_data = ohlc_resp.json()
+            if ohlc_data:
+                # Coingecko OHLC returns list of [timestamp, open, high, low, close]
+                opens = [entry[1] for entry in ohlc_data]
+                highs = [entry[2] for entry in ohlc_data]
+                lows = [entry[3] for entry in ohlc_data]
+                closes = [entry[4] for entry in ohlc_data]
+                o = opens[0] if opens else None
+                c = closes[-1] if closes else None
+                h = max(highs) if highs else None
+                l = min(lows) if lows else None
+                v = None
+                # Volume: use market chart endpoint to get total volume of the day
+                market_resp = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1")
+                if market_resp.status_code == 200:
+                    market_data = market_resp.json()
+                    volumes = market_data.get('total_volumes', [])
+                    if volumes:
+                        v = volumes[-1][1]  # last recorded total volume
+                if o is None or c is None or h is None or l is None:
+                    context.bot.send_message(chat_id=update.effective_chat.id, text=f"Not enough data for {symbol.upper()}.")
+                else:
+                    # Convert to float and format
+                    o = float(o)
+                    c = float(c)
+                    h = float(h)
+                    l = float(l)
+                    vol_str = f"{v:.2f}" if v else "N/A"
+                    change = ((c - o) / o * 100) if o != 0 else 0.0
+                    summary_text = (
+                        f"{symbol.upper()} – Open: {o:.4f}, High: {h:.4f}, Low: {l:.4f}, Close: {c:.4f}\n"
+                        f"Volume: {vol_str}, Change: {change:.2f}%"
+                    )
+                    context.bot.send_message(chat_id=update.effective_chat.id, text=summary_text)
+            else:
+                context.bot.send_message(chat_id=update.effective_chat.id, text=f"No OHLC data for {symbol.upper()}.")
+        else:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f"Failed to fetch data for {symbol.upper()}.")
+    except Exception as e:
+        print(f"Error in summary_command for {symbol}: {e}")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="An error occurred while fetching summary.")
+    reset_watchdog()
+
+def global_command(update, context):
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    try:
+        resp = requests.get("https://api.coingecko.com/api/v3/global")
+        if resp.status_code == 200:
+            data = resp.json().get('data', {})
+            total_cap = data.get('total_market_cap', {}).get('usd')
+            total_vol = data.get('total_volume', {}).get('usd')
+            market_change = data.get('market_cap_change_percentage_24h_usd')
+            active_coins = data.get('active_cryptocurrencies')
+            if total_cap and total_vol and market_change is not None:
+                text = (
+                    f"🌐 Global Market Cap: ${total_cap:,.0f}\n"
+                    f"24h Volume: ${total_vol:,.0f}\n"
+                    f"Market Cap Change (24h): {market_change:.2f}%\n"
+                    f"Active Cryptocurrencies: {active_coins}"
+                )
+            else:
+                text = "Global market data is not available at the moment."
+        else:
+            text = "Failed to fetch global market data."
+    except Exception as e:
+        print(f"Error fetching global data: {e}")
+        text = "Error fetching global market data."
+    context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+    reset_watchdog()
+
+def text_message(update, context):
+    # Handle non-command text messages (potential coin symbols)
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    text = update.message.text.strip()
+    if text and text.isalpha() and len(text) <= 10:
+        symbol = text
+        price = get_price(symbol)
+        if price is not None:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f"💰 {symbol.upper()} price: ${price}")
+        else:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f"Sorry, I don't have data for {symbol.upper()}.")
+    else:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Sorry, I didn't understand that.")
+    reset_watchdog()
+
+def unknown_command(update, context):
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS and update.effective_user.id not in ALLOWED_CHAT_IDS:
+        return
+    context.bot.send_message(chat_id=update.effective_chat.id, text="❓ Unknown command. Type /help for the list of commands.")
+    reset_watchdog()
+
+def main():
+    # Initial data refresh if applicable
+    if UNIVERSE_REFRESH_SEC:
+        refresh_universe()
+        # Start periodic background thread to refresh universe data
+        def periodic_refresh():
+            while True:
+                time.sleep(UNIVERSE_REFRESH_SEC)
+                refresh_universe()
+        threading.Thread(target=periodic_refresh, daemon=True).start()
+
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Register command handlers
+    dp.add_handler(CommandHandler('start', start))
+    dp.add_handler(CommandHandler('help', help_command))
+    dp.add_handler(CommandHandler('price', price_command))
+    dp.add_handler(CommandHandler('summary', summary_command))
+    dp.add_handler(CommandHandler('global', global_command))
+    # Text messages and unknown commands handlers
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message))
+    dp.add_handler(MessageHandler(Filters.command, unknown_command))
+
+    # Start the bot using webhook if PUBLIC_URL is set, otherwise use polling
+    if PUBLIC_URL:
+        PORT = int(os.getenv('PORT', '8443'))
+        updater.start_webhook(listen='0.0.0.0', port=PORT, url_path=TELEGRAM_TOKEN)
+        webhook_url = PUBLIC_URL.rstrip('/') + '/' + TELEGRAM_TOKEN
+        updater.bot.setWebhook(webhook_url)
+        print(f"Webhook set to {webhook_url}")
+    else:
+        updater.start_polling()
+
+    updater.idle()
+
+if __name__ == '__main__':
+    main()VOLUME_MIN_USD  = float(os.getenv("VOLUME_MIN_USD",  "5000000"))
 ACTIVE_SYMBOLS  = int(os.getenv("ACTIVE_SYMBOLS",     "60"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
@@ -620,3 +862,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
