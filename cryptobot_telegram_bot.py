@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import web
 
 # =========================
-# Конфиг
+# Config
 # =========================
 BYBIT_REST = "https://api.bybit.com"
 BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
@@ -31,64 +31,49 @@ ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
 ONLY_CHANNEL = True
 
-# Вселенная: мягкие фильтры (ENV)
+# Universe filters
 UNIVERSE_REFRESH_SEC = 600
 TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "5000000"))
 VOLUME_MIN_USD  = float(os.getenv("VOLUME_MIN_USD",  "5000000"))
 ACTIVE_SYMBOLS  = int(os.getenv("ACTIVE_SYMBOLS",     "60"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
-# Таймфреймы
-EXEC_TF_MAIN = "15"   # (not used in new logic, kept for compatibility)
-EXEC_TF_AUX  = "5"    # 5m timeframe for signals
-CONTEXT_TF   = "60"   # (not used in new logic, kept for future/compatibility)
+# Timeframes
+EXEC_TF_MAIN = "15"
+EXEC_TF_AUX  = "5"
+CONTEXT_TF   = "60"
 
-# Индикаторные периоды (ENV)
-ATR_PERIOD_15   = int(os.getenv("ATR_PERIOD_15",   "14"))
-VOL_SMA_15      = int(os.getenv("VOL_SMA_15",      "20"))
-EMA_PERIOD_1H   = int(os.getenv("EMA_PERIOD_1H",   "100"))   # not used in code, reserved for future
-VWAP_WINDOW_15  = int(os.getenv("VWAP_WINDOW_15",  "60"))    # not used in new logic
+# Indicators / thresholds
+ATR_PERIOD_15 = int(os.getenv("ATR_PERIOD_15", "14"))
+VOL_SMA_15    = int(os.getenv("VOL_SMA_15",    "20"))
+VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
 
-# Пороги/режимы (ENV)
-IMPULSE_BODY_ATR     = float(os.getenv("IMPULSE_BODY_ATR",     "0.6"))   # not used in new logic
-VOLUME_SPIKE_MULT    = float(os.getenv("VOLUME_SPIKE_MULT",    "2.0"))
-CH_LEN               = int(os.getenv("CH_LEN",                 "12"))    # not used in new logic
-OI_WINDOW_MIN        = int(os.getenv("OI_WINDOW_MIN",          "15"))   # not used in new logic
-OI_DELTA_LONG_MAX    = float(os.getenv("OI_DELTA_LONG_MAX",    "-0.02"))  # not used
-OI_DELTA_SHORT_MIN   = float(os.getenv("OI_DELTA_SHORT_MIN",   "0.02"))   # not used
-LIQ_SPIKE_MINUTES    = int(os.getenv("LIQ_SPIKE_MINUTES",      "15"))   # not used
-LIQ_SPIKE_WINDOW_MIN = int(os.getenv("LIQ_SPIKE_WINDOW_MIN",   "120"))  # not used
-LIQ_SPIKE_QUANTILE   = float(os.getenv("LIQ_SPIKE_QUANTILE",   "0.95")) # not used
-
-# Trend mode (ENV) - not used in new logic, kept for compatibility
-MODE_TREND = int(os.getenv("MODE_TREND", "1"))
-
-# Funding extremes – not used in new logic
-FUNDING_EXTREME_POS = 0.0005
-FUNDING_EXTREME_NEG = -0.0005
-
-# TP/SL и риск (ENV)
-ATR_SL_MULT  = float(os.getenv("ATR_SL_MULT",  "0.8"))
-ATR_TP_MULT  = float(os.getenv("ATR_TP_MULT",  "1.2"))
-TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.01"))    # 1%
-TP_MAX_PCT   = float(os.getenv("TP_MAX_PCT",   "0.015"))   # 1.5%
+# TP/SL and risk
+ATR_SL_MULT  = float(os.getenv("ATR_SL_MULT",  "1.0"))
+ATR_TP_MULT  = float(os.getenv("ATR_TP_MULT",  "1.5"))
+TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.01"))
+TP_MAX_PCT   = float(os.getenv("TP_MAX_PCT",   "0.015"))
 RR_MIN       = float(os.getenv("RR_MIN",       "1.5"))
 
-# Антиспам/надежность (ENV)
-SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "90"))
-KEEPALIVE_SEC = 13 * 60
-WATCHDOG_SEC = 60
-STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "240"))
+# Anti-spam / reliability
+SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "30"))
+KEEPALIVE_SEC       = 13 * 60
+WATCHDOG_SEC        = 60
+STALL_EXIT_SEC      = int(os.getenv("STALL_EXIT_SEC", "240"))
 
 # =========================
-# Утилиты/логгер
+# Utilities / Logging
 # =========================
-def now_ms() -> int: return int(time.time() * 1000)
-def pct(x: float) -> str: return f"{x:.2%}"
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def pct(x: float) -> str:
+    return f"{x:.2%}"
 
 def setup_logging(level: str) -> None:
     fmt = "%(asctime)s %(levelname)s %(message)s"
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt, force=True)
+    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
+                        format=fmt, force=True)
 
 logger = logging.getLogger("cryptobot")
 
@@ -108,8 +93,7 @@ class Tg:
 
     async def updates(self, offset: Optional[int], timeout: int = 25) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "channel_post", "my_chat_member"]}
-        if offset is not None:
-            payload["offset"] = offset
+        if offset is not None: payload["offset"] = offset
         async with self.http.post(f"{self.base}/getUpdates", json=payload, timeout=aiohttp.ClientTimeout(total=timeout+10)) as r:
             r.raise_for_status()
             return await r.json()
@@ -135,7 +119,7 @@ class BybitRest:
             r.raise_for_status()
             return (await r.json()).get("result", {}).get("list", []) or []
 
-    async def klines(self, category: str, symbol: str, interval: str, limit: int = 200) -> List[Tuple[float,float,float,float,float]]:
+    async def klines(self, category: str, symbol: str, interval: str, limit: int = 200) -> List[Tuple[float, float, float, float, float]]:
         url = f"{self.base}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={min(200, max(1, limit))}"
         async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             r.raise_for_status()
@@ -148,14 +132,54 @@ class BybitRest:
                 out.append((o,h,l,c,v))
             except Exception:
                 continue
-        return out[-200:]
+
+# =========================
+# Indicators
+# =========================
+def atr(rows: List[Tuple[float,float,float,float,float]], period: int) -> float:
+    if len(rows) < period + 1: return 0.0
+    s = 0.0
+    for i in range(1, period+1):
+        _, h, l, c, _ = rows[-i]
+        _, _, _, pc, _ = rows[-i-1]
+        tr = max(h-l, abs(h-pc), abs(pc-l))
+        s += tr
+    return s / period
+
+def sma(vals: List[float], period: int) -> float:
+    if len(vals) < period or period <= 0: return 0.0
+    return sum(vals[-period:]) / period
+
+def rsi14(rows: List[Tuple[float, float, float, float, float]]) -> float:
+    """RSI(14) по закрытиям, расчёт по Wilder."""
+    period = 14
+    closes = [r[3] for r in rows]
+    if len(closes) <= period:
+        return 0.0
+    gains = [max(0.0, closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+    losses = [max(0.0, closes[i - 1] - closes[i]) for i in range(1, len(closes))]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 # =========================
 # Market data / state
 # =========================
 @dataclass
 class SymbolState:
+    k15: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
     k5:  List[Tuple[float,float,float,float,float]] = field(default_factory=list)
+    k60: List[Tuple[float,float,float,float,float]] = field(default_factory=list)
+    funding_rate: float = 0.0
+    next_funding_ms: Optional[int] = None
+    oi_points: deque = field(default_factory=lambda: deque(maxlen=120))
+    liq_events: deque = field(default_factory=lambda: deque(maxlen=10000))
     last_signal_ts: int = 0
     cooldown_ts: Dict[str, int] = field(default_factory=dict)
 
@@ -176,167 +200,137 @@ class Engine:
     def on_5m_close(self, sym: str) -> Optional[Dict[str, Any]]:
         st = self.mkt.state[sym]
         K5 = st.k5
-        # Require enough history: at least 30 bars for local extremes, 20 for volume avg, 14 for ATR/RSI
-        if len(K5) < max(31, VOL_SMA_15 + 1, ATR_PERIOD_15 + 1):
+        # require enough bars for RSI and confirmations
+        if len(K5) < 30:
             return None
-
-        # Cooldown per symbol/side
-        now_s = int(time.time())
-        def cooled(side: str) -> bool:
-            last = st.cooldown_ts.get(side, 0)
-            return (now_s - last) >= SIGNAL_COOLDOWN_SEC
-
-        # RSI crossing conditions
         prev_rsi = rsi14(K5[:-1])
         curr_rsi = rsi14(K5)
         long_signal = prev_rsi < 30 <= curr_rsi
         short_signal = prev_rsi > 70 >= curr_rsi
         if not long_signal and not short_signal:
             return None
-
         side = "LONG" if long_signal else "SHORT"
-        if not cooled(side):
+        # cooldown
+        now_s = int(time.time())
+        last_ts = st.cooldown_ts.get(side, 0)
+        if now_s - last_ts < SIGNAL_COOLDOWN_SEC:
             return None
-
-        # Confirmations
-        confirm_extreme = False
-        confirm_pattern = False
-        confirm_volume = False
-        confirm_divergence = False
-        reasons: List[str] = []
-
-        # Local extrema touch/break
-        lookback = 30
+        confirms = []
+        # extreme of 30 bars
         if side == "LONG":
-            local_min = min(r[2] for r in K5[-(lookback+1):-1])
-            if K5[-1][2] <= local_min:
-                confirm_extreme = True
-                reasons.append(f"Обновлён локальный минимум ({lookback} свечей)")
+            low30 = min(r[2] for r in K5[-30:])
+            if K5[-1][2] <= low30:
+                confirms.append("касание 30-св. минимума")
         else:
-            local_max = max(r[1] for r in K5[-(lookback+1):-1])
-            if K5[-1][1] >= local_max:
-                confirm_extreme = True
-                reasons.append(f"Обновлён локальный максимум ({lookback} свечей)")
-
-        # Candlestick pattern
+            high30 = max(r[1] for r in K5[-30:])
+            if K5[-1][1] >= high30:
+                confirms.append("касание 30-св. максимума")
+        # candle pattern
         o,h,l,c,v = K5[-1]
         if side == "LONG":
-            # Hammer
-            body = abs(c - o); upper_wick = h - max(c, o); lower_wick = min(c, o) - l
+            body = c - o
+            lower_wick = o - l
+            upper_wick = h - c
+            # hammer
             if c > o and lower_wick >= 2 * body and upper_wick <= 0.5 * body:
-                confirm_pattern = True
-                reasons.append("Свечной паттерн: молот")
+                confirms.append("паттерн: молот")
             else:
-                # Bullish engulfing
+                # bullish engulfing
                 o_prev, h_prev, l_prev, c_prev, _ = K5[-2]
-                if c_prev < o_prev and c > o and c >= o_prev and o <= c_prev:
-                    confirm_pattern = True
-                    reasons.append("Свечной паттерн: бычье поглощение")
+                if c_prev < o_prev and o <= c_prev and c >= o_prev:
+                    confirms.append("паттерн: бычье поглощение")
         else:
-            # Shooting star (pin-bar)
-            body = abs(c - o); upper_wick = h - max(c, o); lower_wick = min(c, o) - l
+            body = o - c
+            upper_wick = h - o
+            lower_wick = c - l
+            # shooting star (pin-bar)
             if o > c and upper_wick >= 2 * body and lower_wick <= 0.5 * body:
-                confirm_pattern = True
-                reasons.append("Свечной паттерн: пин-бар")
+                confirms.append("паттерн: пин-бар")
             else:
-                # Bearish engulfing
+                # bearish engulfing
                 o_prev, h_prev, l_prev, c_prev, _ = K5[-2]
-                if c_prev > o_prev and c < o and o >= c_prev and c <= o_prev:
-                    confirm_pattern = True
-                    reasons.append("Свечной паттерн: медвежье поглощение")
-
-        # Volume spike
-        avg_vol = sma([r[4] for r in K5[-21:-1]], VOL_SMA_15)
-        if avg_vol > 0 and v >= VOLUME_SPIKE_MULT * avg_vol:
-            confirm_volume = True
-            reasons.append(f"Объёмный всплеск: vol={v:.0f} ≥ {VOLUME_SPIKE_MULT}×SMA20({avg_vol:.0f})")
-
+                if c_prev > o_prev and o >= c_prev and c <= o_prev:
+                    confirms.append("паттерн: медвежье поглощение")
+        # volume spike
+        if len(K5) >= VOL_SMA_15+1:
+            avg_vol = sma([r[4] for r in K5[-(VOL_SMA_15+1):-1]], VOL_SMA_15)
+            if avg_vol > 0 and v >= 2 * avg_vol:
+                confirms.append("спайк объема")
         # RSI divergence (optional)
-        if confirm_extreme:
+        if confirms:
             if side == "LONG":
-                prev_low_idx = min(range(len(K5)-30, len(K5)-1), key=lambda i: K5[i][2])
-                rsi_prev_low = rsi14(K5[:prev_low_idx+1])
-                if curr_rsi > rsi_prev_low:
-                    confirm_divergence = True
-                    reasons.append("Бычья дивергенция RSI")
+                lows_idx = [i for i in range(len(K5)-30, len(K5)-1)]
+                if lows_idx:
+                    prev_low_idx = min(lows_idx, key=lambda i: K5[i][2])
+                    rsi_prev_low = rsi14(K5[:prev_low_idx+1])
+                    if curr_rsi > rsi_prev_low:
+                        confirms.append("бычья дивергенция RSI")
             else:
-                prev_high_idx = max(range(len(K5)-30, len(K5)-1), key=lambda i: K5[i][1])
-                rsi_prev_high = rsi14(K5[:prev_high_idx+1])
-                if curr_rsi < rsi_prev_high:
-                    confirm_divergence = True
-                    reasons.append("Медвежья дивергенция RSI")
-
-        # Determine signal strength
-        count = (1 if confirm_extreme else 0) + (1 if confirm_pattern else 0) + (1 if confirm_volume else 0) + (1 if confirm_divergence else 0)
-        if count < 2:
+                highs_idx = [i for i in range(len(K5)-30, len(K5)-1)]
+                if highs_idx:
+                    prev_high_idx = max(highs_idx, key=lambda i: K5[i][1])
+                    rsi_prev_high = rsi14(K5[:prev_high_idx+1])
+                    if curr_rsi < rsi_prev_high:
+                        confirms.append("медвежья дивергенция RSI")
+        if len(confirms) < 2:
             return None
-        strength = "сильный" if count >= 3 else "слабый"
-
-        # ATR-based TP/SL calculation
-        atr5 = atr(K5, ATR_PERIOD_15)
+        strength = "сильный" if len(confirms) >= 3 else "слабый"
+        # ATR-based SL/TP
         entry_price = K5[-1][3]
+        atr5 = atr(K5, ATR_PERIOD_15)
+        if atr5 == 0:
+            return None
         if side == "LONG":
-            sl_price = max(1e-9, entry_price - ATR_SL_MULT * atr5)
+            sl_price = entry_price - ATR_SL_MULT * atr5
+            risk = entry_price - sl_price
             tp_price = entry_price + ATR_TP_MULT * atr5
-            rr = (tp_price - entry_price) / max(1e-9, (entry_price - sl_price))
-            tp_pct = (tp_price - entry_price) / entry_price
-            if tp_pct < TP_MIN_PCT:
-                tp_price = entry_price * (1 + TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp_price = entry_price * (1 + TP_MAX_PCT)
-            rr = (tp_price - entry_price) / max(1e-9, (entry_price - sl_price))
         else:
             sl_price = entry_price + ATR_SL_MULT * atr5
+            risk = sl_price - entry_price
             tp_price = entry_price - ATR_TP_MULT * atr5
-            rr = (entry_price - tp_price) / max(1e-9, (sl_price - entry_price))
-            tp_pct = (entry_price - tp_price) / entry_price
-            if tp_pct < TP_MIN_PCT:
-                tp_price = entry_price * (1 - TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp_price = entry_price * (1 - TP_MAX_PCT)
-            rr = (entry_price - tp_price) / max(1e-9, (sl_price - entry_price))
-
+        # enforce min/max TP% and RR
+        tp_pct = abs(tp_price - entry_price) / entry_price
+        if tp_pct < TP_MIN_PCT:
+            tp_price = entry_price * (1 + (TP_MIN_PCT if side=="LONG" else -TP_MIN_PCT))
+        if tp_pct > TP_MAX_PCT:
+            tp_price = entry_price * (1 + (TP_MAX_PCT if side=="LONG" else -TP_MAX_PCT))
+        rr = abs(tp_price - entry_price) / max(1e-9, risk)
         if rr < RR_MIN:
             return None
-
+        # update cooldown
         st.cooldown_ts[side] = now_s
         return {
             "symbol": sym,
             "side": side,
             "entry": float(entry_price),
-            "tp1": float(tp_price),
-            "tp2": None,
             "sl": float(sl_price),
-            "rr": float(rr),
-            "reason": reasons,
-            "rsi14": round(curr_rsi, 2),
-            "strength": strength
+            "tp": float(tp_price),
+            "strength": strength,
+            "rsi": round(curr_rsi, 2),
+            "confirms": confirms
         }
 
 # =========================
-# Форматирование сигнала
+# Signal formatting
 # =========================
 def fmt_signal(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]; side = sig["side"]
-    entry = sig["entry"]; tp1 = sig["tp1"]; sl = sig["sl"]; rr = sig["rr"]
-    tp1_pct = (tp1 - entry)/entry if side == "LONG" else (entry - tp1)/entry
-    tp2 = sig.get("tp2")
-    rsi_val = sig.get("rsi14")
+    entry = sig["entry"]; sl = sig["sl"]; tp = sig["tp"]
     strength = sig.get("strength")
-    reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
+    rsi_val = sig.get("rsi")
+    confirms = sig.get("confirms", [])
+    emoji = "🟢" if side=="LONG" else "🔴"
     lines = [
-        f"🎯 <b>DERIVATIVES | {side} SIGNAL</b> on <b>[{sym}]</b> (5m)",
-        "<b>Параметры:</b>",
-        f"- <b>Сила сигнала:</b> {strength}" if strength else None,
-        f"- <b>RSI(14):</b> {rsi_val:.2f}" if rsi_val is not None else None,
-        f"<b>Текущая цена:</b> {entry:g}",
-        f"<b>Вход:</b> {entry:g}",
-        f"<b>Стоп-Лосс:</b> {sl:g}",
-        f"<b>Тейк-Профит 1:</b> {tp1:g} ({pct(tp1_pct)})" + (f"\n<b>Тейк-Профит 2:</b> {tp2:g}" if tp2 else ""),
-        "<b>Обоснование:</b>" + reasons if reasons else None,
-        f"<b>Риск:</b> RR≈{rr:.2f} • плечо ≤ x10; риск ≤ 1% депозита.",
-        f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"{emoji} <b>Сигнал {side} по {sym}</b>",
+        f"Вход: <b>{entry:g}</b>",
+        f"Стоп-Лосс: <b>{sl:g}</b>",
+        f"Тейк-Профит: <b>{tp:g}</b> ({pct((tp - entry)/entry) if entry else ''})",
+        f"Сила сигнала: <b>{strength}</b>",
+        f"RSI(14): <b>{rsi_val:.2f}</b>",
+        "Подтверждения:"
     ]
+    for c in confirms:
+        lines.append(f"• {c}")
     return "\n".join([x for x in lines if x])
 
 # =========================
@@ -368,7 +362,7 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id,
                         "✅ Online\n"
                         f"Symbols: {len(mkt.symbols)}\n"
-                        f"Mode: Derivatives (RSI 5m signals)\n"
+                        f"Mode: RSI 5m signals\n"
                         f"TP≥{pct(TP_MIN_PCT)} • RR≥{RR_MIN:.2f}\n"
                         f"Silent (signals): {silent_line}")
                 elif cmd == "/help":
@@ -381,7 +375,8 @@ async def tg_loop(app: web.Application) -> None:
                 elif cmd == "/jobs":
                     jobs = []
                     for k in ("ws_task", "keepalive_task", "watchdog_task", "tg_task", "universe_task"):
-                        t = app.get(k); jobs.append(f"{k}: {'running' if (t and not t.done()) else 'stopped'}")
+                        t = app.get(k)
+                        jobs.append(f"{k}: {'running' if (t and not t.done()) else 'stopped'}")
                     await tg.send(chat_id, "Jobs:\n" + "\n".join(jobs))
                 elif cmd == "/diag":
                     k5_pts = sum(len(mkt.state[s].k5) for s in mkt.symbols)
@@ -428,7 +423,8 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                     sig = eng.on_5m_close(sym)
                     if sig:
                         text = fmt_signal(sig)
-                        for chat_id in (PRIMARY_RECIPIENTS if ONLY_CHANNEL else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)):
+                        targets = PRIMARY_RECIPIENTS if ONLY_CHANNEL else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)
+                        for chat_id in targets:
                             with contextlib.suppress(Exception):
                                 await app["tg"].send(chat_id, text)
                         mkt.last_signal_sent_ts = now_ms()
@@ -472,9 +468,6 @@ async def watchdog_loop(app: web.Application) -> None:
         except Exception:
             logger.exception("watchdog error")
 
-# =========================
-# Universe of symbols
-# =========================
 async def build_universe_once(rest: BybitRest) -> List[str]:
     """Build the universe of active symbols (fallback to CORE_SYMBOLS if needed)."""
     symbols: List[str] = []
@@ -538,9 +531,6 @@ async def universe_refresh_loop(app: web.Application) -> None:
         except asyncio.CancelledError:
             break
 
-# =========================
-# Web app
-# =========================
 async def handle_health(request: web.Request) -> web.Response:
     mkt: Market = request.app["mkt"]
     return web.json_response({
@@ -615,7 +605,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v7.0 — TF=5m, RSI signals + ATR targets")
+    logger.info("Starting Cryptobot v7.0 — RSI 5m signals + ATR targets")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
