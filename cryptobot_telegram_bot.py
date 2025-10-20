@@ -95,6 +95,49 @@ logger = logging.getLogger("cryptobot")
 # =========================
 # Telegram
 # =========================
+
+class BybitWS:
+    def __init__(self, url: str, http: aiohttp.ClientSession) -> None:
+        self.url = url
+        self.http = http
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.on_message = None
+
+    async def connect(self) -> None:
+        self.ws = await self.http.ws_connect(self.url)
+
+    async def subscribe(self, topics: List[str]) -> None:
+        if not self.ws:
+            raise RuntimeError("WebSocket is not connected")
+        await self.ws.send_json({"op": "subscribe", "args": topics})
+
+    async def unsubscribe(self, topics: List[str]) -> None:
+        if not self.ws:
+            raise RuntimeError("WebSocket is not connected")
+        await self.ws.send_json({"op": "unsubscribe", "args": topics})
+
+    async def run(self) -> None:
+        if not self.ws:
+            raise RuntimeError("WebSocket is not connected")
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if self.on_message:
+                        res = self.on_message(data)
+                        if asyncio.iscoroutine(res):
+                            asyncio.create_task(res)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("WebSocket run error")
+        finally:
+            if self.ws and not self.ws.closed:
+                await self.ws.close()
+
+
 class Tg:
     def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
         self.base = f"https://api.telegram.org/bot{token}"
