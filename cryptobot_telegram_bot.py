@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v7.0 — RSI 5m signals + ATR targets + price action confirmations
+v8.0 — RSI 5m signals + ATR targets + price action confirmations
 """
 from __future__ import annotations
 import asyncio
@@ -46,28 +46,28 @@ CONTEXT_TF   = "60"   # (not used in new logic, kept for future/compatibility)
 # Индикаторные периоды (ENV)
 ATR_PERIOD_15   = int(os.getenv("ATR_PERIOD_15",   "14"))
 VOL_SMA_15      = int(os.getenv("VOL_SMA_15",      "20"))
-EMA_PERIOD_1H   = int(os.getenv("EMA_PERIOD_1H",   "100"))   # not used in code, reserved for future
+EMA_PERIOD_1H   = int(os.getenv("EMA_PERIOD_1H",   "100"))   # not used in code, reserved
 VWAP_WINDOW_15  = int(os.getenv("VWAP_WINDOW_15",  "60"))    # not used in new logic
 
 # Пороги/режимы (ENV)
-IMPULSE_BODY_ATR     = float(os.getenv("IMPULSE_BODY_ATR",     "0.6"))   # not used in new 
+IMPULSE_BODY_ATR     = float(os.getenv("IMPULSE_BODY_ATR",     "0.6"))   # not used
 VOLUME_SPIKE_MULT    = float(os.getenv("VOLUME_SPIKE_MULT",    "2.0"))
-CH_LEN               = int(os.getenv("CH_LEN",                 "12"))    # not used in new logic
-OI_WINDOW_MIN        = int(os.getenv("OI_WINDOW_MIN",          "15"))   # not used in new logic
+CH_LEN               = int(os.getenv("CH_LEN",                 "12"))    # not used
+OI_WINDOW_MIN        = int(os.getenv("OI_WINDOW_MIN",          "15"))   # not used
 OI_DELTA_LONG_MAX    = float(os.getenv("OI_DELTA_LONG_MAX",    "-0.02"))  # not used
 OI_DELTA_SHORT_MIN   = float(os.getenv("OI_DELTA_SHORT_MIN",   "0.02"))   # not used
 LIQ_SPIKE_MINUTES    = int(os.getenv("LIQ_SPIKE_MINUTES",      "15"))   # not used
 LIQ_SPIKE_WINDOW_MIN = int(os.getenv("LIQ_SPIKE_WINDOW_MIN",   "120"))  # not used
 LIQ_SPIKE_QUANTILE   = float(os.getenv("LIQ_SPIKE_QUANTILE",   "0.95")) # not used
 
-# Trend mode (ENV) - not used in new logic, kept for compatibility
+# Trend mode (ENV) - not used in new logic
 MODE_TREND = int(os.getenv("MODE_TREND", "1"))
 
 # Funding extremes – not used in new logic
 FUNDING_EXTREME_POS = 0.0005
 FUNDING_EXTREME_NEG = -0.0005
 
-# TP/SL и риск (ENV)
+# TP/SL and risk (ENV)
 ATR_SL_MULT  = float(os.getenv("ATR_SL_MULT",  "0.8"))
 ATR_TP_MULT  = float(os.getenv("ATR_TP_MULT",  "1.2"))
 TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.01"))    # 1%
@@ -93,9 +93,55 @@ def setup_logging(level: str) -> None:
 logger = logging.getLogger("cryptobot")
 
 # =========================
-# Telegram
+# Индикаторы/утилиты
 # =========================
+def sma(values: List[float], period: int) -> float:
+    """Simple moving average over the last 'period' values."""
+    if not values or period <= 0:
+        return 0.0
+    if len(values) < period:
+        return sum(values) / len(values)
+    return sum(values[-period:]) / period
 
+def atr(data: List[Tuple[float, float, float, float, float]], period: int) -> float:
+    """Calculate Average True Range for the last 'period' bars."""
+    if len(data) < period + 1:
+        return 0.0
+    sum_tr = 0.0
+    # True Range for each bar: max(high-low, abs(high-prev_close), abs(prev_close-low))
+    for i in range(len(data) - period, len(data)):
+        high = data[i][1]; low = data[i][2]; prev_close = data[i-1][3]
+        tr = max(high - low, abs(high - prev_close), abs(prev_close - low))
+        sum_tr += tr
+    return sum_tr / period
+
+def rsi14(data: List[Tuple[float, float, float, float, float]]) -> float:
+    """Calculate 14-period RSI for the given data (list of OHLCV tuples)."""
+    period = 14
+    closes = [bar[3] for bar in data]
+    if len(closes) < period + 1:
+        return 50.0
+    # Use only the last 'period+1' closes to calculate RSI
+    closes = closes[-(period+1):]
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff > 0:
+            gains += diff
+        else:
+            losses += -diff
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# =========================
+# Telegram/Websocket clients
+# =========================
 class BybitWS:
     def __init__(self, url: str, http: aiohttp.ClientSession) -> None:
         self.url = url
@@ -136,7 +182,6 @@ class BybitWS:
         finally:
             if self.ws and not self.ws.closed:
                 await self.ws.close()
-
 
 class Tg:
     def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
@@ -187,8 +232,8 @@ class BybitRest:
         out: List[Tuple[float, float, float, float, float]] = []
         for it in arr:
             try:
-                o,h,l,c,v = float(it[1]), float(it[2]), float(it[3]), float(it[4]), float(it[5])
-                out.append((o,h,l,c,v))
+                o, h, l, c, v = float(it[1]), float(it[2]), float(it[3]), float(it[4]), float(it[5])
+                out.append((o, h, l, c, v))
             except Exception:
                 continue
         return out[-200:]
@@ -210,7 +255,7 @@ class Market:
         self.last_signal_sent_ts: int = 0
 
 # =========================
-# Signal Engine (5m RSI)
+# Signal Engine (5m RSI reversal)
 # =========================
 class Engine:
     def __init__(self, mkt: Market):
@@ -219,7 +264,7 @@ class Engine:
     def on_5m_close(self, sym: str) -> Optional[Dict[str, Any]]:
         st = self.mkt.state[sym]
         K5 = st.k5
-        # Require enough history: at least 
+        # Require enough history: at least N bars
         if len(K5) < max(31, VOL_SMA_15 + 1, ATR_PERIOD_15 + 1):
             return None
 
@@ -229,7 +274,7 @@ class Engine:
             last = st.cooldown_ts.get(side, 0)
             return (now_s - last) >= SIGNAL_COOLDOWN_SEC
 
-        # RSI crossing conditions
+        # RSI crossing conditions (exit oversold/overbought)
         prev_rsi = rsi14(K5[:-1])
         curr_rsi = rsi14(K5)
         long_signal = prev_rsi < 30 <= curr_rsi
@@ -248,21 +293,23 @@ class Engine:
         confirm_divergence = False
         reasons: List[str] = []
 
-        # Local extrema touch/break
+        # Local extrema touch/break (False breakout)
         lookback = 30
         if side == "LONG":
+            # New local low?
             local_min = min(r[2] for r in K5[-(lookback+1):-1])
             if K5[-1][2] <= local_min:
                 confirm_extreme = True
                 reasons.append(f"Обновлён локальный минимум ({lookback} свечей)")
         else:
+            # New local high?
             local_max = max(r[1] for r in K5[-(lookback+1):-1])
             if K5[-1][1] >= local_max:
                 confirm_extreme = True
                 reasons.append(f"Обновлён локальный максимум ({lookback} свечей)")
 
         # Candlestick pattern
-        o,h,l,c,v = K5[-1]
+        o, h, l, c, v = K5[-1]
         if side == "LONG":
             # Hammer
             body = abs(c - o); upper_wick = h - max(c, o); lower_wick = min(c, o) - l
@@ -289,33 +336,33 @@ class Engine:
                     reasons.append("Свечной паттерн: медвежье поглощение")
 
         # Volume spike
-        avg_vol = sma([r[4] for r in K5[-21:-1]], VOL_SMA_15)
+        avg_vol = sma([r[4] for r in K5[-(VOL_SMA_15+1):-1]], VOL_SMA_15)
         if avg_vol > 0 and v >= VOLUME_SPIKE_MULT * avg_vol:
             confirm_volume = True
-            reasons.append(f"Объёмный всплеск: vol={v:.0f} ≥ {VOLUME_SPIKE_MULT}×SMA20({avg_vol:.0f})")
+            reasons.append(f"Объёмный всплеск: vol={v:.0f} ≥ {VOLUME_SPIKE_MULT}×SMA{VOL_SMA_15}({avg_vol:.0f})")
 
-        # RSI divergence (optional)
+        # RSI divergence (price vs RSI)
         if confirm_extreme:
             if side == "LONG":
-                prev_low_idx = min(range(len(K5)-30, len(K5)-1), key=lambda i: K5[i][2])
+                prev_low_idx = min(range(len(K5)-lookback, len(K5)-1), key=lambda i: K5[i][2])
                 rsi_prev_low = rsi14(K5[:prev_low_idx+1])
                 if curr_rsi > rsi_prev_low:
                     confirm_divergence = True
                     reasons.append("Бычья дивергенция RSI")
             else:
-                prev_high_idx = max(range(len(K5)-30, len(K5)-1), key=lambda i: K5[i][1])
+                prev_high_idx = max(range(len(K5)-lookback, len(K5)-1), key=lambda i: K5[i][1])
                 rsi_prev_high = rsi14(K5[:prev_high_idx+1])
                 if curr_rsi < rsi_prev_high:
                     confirm_divergence = True
                     reasons.append("Медвежья дивергенция RSI")
 
-        # Determine signal strength
+        # Signal strength
         count = (1 if confirm_extreme else 0) + (1 if confirm_pattern else 0) + (1 if confirm_volume else 0) + (1 if confirm_divergence else 0)
         if count < 2:
             return None
         strength = "сильный" if count >= 3 else "слабый"
 
-        # ATR-based TP/SL calculation
+        # ATR-based TP/SL with min 1% TP
         atr5 = atr(K5, ATR_PERIOD_15)
         entry_price = K5[-1][3]
         if side == "LONG":
@@ -368,7 +415,7 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
     strength = sig.get("strength")
     reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
     lines = [
-        f"🎯 <b>DERIVATIVES | {side} SIGNAL</b> on <b>[{sym}]</b> (5m)",
+        f"{'🟢' if side=='LONG' else '🔴'} <b>DERIVATIVES | {side} SIGNAL</b> on <b>[{sym}]</b> (5m)",
         "<b>Параметры:</b>",
         f"- <b>Сила сигнала:</b> {strength}" if strength else None,
         f"- <b>RSI(14):</b> {rsi_val:.2f}" if rsi_val is not None else None,
@@ -459,11 +506,12 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             st = mkt.state[sym]
             for p in payload:
-                o,h,l,c,v = float(p["open"]), float(p["high"]), float(p["low"]), float(p["close"]), float(p.get("volume") or 0.0)
+                o = float(p["open"]); h = float(p["high"]); l = float(p["low"])
+                c = float(p["close"]); v = float(p.get("volume") or 0.0)
                 if p.get("confirm") is False and st.k5:
-                    st.k5[-1] = (o,h,l,c,v)
+                    st.k5[-1] = (o, h, l, c, v)
                 else:
-                    st.k5.append((o,h,l,c,v))
+                    st.k5.append((o, h, l, c, v))
                     if len(st.k5) > 900:
                         st.k5 = st.k5[-900:]
                 # On 5m close, generate signal
@@ -576,10 +624,10 @@ async def universe_refresh_loop(app: web.Application) -> None:
                     logger.info(f"[WS] Subscribed to {len(args)} topics for {len(add)} symbols")
                 mkt.symbols = symbols_new
                 logger.info(f"[universe] +{len(add)} / -{len(rem)} • total={len(mkt.symbols)}")
-        except Exception:
-            logger.exception("universe_refresh_loop error")
         except asyncio.CancelledError:
             break
+        except Exception:
+            logger.exception("universe_refresh_loop error")
 
 # =========================
 # Web app
@@ -632,7 +680,7 @@ async def on_startup(app: web.Application) -> None:
     # Notify startup
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, f"🟢 Cryptobot v7.0: RSI 5m signals + ATR targets")
+            await app["tg"].send(chat_id, f"🟢 Cryptobot v8.0: RSI 5m signals + ATR targets + confirmations")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -658,7 +706,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v7.0 — TF=5m, RSI signals + ATR targets")
+    logger.info("Starting Cryptobot v8.0 — TF=5m, RSI reversal signals")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
