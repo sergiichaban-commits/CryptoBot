@@ -87,7 +87,6 @@ def atr(data: List[Tuple[float, float, float, float, float]], period: int) -> fl
     if len(data) < period + 1:
         return 0.0
     total = 0.0
-    # берём последние `period` интервалов, каждый TR зависит от предыдущего close
     for i in range(len(data) - period, len(data)):
         high = data[i][1]; low = data[i][2]; prev_close = data[i-1][3]
         tr = max(high - low, abs(high - prev_close), abs(prev_close - low))
@@ -235,7 +234,6 @@ class Engine:
         def cooled(side: str) -> bool:
             return (now_s - st.cooldown_ts.get(side, 0)) >= SIGNAL_COOLDOWN_SEC
 
-        # RSI выход из зон
         prev_rsi = rsi14(K5[:-1])
         curr_rsi = rsi14(K5)
         long_signal  = prev_rsi < 30 <= curr_rsi
@@ -247,14 +245,12 @@ class Engine:
         if not cooled(side):
             return None
 
-        # Подтверждения
         confirm_extreme = False
         confirm_pattern = False
         confirm_volume  = False
         confirm_diverg  = False
         reasons: List[str] = ["RSI вышел из " + ("перепроданности" if side=="LONG" else "перекупленности")]
 
-        # Экстремумы (ложный пробой за 30 свечей)
         lookback = 30
         if side == "LONG":
             local_min = min(r[2] for r in K5[-(lookback+1):-1])
@@ -267,36 +263,29 @@ class Engine:
                 confirm_extreme = True
                 reasons.append(f"Обновлён локальный максимум ({lookback} св.)")
 
-        # Свечной паттерн
         o,h,l,c,v = K5[-1]
         if side == "LONG":
             body = abs(c - o); upper = h - max(c, o); lower = min(c, o) - l
-            # молот
             if c > o and lower >= 2*body and upper <= 0.5*body:
                 confirm_pattern = True; reasons.append("Паттерн: молот")
             else:
-                # бычье поглощение
                 o2,h2,l2,c2,_ = K5[-2]
                 if c2 < o2 and c > o and c >= o2 and o <= c2:
                     confirm_pattern = True; reasons.append("Паттерн: бычье поглощение")
         else:
             body = abs(c - o); upper = h - max(c, o); lower = min(c, o) - l
-            # пин-бар
             if o > c and upper >= 2*body and lower <= 0.5*body:
                 confirm_pattern = True; reasons.append("Паттерн: пин-бар")
             else:
-                # медвежье поглощение
                 o2,h2,l2,c2,_ = K5[-2]
                 if c2 > o2 and c < o and o >= c2 and c <= o2:
                     confirm_pattern = True; reasons.append("Паттерн: медвежье поглощение")
 
-        # Объёмный всплеск
         avg_vol = sma([r[4] for r in K5[-(VOL_SMA_15+1):-1]], VOL_SMA_15)
         if avg_vol > 0 and v >= VOLUME_SPIKE_MULT * avg_vol:
             confirm_volume = True
             reasons.append(f"Объёмный всплеск ≥ {VOLUME_SPIKE_MULT}×SMA{VOL_SMA_15}")
 
-        # Дивергенция RSI (если был экстремум)
         if confirm_extreme:
             if side == "LONG":
                 prev_low_idx = min(range(len(K5)-lookback, len(K5)-1), key=lambda i: K5[i][2])
@@ -314,7 +303,6 @@ class Engine:
             return None
         strength = "сильный" if conf_count >= 3 else "слабый"
 
-        # ATR SL/TP, TP в пределах [1%; 1.5%]
         a = atr(K5, ATR_PERIOD_15)
         entry = K5[-1][3]
         if side == "LONG":
@@ -451,7 +439,8 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             sym = payload[0].get("symbol") or topic.split(".")[-1]
             st = mkt.state[sym]
             for p in payload:
-                o = float(p["open"]); h = float(p["high"]); l = float(p["low"])
+                o = float(p["open"]); h = float(p["high"]); l = float(p["low"]
+                )
                 c = float(p["close"]); v = float(p.get("volume") or 0.0)
                 if p.get("confirm") is False and st.k5:
                     st.k5[-1] = (o,h,l,c,v)
@@ -591,7 +580,6 @@ async def on_startup(app: web.Application) -> None:
     http = aiohttp.ClientSession()
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
-    # Критично для long polling: снять webhook, чтобы не ловить 409 Conflict
     try:
         await app["tg"].delete_webhook(drop_pending_updates=True)
         logger.info("Telegram webhook deleted (drop_pending_updates=True)")
@@ -604,7 +592,6 @@ async def on_startup(app: web.Application) -> None:
     app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: asyncio.create_task(ws_on_message(app, data))
 
-    # Вселенная и подписка
     symbols = await build_universe_once(app["rest"])
     app["mkt"].symbols = symbols
     logger.info(f"symbols: {symbols}")
@@ -616,17 +603,15 @@ async def on_startup(app: web.Application) -> None:
         await app["ws"].subscribe(args)
         logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(symbols)} symbols")
 
-    # Фоновые задачи
     app["ws_task"] = asyncio.create_task(app["ws"].run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
     app["tg_task"] = asyncio.create_task(tg_loop(app))
     app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
 
-    # Уведомление
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, f"🟢 Cryptobot v8.1: polling mode enabled, RSI 5m signals live")
+            await app["tg"].send(chat_id, "🟢 Cryptobot v8.1: polling mode enabled, RSI 5m signals live")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -657,4 +642,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```0
