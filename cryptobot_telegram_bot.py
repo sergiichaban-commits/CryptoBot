@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — Derivatives Signals (Bybit V5, USDT Perpetuals)
-v8.0 — RSI 5m signals + ATR targets + price action confirmations
+v8.1 — Long polling fix (deleteWebhook) + RSI 5m signals + ATR targets + confirmations
 """
 from __future__ import annotations
 import asyncio
@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,9 +29,9 @@ PORT = int(os.getenv("PORT", "10000"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or ""
 ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
-ONLY_CHANNEL = True
+ONLY_CHANNEL = True  # отправлять только в канал (если есть), иначе всем разрешённым chat_id
 
-# Вселенная: мягкие фильтры (ENV)
+# Вселенная
 UNIVERSE_REFRESH_SEC = 600
 TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "5000000"))
 VOLUME_MIN_USD  = float(os.getenv("VOLUME_MIN_USD",  "5000000"))
@@ -39,45 +39,26 @@ ACTIVE_SYMBOLS  = int(os.getenv("ACTIVE_SYMBOLS",     "60"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TONUSDT"]
 
 # Таймфреймы
-EXEC_TF_MAIN = "15"   # (not used in new logic, kept for compatibility)
-EXEC_TF_AUX  = "5"    # 5m timeframe for signals
-CONTEXT_TF   = "60"   # (not used in new logic, kept for future/compatibility)
+EXEC_TF_AUX  = "5"    # 5m — генерация сигналов
 
-# Индикаторные периоды (ENV)
+# Индикаторные периоды
 ATR_PERIOD_15   = int(os.getenv("ATR_PERIOD_15",   "14"))
 VOL_SMA_15      = int(os.getenv("VOL_SMA_15",      "20"))
-EMA_PERIOD_1H   = int(os.getenv("EMA_PERIOD_1H",   "100"))   # not used in code, reserved
-VWAP_WINDOW_15  = int(os.getenv("VWAP_WINDOW_15",  "60"))    # not used in new logic
 
-# Пороги/режимы (ENV)
-IMPULSE_BODY_ATR     = float(os.getenv("IMPULSE_BODY_ATR",     "0.6"))   # not used
-VOLUME_SPIKE_MULT    = float(os.getenv("VOLUME_SPIKE_MULT",    "2.0"))
-CH_LEN               = int(os.getenv("CH_LEN",                 "12"))    # not used
-OI_WINDOW_MIN        = int(os.getenv("OI_WINDOW_MIN",          "15"))   # not used
-OI_DELTA_LONG_MAX    = float(os.getenv("OI_DELTA_LONG_MAX",    "-0.02"))  # not used
-OI_DELTA_SHORT_MIN   = float(os.getenv("OI_DELTA_SHORT_MIN",   "0.02"))   # not used
-LIQ_SPIKE_MINUTES    = int(os.getenv("LIQ_SPIKE_MINUTES",      "15"))   # not used
-LIQ_SPIKE_WINDOW_MIN = int(os.getenv("LIQ_SPIKE_WINDOW_MIN",   "120"))  # not used
-LIQ_SPIKE_QUANTILE   = float(os.getenv("LIQ_SPIKE_QUANTILE",   "0.95")) # not used
+# Пороги/режимы
+VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
 
-# Trend mode (ENV) - not used in new logic
-MODE_TREND = int(os.getenv("MODE_TREND", "1"))
-
-# Funding extremes – not used in new logic
-FUNDING_EXTREME_POS = 0.0005
-FUNDING_EXTREME_NEG = -0.0005
-
-# TP/SL and risk (ENV)
+# TP/SL и риск
 ATR_SL_MULT  = float(os.getenv("ATR_SL_MULT",  "0.8"))
 ATR_TP_MULT  = float(os.getenv("ATR_TP_MULT",  "1.2"))
-TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.01"))    # 1%
-TP_MAX_PCT   = float(os.getenv("TP_MAX_PCT",   "0.015"))   # 1.5%
+TP_MIN_PCT   = float(os.getenv("TP_MIN_PCT",   "0.01"))   # >=1%
+TP_MAX_PCT   = float(os.getenv("TP_MAX_PCT",   "0.015"))  # <=1.5%
 RR_MIN       = float(os.getenv("RR_MIN",       "1.5"))
 
-# Антиспам/надежность (ENV)
+# Антиспам / надёжность
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "90"))
 KEEPALIVE_SEC = 13 * 60
-WATCHDOG_SEC = 60
+WATCHDOG_SEC  = 60
 STALL_EXIT_SEC = int(os.getenv("STALL_EXIT_SEC", "240"))
 
 # =========================
@@ -93,10 +74,9 @@ def setup_logging(level: str) -> None:
 logger = logging.getLogger("cryptobot")
 
 # =========================
-# Индикаторы/утилиты
+# Индикаторы
 # =========================
 def sma(values: List[float], period: int) -> float:
-    """Simple moving average over the last 'period' values."""
     if not values or period <= 0:
         return 0.0
     if len(values) < period:
@@ -104,43 +84,39 @@ def sma(values: List[float], period: int) -> float:
     return sum(values[-period:]) / period
 
 def atr(data: List[Tuple[float, float, float, float, float]], period: int) -> float:
-    """Calculate Average True Range for the last 'period' bars."""
     if len(data) < period + 1:
         return 0.0
-    sum_tr = 0.0
-    # True Range for each bar: max(high-low, abs(high-prev_close), abs(prev_close-low))
+    total = 0.0
+    # берём последние `period` интервалов, каждый TR зависит от предыдущего close
     for i in range(len(data) - period, len(data)):
         high = data[i][1]; low = data[i][2]; prev_close = data[i-1][3]
         tr = max(high - low, abs(high - prev_close), abs(prev_close - low))
-        sum_tr += tr
-    return sum_tr / period
+        total += tr
+    return total / period
 
 def rsi14(data: List[Tuple[float, float, float, float, float]]) -> float:
-    """Calculate 14-period RSI for the given data (list of OHLCV tuples)."""
     period = 14
     closes = [bar[3] for bar in data]
     if len(closes) < period + 1:
         return 50.0
-    # Use only the last 'period+1' closes to calculate RSI
     closes = closes[-(period+1):]
     gains = 0.0
     losses = 0.0
     for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains += diff
+        d = closes[i] - closes[i-1]
+        if d > 0:
+            gains += d
         else:
-            losses += -diff
+            losses += -d
     avg_gain = gains / period
     avg_loss = losses / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 # =========================
-# Telegram/Websocket clients
+# Клиенты: WS/Telegram/REST
 # =========================
 class BybitWS:
     def __init__(self, url: str, http: aiohttp.ClientSession) -> None:
@@ -188,6 +164,12 @@ class Tg:
         self.base = f"https://api.telegram.org/bot{token}"
         self.http = http
 
+    async def delete_webhook(self, drop_pending_updates: bool = True) -> Dict[str, Any]:
+        payload = {"drop_pending_updates": drop_pending_updates}
+        async with self.http.post(f"{self.base}/deleteWebhook", json=payload) as r:
+            r.raise_for_status()
+            return await r.json()
+
     async def send(self, chat_id: int, text: str) -> None:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         async with self.http.post(f"{self.base}/sendMessage", json=payload) as r:
@@ -202,9 +184,6 @@ class Tg:
             r.raise_for_status()
             return await r.json()
 
-# =========================
-# Bybit REST
-# =========================
 class BybitRest:
     def __init__(self, base: str, http: aiohttp.ClientSession) -> None:
         self.base = base.rstrip("/")
@@ -223,23 +202,8 @@ class BybitRest:
             r.raise_for_status()
             return (await r.json()).get("result", {}).get("list", []) or []
 
-    async def klines(self, category: str, symbol: str, interval: str, limit: int = 200) -> List[Tuple[float, float, float, float, float]]:
-        url = f"{self.base}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={min(200, max(1, limit))}"
-        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            r.raise_for_status()
-            data = await r.json()
-        arr = (data.get("result") or {}).get("list") or []
-        out: List[Tuple[float, float, float, float, float]] = []
-        for it in arr:
-            try:
-                o, h, l, c, v = float(it[1]), float(it[2]), float(it[3]), float(it[4]), float(it[5])
-                out.append((o, h, l, c, v))
-            except Exception:
-                continue
-        return out[-200:]
-
 # =========================
-# Market data / state
+# Состояние рынка
 # =========================
 @dataclass
 class SymbolState:
@@ -255,7 +219,7 @@ class Market:
         self.last_signal_sent_ts: int = 0
 
 # =========================
-# Signal Engine (5m RSI reversal)
+# Логика сигналов (5m RSI)
 # =========================
 class Engine:
     def __init__(self, mkt: Market):
@@ -264,20 +228,17 @@ class Engine:
     def on_5m_close(self, sym: str) -> Optional[Dict[str, Any]]:
         st = self.mkt.state[sym]
         K5 = st.k5
-        # Require enough history: at least N bars
         if len(K5) < max(31, VOL_SMA_15 + 1, ATR_PERIOD_15 + 1):
             return None
 
-        # Cooldown per symbol/side
         now_s = int(time.time())
         def cooled(side: str) -> bool:
-            last = st.cooldown_ts.get(side, 0)
-            return (now_s - last) >= SIGNAL_COOLDOWN_SEC
+            return (now_s - st.cooldown_ts.get(side, 0)) >= SIGNAL_COOLDOWN_SEC
 
-        # RSI crossing conditions (exit oversold/overbought)
+        # RSI выход из зон
         prev_rsi = rsi14(K5[:-1])
         curr_rsi = rsi14(K5)
-        long_signal = prev_rsi < 30 <= curr_rsi
+        long_signal  = prev_rsi < 30 <= curr_rsi
         short_signal = prev_rsi > 70 >= curr_rsi
         if not long_signal and not short_signal:
             return None
@@ -286,106 +247,90 @@ class Engine:
         if not cooled(side):
             return None
 
-        # Confirmations
+        # Подтверждения
         confirm_extreme = False
         confirm_pattern = False
-        confirm_volume = False
-        confirm_divergence = False
-        reasons: List[str] = []
+        confirm_volume  = False
+        confirm_diverg  = False
+        reasons: List[str] = ["RSI вышел из " + ("перепроданности" if side=="LONG" else "перекупленности")]
 
-        # Local extrema touch/break (False breakout)
+        # Экстремумы (ложный пробой за 30 свечей)
         lookback = 30
         if side == "LONG":
-            # New local low?
             local_min = min(r[2] for r in K5[-(lookback+1):-1])
             if K5[-1][2] <= local_min:
                 confirm_extreme = True
-                reasons.append(f"Обновлён локальный минимум ({lookback} свечей)")
+                reasons.append(f"Обновлён локальный минимум ({lookback} св.)")
         else:
-            # New local high?
             local_max = max(r[1] for r in K5[-(lookback+1):-1])
             if K5[-1][1] >= local_max:
                 confirm_extreme = True
-                reasons.append(f"Обновлён локальный максимум ({lookback} свечей)")
+                reasons.append(f"Обновлён локальный максимум ({lookback} св.)")
 
-        # Candlestick pattern
-        o, h, l, c, v = K5[-1]
+        # Свечной паттерн
+        o,h,l,c,v = K5[-1]
         if side == "LONG":
-            # Hammer
-            body = abs(c - o); upper_wick = h - max(c, o); lower_wick = min(c, o) - l
-            if c > o and lower_wick >= 2 * body and upper_wick <= 0.5 * body:
-                confirm_pattern = True
-                reasons.append("Свечной паттерн: молот")
+            body = abs(c - o); upper = h - max(c, o); lower = min(c, o) - l
+            # молот
+            if c > o and lower >= 2*body and upper <= 0.5*body:
+                confirm_pattern = True; reasons.append("Паттерн: молот")
             else:
-                # Bullish engulfing
-                o_prev, h_prev, l_prev, c_prev, _ = K5[-2]
-                if c_prev < o_prev and c > o and c >= o_prev and o <= c_prev:
-                    confirm_pattern = True
-                    reasons.append("Свечной паттерн: бычье поглощение")
+                # бычье поглощение
+                o2,h2,l2,c2,_ = K5[-2]
+                if c2 < o2 and c > o and c >= o2 and o <= c2:
+                    confirm_pattern = True; reasons.append("Паттерн: бычье поглощение")
         else:
-            # Shooting star (pin-bar)
-            body = abs(c - o); upper_wick = h - max(c, o); lower_wick = min(c, o) - l
-            if o > c and upper_wick >= 2 * body and lower_wick <= 0.5 * body:
-                confirm_pattern = True
-                reasons.append("Свечной паттерн: пин-бар")
+            body = abs(c - o); upper = h - max(c, o); lower = min(c, o) - l
+            # пин-бар
+            if o > c and upper >= 2*body and lower <= 0.5*body:
+                confirm_pattern = True; reasons.append("Паттерн: пин-бар")
             else:
-                # Bearish engulfing
-                o_prev, h_prev, l_prev, c_prev, _ = K5[-2]
-                if c_prev > o_prev and c < o and o >= c_prev and c <= o_prev:
-                    confirm_pattern = True
-                    reasons.append("Свечной паттерн: медвежье поглощение")
+                # медвежье поглощение
+                o2,h2,l2,c2,_ = K5[-2]
+                if c2 > o2 and c < o and o >= c2 and c <= o2:
+                    confirm_pattern = True; reasons.append("Паттерн: медвежье поглощение")
 
-        # Volume spike
+        # Объёмный всплеск
         avg_vol = sma([r[4] for r in K5[-(VOL_SMA_15+1):-1]], VOL_SMA_15)
         if avg_vol > 0 and v >= VOLUME_SPIKE_MULT * avg_vol:
             confirm_volume = True
-            reasons.append(f"Объёмный всплеск: vol={v:.0f} ≥ {VOLUME_SPIKE_MULT}×SMA{VOL_SMA_15}({avg_vol:.0f})")
+            reasons.append(f"Объёмный всплеск ≥ {VOLUME_SPIKE_MULT}×SMA{VOL_SMA_15}")
 
-        # RSI divergence (price vs RSI)
+        # Дивергенция RSI (если был экстремум)
         if confirm_extreme:
             if side == "LONG":
                 prev_low_idx = min(range(len(K5)-lookback, len(K5)-1), key=lambda i: K5[i][2])
                 rsi_prev_low = rsi14(K5[:prev_low_idx+1])
                 if curr_rsi > rsi_prev_low:
-                    confirm_divergence = True
-                    reasons.append("Бычья дивергенция RSI")
+                    confirm_diverg = True; reasons.append("Бычья дивергенция RSI")
             else:
                 prev_high_idx = max(range(len(K5)-lookback, len(K5)-1), key=lambda i: K5[i][1])
                 rsi_prev_high = rsi14(K5[:prev_high_idx+1])
                 if curr_rsi < rsi_prev_high:
-                    confirm_divergence = True
-                    reasons.append("Медвежья дивергенция RSI")
+                    confirm_diverg = True; reasons.append("Медвежья дивергенция RSI")
 
-        # Signal strength
-        count = (1 if confirm_extreme else 0) + (1 if confirm_pattern else 0) + (1 if confirm_volume else 0) + (1 if confirm_divergence else 0)
-        if count < 2:
+        conf_count = int(confirm_extreme) + int(confirm_pattern) + int(confirm_volume) + int(confirm_diverg)
+        if conf_count < 2:
             return None
-        strength = "сильный" if count >= 3 else "слабый"
+        strength = "сильный" if conf_count >= 3 else "слабый"
 
-        # ATR-based TP/SL with min 1% TP
-        atr5 = atr(K5, ATR_PERIOD_15)
-        entry_price = K5[-1][3]
+        # ATR SL/TP, TP в пределах [1%; 1.5%]
+        a = atr(K5, ATR_PERIOD_15)
+        entry = K5[-1][3]
         if side == "LONG":
-            sl_price = max(1e-9, entry_price - ATR_SL_MULT * atr5)
-            tp_price = entry_price + ATR_TP_MULT * atr5
-            rr = (tp_price - entry_price) / max(1e-9, (entry_price - sl_price))
-            tp_pct = (tp_price - entry_price) / entry_price
-            if tp_pct < TP_MIN_PCT:
-                tp_price = entry_price * (1 + TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp_price = entry_price * (1 + TP_MAX_PCT)
-            rr = (tp_price - entry_price) / max(1e-9, (entry_price - sl_price))
+            sl = max(1e-9, entry - ATR_SL_MULT * a)
+            tp = entry + ATR_TP_MULT * a
+            tp_pct = (tp - entry)/entry
+            if tp_pct < TP_MIN_PCT: tp = entry * (1 + TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT: tp = entry * (1 + TP_MAX_PCT)
+            rr = (tp - entry) / max(1e-9, (entry - sl))
         else:
-            sl_price = entry_price + ATR_SL_MULT * atr5
-            tp_price = entry_price - ATR_TP_MULT * atr5
-            rr = (entry_price - tp_price) / max(1e-9, (sl_price - entry_price))
-            tp_pct = (entry_price - tp_price) / entry_price
-            if tp_pct < TP_MIN_PCT:
-                tp_price = entry_price * (1 - TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp_price = entry_price * (1 - TP_MAX_PCT)
-            rr = (entry_price - tp_price) / max(1e-9, (sl_price - entry_price))
-
+            sl = entry + ATR_SL_MULT * a
+            tp = entry - ATR_TP_MULT * a
+            tp_pct = (entry - tp)/entry
+            if tp_pct < TP_MIN_PCT: tp = entry * (1 - TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT: tp = entry * (1 - TP_MAX_PCT)
+            rr = (entry - tp) / max(1e-9, (sl - entry))
         if rr < RR_MIN:
             return None
 
@@ -393,10 +338,10 @@ class Engine:
         return {
             "symbol": sym,
             "side": side,
-            "entry": float(entry_price),
-            "tp1": float(tp_price),
+            "entry": float(entry),
+            "tp1": float(tp),
             "tp2": None,
-            "sl": float(sl_price),
+            "sl": float(sl),
             "rr": float(rr),
             "reason": reasons,
             "rsi14": round(curr_rsi, 2),
@@ -410,28 +355,27 @@ def fmt_signal(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]; side = sig["side"]
     entry = sig["entry"]; tp1 = sig["tp1"]; sl = sig["sl"]; rr = sig["rr"]
     tp1_pct = (tp1 - entry)/entry if side == "LONG" else (entry - tp1)/entry
-    tp2 = sig.get("tp2")
-    rsi_val = sig.get("rsi14")
-    strength = sig.get("strength")
+    rsi_val = sig.get("rsi14"); strength = sig.get("strength")
     reasons = "".join(f"\n- {r}" for r in (sig.get("reason") or []))
+    emoji = "🟢" if side == "LONG" else "🔴"
     lines = [
-        f"{'🟢' if side=='LONG' else '🔴'} <b>DERIVATIVES | {side} SIGNAL</b> on <b>[{sym}]</b> (5m)",
+        f"{emoji} <b>{side} SIGNAL</b> — <b>{sym}</b> (5m)",
         "<b>Параметры:</b>",
         f"- <b>Сила сигнала:</b> {strength}" if strength else None,
         f"- <b>RSI(14):</b> {rsi_val:.2f}" if rsi_val is not None else None,
         f"<b>Текущая цена:</b> {entry:g}",
         f"<b>Вход:</b> {entry:g}",
         f"<b>Стоп-Лосс:</b> {sl:g}",
-        f"<b>Тейк-Профит 1:</b> {tp1:g} ({pct(tp1_pct)})" + (f"\n<b>Тейк-Профит 2:</b> {tp2:g}" if tp2 else ""),
-        "<b>Обоснование:</b>" + reasons if reasons else None,
+        f"<b>Тейк-Профит:</b> {tp1:g} ({pct(tp1_pct)})",
+        "<b>Причины:</b>" + reasons if reasons else None,
         f"<b>Риск:</b> RR≈{rr:.2f} • плечо ≤ x10; риск ≤ 1% депозита.",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
     ]
     return "\n".join([x for x in lines if x])
 
 # =========================
-# Telegram bot commands
-# ======================
+# Telegram loop (long polling)
+# =========================
 async def tg_loop(app: web.Application) -> None:
     tg: Tg = app["tg"]; mkt: Market = app["mkt"]
     offset = None
@@ -458,7 +402,7 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id,
                         "✅ Online\n"
                         f"Symbols: {len(mkt.symbols)}\n"
-                        f"Mode: Derivatives (RSI 5m signals)\n"
+                        f"Mode: RSI 5m signals\n"
                         f"TP≥{pct(TP_MIN_PCT)} • RR≥{RR_MIN:.2f}\n"
                         f"Silent (signals): {silent_line}")
                 elif cmd == "/help":
@@ -466,12 +410,13 @@ async def tg_loop(app: web.Application) -> None:
                         "Команды:\n"
                         "/ping — пинг\n"
                         "/status — статус\n"
-                        "/diag — диагностика буферов и метрик\n"
+                        "/diag — диагностика\n"
                         "/jobs — фоновые задачи\n")
                 elif cmd == "/jobs":
                     jobs = []
                     for k in ("ws_task", "keepalive_task", "watchdog_task", "tg_task", "universe_task"):
-                        t = app.get(k); jobs.append(f"{k}: {'running' if (t and not t.done()) else 'stopped'}")
+                        t = app.get(k)
+                        jobs.append(f"{k}: {'running' if (t and not t.done()) else 'stopped'}")
                     await tg.send(chat_id, "Jobs:\n" + "\n".join(jobs))
                 elif cmd == "/diag":
                     k5_pts = sum(len(mkt.state[s].k5) for s in mkt.symbols)
@@ -499,7 +444,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
     mkt: Market = app["mkt"]; eng: Engine = app["engine"]
     topic = data.get("topic") or ""
     mkt.last_ws_msg_ts = now_ms()
-    # 5m KLINE data
+
     if topic.startswith(f"kline.{EXEC_TF_AUX}."):
         payload = data.get("data") or []
         if payload:
@@ -509,17 +454,17 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                 o = float(p["open"]); h = float(p["high"]); l = float(p["low"])
                 c = float(p["close"]); v = float(p.get("volume") or 0.0)
                 if p.get("confirm") is False and st.k5:
-                    st.k5[-1] = (o, h, l, c, v)
+                    st.k5[-1] = (o,h,l,c,v)
                 else:
-                    st.k5.append((o, h, l, c, v))
+                    st.k5.append((o,h,l,c,v))
                     if len(st.k5) > 900:
                         st.k5 = st.k5[-900:]
-                # On 5m close, generate signal
                 if p.get("confirm") is True:
                     sig = eng.on_5m_close(sym)
                     if sig:
                         text = fmt_signal(sig)
-                        for chat_id in (PRIMARY_RECIPIENTS if ONLY_CHANNEL else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)):
+                        targets = PRIMARY_RECIPIENTS if ONLY_CHANNEL else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)
+                        for chat_id in targets:
                             with contextlib.suppress(Exception):
                                 await app["tg"].send(chat_id, text)
                         mkt.last_signal_sent_ts = now_ms()
@@ -531,7 +476,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
                 pass
 
 # =========================
-# Background tasks
+# Фоновые задачи
 # =========================
 async def keepalive_loop(app: web.Application) -> None:
     public_url = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
@@ -564,10 +509,9 @@ async def watchdog_loop(app: web.Application) -> None:
             logger.exception("watchdog error")
 
 # =========================
-# Universe of symbols
+# Вселенная тикеров
 # =========================
 async def build_universe_once(rest: BybitRest) -> List[str]:
-    """Build the universe of active symbols (fallback to CORE_SYMBOLS if needed)."""
     symbols: List[str] = []
     try:
         tickers = await rest.tickers_linear()
@@ -647,12 +591,20 @@ async def on_startup(app: web.Application) -> None:
     http = aiohttp.ClientSession()
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
+    # Критично для long polling: снять webhook, чтобы не ловить 409 Conflict
+    try:
+        await app["tg"].delete_webhook(drop_pending_updates=True)
+        logger.info("Telegram webhook deleted (drop_pending_updates=True)")
+    except Exception:
+        logger.exception("Failed to delete Telegram webhook (harmless in polling mode)")
+
     app["rest"] = BybitRest(BYBIT_REST, http)
     app["mkt"] = Market()
     app["engine"] = Engine(app["mkt"])
     app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: asyncio.create_task(ws_on_message(app, data))
-    # Build initial universe and subscribe
+
+    # Вселенная и подписка
     symbols = await build_universe_once(app["rest"])
     app["mkt"].symbols = symbols
     logger.info(f"symbols: {symbols}")
@@ -663,24 +615,18 @@ async def on_startup(app: web.Application) -> None:
     if args:
         await app["ws"].subscribe(args)
         logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(symbols)} symbols")
-    else:
-        fallback = CORE_SYMBOLS[:]
-        app["mkt"].symbols = fallback
-        fargs = []
-        for s in fallback:
-            fargs += [f"kline.5.{s}"]
-        await app["ws"].subscribe(fargs)
-        logger.info(f"[WS] Fallback subscribed to {len(fargs)} topics for {len(fallback)} symbols")
-    # Start background tasks
+
+    # Фоновые задачи
     app["ws_task"] = asyncio.create_task(app["ws"].run())
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
     app["tg_task"] = asyncio.create_task(tg_loop(app))
     app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
-    # Notify startup
+
+    # Уведомление
     try:
         for chat_id in PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS:
-            await app["tg"].send(chat_id, f"🟢 Cryptobot v8.0: RSI 5m signals + ATR targets + confirmations")
+            await app["tg"].send(chat_id, f"🟢 Cryptobot v8.1: polling mode enabled, RSI 5m signals live")
     except Exception:
         logger.warning("startup notify failed")
 
@@ -706,8 +652,9 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("Starting Cryptobot v8.0 — TF=5m, RSI reversal signals")
+    logger.info("Starting Cryptobot v8.1 — TF=5m, RSI reversal signals (long polling)")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()
+```0
