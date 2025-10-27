@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v10.1 — Fast RSI + Momentum + Real-time levels
-       Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
-       Telegram error reporting (REPORT_ERRORS_TO_TG=1)
+v10.2 — 5m RSI re-entry + Momentum + Levels (lighter filters)
+      Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
+      Telegram error reporting (REPORT_ERRORS_TO_TG=1)
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import logging
 import os
 import time
 import traceback
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,27 +55,28 @@ CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"
 # =========================
 TF_SCALP = "5"
 
-# Более чувствительные параметры
+# RSI и пороги
 RSI_PERIOD     = 14
-RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "38"))  # было 32
-RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "62"))  # было 68
+RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "30"))
+RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "70"))
 
 # Быстрые EMA для момента
 EMA_FAST = 5
 EMA_SLOW = 13
 
 # Объемный фильтр
-VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.3"))  # было 1.8
+USE_VOLUME_FILTER = _bool_env("USE_VOLUME_FILTER", False)  # по умолчанию ВЫКЛ, чтобы оживить сигналы
+VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.10"))
 
-# Risk management для скальпинга
+# Risk management
 ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "0.8"))
 ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.5"))
-TP_MIN_PCT  = float(os.getenv("TP_MIN_PCT",  "0.002"))  # 0.2%
-TP_MAX_PCT  = float(os.getenv("TP_MAX_PCT",  "0.008"))  # 0.8% (хард-верх)
-RR_MIN      = float(os.getenv("RR_MIN",      "1.8"))
+TP_MIN_PCT  = float(os.getenv("TP_MIN_PCT",  "0.01"))   # >= 1%
+TP_MAX_PCT  = float(os.getenv("TP_MAX_PCT",  "0.02"))   # до 2%
+RR_MIN      = float(os.getenv("RR_MIN",      "1.5"))
 
 # Подтверждения
-MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "1"))  # было 2
+MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "2"))
 
 # Антиспам/мониторинг
 SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "60"))
@@ -164,7 +165,7 @@ def average_true_range(data: List[Tuple[float, float, float, float, float]], per
     return total / cnt if cnt else 0.0
 
 def relative_strength_index_fixed(data: List[Tuple[float, float, float, float, float]], period: int = RSI_PERIOD) -> float:
-    """RSI по последним period+1 свечам (простая, быстрая версия)."""
+    """RSI по последним period+1 свечам (простая версия)."""
     if len(data) < period + 1:
         return 50.0
     closes = [bar[3] for bar in data[-(period+1):]]
@@ -191,8 +192,7 @@ def momentum_indicator(data: List[Tuple[float, float, float, float, float]], per
     past_close = data[-(period+1)][3]
     return (current_close - past_close) / past_close * 100.0
 
-def detect_key_levels(data: List[Tuple[float, float, float, float, float]], lookback: int = 20) -> Tuple[float, float]:
-    """Примитивные уровни: min/max за lookback."""
+def detect_key_levels(data: List[Tuple[float,float,float,float,float]], lookback: int = 20) -> Tuple[float, float]:
     if len(data) < lookback:
         c = data[-1][3] if data else 0.0
         return c, c
@@ -342,6 +342,7 @@ class SymbolState:
     k5:  List[Tuple[float, float, float, float, float]] = field(default_factory=list)
     # индикаторы
     rsi_5m: float = 50.0
+    prev_rsi_5m: float = 50.0
     ema_fast: float = 0.0
     ema_slow: float = 0.0
     momentum: float = 0.0
@@ -371,6 +372,8 @@ class ScalpingEngine:
     def update_indicators_fast(self, sym: str) -> None:
         st = self.mkt.state[sym]
         if len(st.k5) >= RSI_PERIOD + 1:
+            # сохраняем предыдущее RSI перед пересчетом — для ловли re-entry
+            st.prev_rsi_5m = st.rsi_5m
             st.rsi_5m = relative_strength_index_fixed(st.k5)
         if len(st.k5) >= EMA_SLOW:
             closes = [bar[3] for bar in st.k5]
@@ -396,43 +399,50 @@ class ScalpingEngine:
 
         price = st.k5[-1][3]
         rsi = st.rsi_5m
+        prev_rsi = st.prev_rsi_5m
         mom = st.momentum
         ema_fast = st.ema_fast
         ema_slow = st.ema_slow
 
-        # объемный фильтр
+        # объемный фильтр (можно отключить через USE_VOLUME_FILTER=0)
         if len(st.k5) >= 6:
             avg_vol = sum(b[4] for b in st.k5[-6:-1]) / 5.0
             cur_vol = st.k5[-1][4]
-            volume_ok = cur_vol > avg_vol * VOLUME_SPIKE_MULT if avg_vol > 0 else True
+            volume_ok = (not USE_VOLUME_FILTER) or (avg_vol == 0) or (cur_vol > avg_vol * VOLUME_SPIKE_MULT)
         else:
             volume_ok = True
 
+        # RSI re-entry из зон
+        long_reentry  = (prev_rsi < RSI_OVERSOLD)   and (rsi >= RSI_OVERSOLD)
+        short_reentry = (prev_rsi > RSI_OVERBOUGHT) and (rsi <= RSI_OVERBOUGHT)
+
         long_checks = [
-            rsi < RSI_OVERSOLD and rsi > 25,              # не «перепродан» слишком глубоко
-            mom > -1.0,                                   # не обвал
+            (rsi < RSI_OVERSOLD) or long_reentry,        # перепроданность или re-entry вверх
+            mom > -1.2,                                   # не обвал
             (ema_fast > ema_slow) or (price > ema_fast),  # импульс вверх
             volume_ok,
-            price > st.support                            # выше поддержки
+            price >= st.support                           # не ниже поддержки
         ]
         short_checks = [
-            rsi > RSI_OVERBOUGHT and rsi < 75,            # не «перекуплен» слишком высоко
-            mom < 1.0,                                    # не ракета
+            (rsi > RSI_OVERBOUGHT) or short_reentry,      # перекупленность или re-entry вниз
+            mom < 1.2,                                    # не ракета
             (ema_fast < ema_slow) or (price < ema_fast),  # импульс вниз
             volume_ok,
-            price < st.resistance                         # ниже сопротивления
+            price <= st.resistance                        # не выше сопротивления
         ]
 
+        # Нужны >= MIN_CONFIRMATIONS, но не меньше 2–3 в сумме
+        need = max(2, MIN_CONFIRMATIONS)
         side = None
-        if sum(long_checks) >= max(3, MIN_CONFIRMATIONS):
+        if sum(1 for c in long_checks if c) >= need:
             side = "LONG"
-        elif sum(short_checks) >= max(3, MIN_CONFIRMATIONS):
+        elif sum(1 for c in short_checks if c) >= need:
             side = "SHORT"
         if not side:
             return None
 
         # SL/TP через ATR (быстро)
-        atr_val = st.atr if st.atr > 0 else price * 0.005  # 0.5% запасной
+        atr_val = st.atr if st.atr > 0 else price * 0.005  # запасной 0.5%
         if side == "LONG":
             sl = price - (atr_val * ATR_SL_MULT)
             tp = price + (atr_val * ATR_TP_MULT)
@@ -465,17 +475,19 @@ class ScalpingEngine:
 
         reasons: List[str] = []
         if side == "LONG":
-            if long_checks[0]: reasons.append(f"RSI<OS ({RSI_OVERSOLD}) → {rsi:.1f}")
-            if long_checks[1]: reasons.append(f"Momentum {mom:.2f}%")
-            if long_checks[2]: reasons.append("EMA импульс ↑")
-            if long_checks[3]: reasons.append("Объём подтверждает")
-            if long_checks[4]: reasons.append("Выше поддержки")
+            if (rsi < RSI_OVERSOLD) or long_reentry: reasons.append(f"RSI(14) re-entry↑/OS<{RSI_OVERSOLD}: {rsi:.1f}")
+            if mom > -1.2:                            reasons.append(f"Momentum {mom:.2f}%")
+            if (ema_fast > ema_slow) or (price > ema_fast): reasons.append("EMA импульс ↑")
+            if volume_ok and USE_VOLUME_FILTER:       reasons.append("Объём подтверждает")
+            if price >= st.support:                   reasons.append("Над поддержкой")
         else:
-            if short_checks[0]: reasons.append(f"RSI>OB ({RSI_OVERBOUGHT}) → {rsi:.1f}")
-            if short_checks[1]: reasons.append(f"Momentum {mom:.2f}%")
-            if short_checks[2]: reasons.append("EMA импульс ↓")
-            if short_checks[3]: reasons.append("Объём подтверждает")
-            if short_checks[4]: reasons.append("Ниже сопротивления")
+            if (rsi > RSI_OVERBOUGHT) or short_reentry: reasons.append(f"RSI(14) re-entry↓/OB>{RSI_OVERBOUGHT}: {rsi:.1f}")
+            if mom < 1.2:                              reasons.append(f"Momentum {mom:.2f}%")
+            if (ema_fast < ema_slow) or (price < ema_fast): reasons.append("EMA импульс ↓")
+            if volume_ok and USE_VOLUME_FILTER:        reasons.append("Объём подтверждает")
+            if price <= st.resistance:                 reasons.append("Под сопротивлением")
+
+        strength = "сильный" if (rr >= 2.0 or (USE_VOLUME_FILTER and volume_ok)) else "слабый"
 
         return {
             "symbol": sym,
@@ -491,6 +503,8 @@ class ScalpingEngine:
             "timeframe": "5m SCALP",
             "duration": "5-15min",
             "confidence": min(90, 40 + (sum(long_checks if side == "LONG" else short_checks))*10),
+            "reasons": reasons,
+            "strength": strength,
         }
 
 # =========================
@@ -507,9 +521,9 @@ def format_scalp_signal(sig: Dict[str, Any]) -> str:
     sl_pct = (entry - sl) / entry if side == "LONG" else (sl - entry) / entry
     emoji = "🟢" if side == "LONG" else "🔴"
     lines = [
-        f"{emoji} <b>SCALP SIGNAL | {side} | {symbol}</b>",
+        f"{emoji} <b>SCALP SIGNAL | {side} | {symbol} | {sig.get('strength','')}</b>",
         "⏰ ТФ: 5m (скальп)",
-        f"📍 <b>Цена/Вход:</b> {entry:.6f}",
+        f"📍 <b>Текущая/Вход:</b> {entry:.6f}",
         f"🛡️ <b>Стоп-Лосс:</b> {sl:.6f} ({pct(abs(sl_pct))})",
         f"🎯 <b>Тейк-Профит:</b> {tp:.6f} ({pct(abs(tp_pct))})",
         f"⚖️ <b>Risk/Reward:</b> {rr:.2f}",
@@ -522,7 +536,7 @@ def format_scalp_signal(sig: Dict[str, Any]) -> str:
         "",
         "📈 <b>Обоснование:</b>",
     ]
-    for r in sig.get("reason", []):
+    for r in sig.get("reasons", []):
         lines.append(f"• {r}")
     lines += [
         "",
@@ -540,7 +554,7 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
         mkt: Market = app["mkt"]; eng: ScalpingEngine = app["engine"]; tg: Tg = app["tg"]
         topic = data.get("topic") or ""
         mkt.last_ws_msg_ts = now_ms()
-        payload = data.get("data") or []
+        payload = (data.get("data") or [])
         if not payload:
             return
 
@@ -759,24 +773,16 @@ async def on_startup(app: web.Application) -> None:
     app["ws"].on_message = lambda data: asyncio.create_task(ws_on_message(app, data))
 
     # Вселенная
-    try:
-        symbols = await build_universe_once(app["rest"])
-        app["mkt"].symbols = symbols
-        logger.info(f"symbols: {symbols}")
-    except Exception as e:
-        await report_error(app, "on_startup:build_universe_once", e)
-        raise
+    symbols = await build_universe_once(app["rest"])
+    app["mkt"].symbols = symbols
+    logger.info(f"symbols: {symbols}")
 
     # Предзагрузка истории (только 5m)
-    try:
-        for s in app["mkt"].symbols:
-            with contextlib.suppress(Exception):
-                app["mkt"].state[s].k5 = await app["rest"].klines("linear", s, TF_SCALP, limit=200)
-                app["engine"].update_indicators_fast(s)
-        logger.info("[bootstrap] 5m klines loaded")
-    except Exception as e:
-        logger.exception("bootstrap history error")
-        await report_error(app, "on_startup:bootstrap_history", e)
+    for s in app["mkt"].symbols:
+        with contextlib.suppress(Exception):
+            app["mkt"].state[s].k5 = await app["rest"].klines("linear", s, TF_SCALP, limit=200)
+            app["engine"].update_indicators_fast(s)
+    logger.info("[bootstrap] 5m klines loaded")
 
     # WS
     await app["ws"].connect()
@@ -796,7 +802,7 @@ async def on_startup(app: web.Application) -> None:
     try:
         targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
         for chat_id in targets:
-            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.1: polling mode enabled, WS live, engine ready")
+            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.2: polling mode enabled, WS live, engine ready")
     except Exception as e:
         logger.warning("startup notify failed")
         await report_error(app, "on_startup:notify", e)
@@ -823,7 +829,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("🚀 Starting Cryptobot SCALP v10.1 — TF=5m, polling + WS + TG error reports")
+    logger.info("🚀 Starting Cryptobot SCALP v10.2 — TF=5m, polling + WS + TG error reports")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
