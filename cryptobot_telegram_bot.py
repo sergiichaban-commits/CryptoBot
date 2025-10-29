@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v10.2 — 5m RSI re-entry + Momentum + Levels (lighter filters)
-      Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
-      Telegram error reporting (REPORT_ERRORS_TO_TG=1)
+v10.3 — Fix: resilient Telegram long polling (retries/backoff),
+        GET getUpdates, robust aiohttp connector.
+        Strategy: 5m RSI re-entry + Momentum + EMA + Levels (as v10.2)
 """
 from __future__ import annotations
 
@@ -90,6 +90,8 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 # Error report
 REPORT_ERRORS_TO_TG = _bool_env("REPORT_ERRORS_TO_TG", False)
 ERROR_REPORT_COOLDOWN_SEC = int(os.getenv("ERROR_REPORT_COOLDOWN_SEC", "180"))
+
+TG_POLL_TIMEOUT = int(os.getenv("TG_POLL_TIMEOUT", "25"))  # seconds
 
 # =========================
 # УТИЛИТЫ
@@ -253,6 +255,7 @@ class Tg:
     def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
         self.base = f"https://api.telegram.org/bot{token}"
         self.http = http
+        self._backoff = 1.0  # seconds
 
     async def delete_webhook(self, drop_pending_updates: bool = True) -> Dict[str, Any]:
         payload = {"drop_pending_updates": drop_pending_updates}
@@ -262,17 +265,67 @@ class Tg:
 
     async def send(self, chat_id: int, text: str) -> None:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        async with self.http.post(f"{self.base}/sendMessage", json=payload) as r:
-            r.raise_for_status()
-            await r.json()
+        for attempt in range(4):
+            try:
+                async with self.http.post(f"{self.base}/sendMessage", json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    r.raise_for_status()
+                    await r.json()
+                self._backoff = 1.0
+                return
+            except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError, ConnectionResetError):
+                sleep = min(self._backoff, 10.0)
+                await asyncio.sleep(sleep)
+                self._backoff = min(self._backoff * 2, 20.0)
+            except aiohttp.ClientResponseError as e:
+                # 429/5xx — мягкий повтор
+                if e.status in (429, 500, 502, 503, 504):
+                    sleep = min(self._backoff, 10.0)
+                    await asyncio.sleep(sleep)
+                    self._backoff = min(self._backoff * 2, 20.0)
+                    continue
+                raise
 
-    async def updates(self, offset: Optional[int], timeout: int = 25) -> Dict[str, Any]:
-        payload = {"timeout": timeout, "allowed_updates": ["message", "channel_post", "my_chat_member"]}
+    async def updates(self, offset: Optional[int], timeout: int = TG_POLL_TIMEOUT) -> Dict[str, Any]:
+        """GET getUpdates с ретраями и авто-починкой webhook на 409."""
+        params = {
+            "timeout": timeout,
+            "allowed_updates": json.dumps(["message", "channel_post", "my_chat_member"]),
+        }
         if offset is not None:
-            payload["offset"] = offset
-        async with self.http.post(f"{self.base}/getUpdates", json=payload, timeout=aiohttp.ClientTimeout(total=timeout+10)) as r:
-            r.raise_for_status()
-            return await r.json()
+            params["offset"] = offset
+
+        for attempt in range(6):
+            try:
+                async with self.http.get(
+                    f"{self.base}/getUpdates",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout + 20)
+                ) as r:
+                    r.raise_for_status()
+                    data = await r.json()
+                self._backoff = 1.0
+                return data
+            except aiohttp.ClientResponseError as e:
+                if e.status == 409:
+                    # Конфликт (висит webhook) — удаляем и повторяем
+                    with contextlib.suppress(Exception):
+                        await self.delete_webhook(drop_pending_updates=True)
+                    await asyncio.sleep(1.0)
+                    continue
+                if e.status in (429, 500, 502, 503, 504):
+                    sleep = min(self._backoff, 10.0)
+                    await asyncio.sleep(sleep)
+                    self._backoff = min(self._backoff * 2, 20.0)
+                    continue
+                raise
+            except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError, ConnectionResetError):
+                sleep = min(self._backoff, 10.0)
+                await asyncio.sleep(sleep)
+                self._backoff = min(self._backoff * 2, 20.0)
+                continue
+
+        # На крайний случай — пустой ответ, чтобы цикл не падал
+        return {"ok": True, "result": []}
 
 class BybitRest:
     def __init__(self, base: str, http: aiohttp.ClientSession) -> None:
@@ -372,7 +425,6 @@ class ScalpingEngine:
     def update_indicators_fast(self, sym: str) -> None:
         st = self.mkt.state[sym]
         if len(st.k5) >= RSI_PERIOD + 1:
-            # сохраняем предыдущее RSI перед пересчетом — для ловли re-entry
             st.prev_rsi_5m = st.rsi_5m
             st.rsi_5m = relative_strength_index_fixed(st.k5)
         if len(st.k5) >= EMA_SLOW:
@@ -417,21 +469,20 @@ class ScalpingEngine:
         short_reentry = (prev_rsi > RSI_OVERBOUGHT) and (rsi <= RSI_OVERBOUGHT)
 
         long_checks = [
-            (rsi < RSI_OVERSOLD) or long_reentry,        # перепроданность или re-entry вверх
-            mom > -1.2,                                   # не обвал
-            (ema_fast > ema_slow) or (price > ema_fast),  # импульс вверх
+            (rsi < RSI_OVERSOLD) or long_reentry,
+            mom > -1.2,
+            (ema_fast > ema_slow) or (price > ema_fast),
             volume_ok,
-            price >= st.support                           # не ниже поддержки
+            price >= st.support
         ]
         short_checks = [
-            (rsi > RSI_OVERBOUGHT) or short_reentry,      # перекупленность или re-entry вниз
-            mom < 1.2,                                    # не ракета
-            (ema_fast < ema_slow) or (price < ema_fast),  # импульс вниз
+            (rsi > RSI_OVERBOUGHT) or short_reentry,
+            mom < 1.2,
+            (ema_fast < ema_slow) or (price < ema_fast),
             volume_ok,
-            price <= st.resistance                        # не выше сопротивления
+            price <= st.resistance
         ]
 
-        # Нужны >= MIN_CONFIRMATIONS, но не меньше 2–3 в сумме
         need = max(2, MIN_CONFIRMATIONS)
         side = None
         if sum(1 for c in long_checks if c) >= need:
@@ -441,32 +492,27 @@ class ScalpingEngine:
         if not side:
             return None
 
-        # SL/TP через ATR (быстро)
-        atr_val = st.atr if st.atr > 0 else price * 0.005  # запасной 0.5%
+        atr_val = st.atr if st.atr > 0 else price * 0.005
         if side == "LONG":
             sl = price - (atr_val * ATR_SL_MULT)
             tp = price + (atr_val * ATR_TP_MULT)
             tp_pct = (tp - price) / price
-            if tp_pct < TP_MIN_PCT:
-                tp = price * (1 + TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp = price * (1 + TP_MAX_PCT)
+            if tp_pct < TP_MIN_PCT: tp = price * (1 + TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT: tp = price * (1 + TP_MAX_PCT)
             rr = (tp - price) / max(1e-9, (price - sl))
         else:
             sl = price + (atr_val * ATR_SL_MULT)
             tp = price - (atr_val * ATR_TP_MULT)
             tp_pct = (price - tp) / price
-            if tp_pct < TP_MIN_PCT:
-                tp = price * (1 - TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT:
-                tp = price * (1 - TP_MAX_PCT)
+            if tp_pct < TP_MIN_PCT: tp = price * (1 - TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT: tp = price * (1 - TP_MAX_PCT)
             rr = (price - tp) / max(1e-9, (sl - price))
 
         if rr < RR_MIN:
             return None
 
         st.last_signal_ts = nowt
-        st.last_position_ts = nowt  # блокируем повторные открытия на короткое время
+        st.last_position_ts = nowt
         pos = Position(symbol=sym, side=side, entry_price=price, stop_loss=sl, take_profit=tp, entry_time=nowt)
         if not self.mkt.position_manager.open_position(pos):
             return None
@@ -490,33 +536,19 @@ class ScalpingEngine:
         strength = "сильный" if (rr >= 2.0 or (USE_VOLUME_FILTER and volume_ok)) else "слабый"
 
         return {
-            "symbol": sym,
-            "side": side,
-            "entry": price,
-            "tp1": tp,
-            "sl": sl,
-            "rr": rr,
-            "rsi": rsi,
-            "momentum": mom,
-            "support": st.support,
-            "resistance": st.resistance,
-            "timeframe": "5m SCALP",
-            "duration": "5-15min",
+            "symbol": sym, "side": side, "entry": price, "tp1": tp, "sl": sl, "rr": rr,
+            "rsi": rsi, "momentum": mom, "support": st.support, "resistance": st.resistance,
+            "timeframe": "5m SCALP", "duration": "5-15min",
             "confidence": min(90, 40 + (sum(long_checks if side == "LONG" else short_checks))*10),
-            "reasons": reasons,
-            "strength": strength,
+            "reasons": reasons, "strength": strength,
         }
 
 # =========================
 # ФОРМАТ СИГНАЛА
 # =========================
 def format_scalp_signal(sig: Dict[str, Any]) -> str:
-    symbol = sig["symbol"]
-    side = sig["side"]
-    entry = sig["entry"]
-    tp = sig["tp1"]
-    sl = sig["sl"]
-    rr = sig["rr"]
+    symbol = sig["symbol"]; side = sig["side"]
+    entry = sig["entry"]; tp = sig["tp1"]; sl = sig["sl"]; rr = sig["rr"]
     tp_pct = (tp - entry) / entry if side == "LONG" else (entry - tp) / entry
     sl_pct = (entry - sl) / entry if side == "LONG" else (sl - entry) / entry
     emoji = "🟢" if side == "LONG" else "🔴"
@@ -580,7 +612,6 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
             for p in payload:
                 if interval == TF_SCALP:
                     _upd(st.k5, p)
-                    # на закрытии 5m — расчет и возможный сигнал
                     if p.get("confirm") is True:
                         eng.update_indicators_fast(symbol)
                         sig = eng.generate_scalp_signal(symbol)
@@ -604,7 +635,7 @@ async def tg_loop(app: web.Application) -> None:
     offset: Optional[int] = None
     while True:
         try:
-            resp = await tg.updates(offset=offset, timeout=25)
+            resp = await tg.updates(offset=offset, timeout=TG_POLL_TIMEOUT)
             for upd in resp.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("channel_post")
@@ -758,9 +789,23 @@ async def on_startup(app: web.Application) -> None:
     setup_logging(LOG_LEVEL)
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Не задан TELEGRAM_TOKEN")
-    http = aiohttp.ClientSession()
+
+    connector = aiohttp.TCPConnector(
+        limit=100,
+        limit_per_host=10,
+        ttl_dns_cache=300,
+        keepalive_timeout=45,
+        enable_cleanup_closed=True,
+    )
+    http = aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=60),
+        trust_env=True,  # на всякий случай, если среда даёт системные прокси
+        headers={"Connection": "keep-alive"}
+    )
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
+
     # long polling: убираем webhook
     with contextlib.suppress(Exception):
         await app["tg"].delete_webhook(drop_pending_updates=True)
@@ -802,7 +847,7 @@ async def on_startup(app: web.Application) -> None:
     try:
         targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
         for chat_id in targets:
-            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.2: polling mode enabled, WS live, engine ready")
+            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.3: polling mode enabled, WS live, engine ready")
     except Exception as e:
         logger.warning("startup notify failed")
         await report_error(app, "on_startup:notify", e)
@@ -829,7 +874,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("🚀 Starting Cryptobot SCALP v10.2 — TF=5m, polling + WS + TG error reports")
+    logger.info("🚀 Starting Cryptobot SCALP v10.3 — TF=5m, polling + WS + resilient TG")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
