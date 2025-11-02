@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v10.3 — Fix: resilient Telegram long polling (retries/backoff),
-        GET getUpdates, robust aiohttp connector.
-        Strategy: 5m RSI re-entry + Momentum + EMA + Levels (as v10.2)
+v10.4 — Stabilized Telegram long-polling (webhook purge + backoff + ACK),
+        de-dup of signals, safe sender, no banner spam, WS watchdog.
+        Strategy: 5m RSI re-entry + Momentum + EMA + Levels.
+
+Author: Sergii Chaban & ChatGPT
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ import logging
 import os
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,7 +43,7 @@ def _bool_env(name: str, default: bool) -> bool:
 
 ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
-ONLY_CHANNEL = _bool_env("ONLY_CHANNEL", True)  # по умолчанию только в канал(ы)
+ONLY_CHANNEL = _bool_env("ONLY_CHANNEL", True)  # по умолчанию выводим только в канал(ы)
 
 # Вселенная
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "600"))
@@ -51,7 +53,7 @@ ACTIVE_SYMBOLS   = int(os.getenv("ACTIVE_SYMBOLS",    "40"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT"]
 
 # =========================
-# SCALPING КОНФИГ (только 5m)
+# SCALPING КОНФИГ (5m)
 # =========================
 TF_SCALP = "5"
 
@@ -60,12 +62,12 @@ RSI_PERIOD     = 14
 RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "30"))
 RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "70"))
 
-# Быстрые EMA для момента
+# EMA / Mom
 EMA_FAST = 5
 EMA_SLOW = 13
 
-# Объемный фильтр
-USE_VOLUME_FILTER = _bool_env("USE_VOLUME_FILTER", False)  # по умолчанию ВЫКЛ, чтобы оживить сигналы
+# Объёмный фильтр (по умолчанию выкл, чтобы увеличить число сигналов)
+USE_VOLUME_FILTER = _bool_env("USE_VOLUME_FILTER", False)
 VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.10"))
 
 # Risk management
@@ -78,7 +80,7 @@ RR_MIN      = float(os.getenv("RR_MIN",      "1.5"))
 # Подтверждения
 MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "2"))
 
-# Антиспам/мониторинг
+# Антиспам / мониторинг
 SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "60"))
 POSITION_COOLDOWN_SEC = int(os.getenv("POSITION_COOLDOWN_SEC", "120"))
 KEEPALIVE_SEC         = int(os.getenv("KEEPALIVE_SEC",         str(13*60)))
@@ -87,11 +89,16 @@ STALL_EXIT_SEC        = int(os.getenv("STALL_EXIT_SEC",        "300"))
 
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 
-# Error report
+# Error report в TG
 REPORT_ERRORS_TO_TG = _bool_env("REPORT_ERRORS_TO_TG", False)
 ERROR_REPORT_COOLDOWN_SEC = int(os.getenv("ERROR_REPORT_COOLDOWN_SEC", "180"))
 
-TG_POLL_TIMEOUT = int(os.getenv("TG_POLL_TIMEOUT", "25"))  # seconds
+# Telegram long polling
+TG_POLL_TIMEOUT = int(os.getenv("TG_POLL_TIMEOUT", "25"))
+ENABLE_TG_SENDER_QUEUE = _bool_env("ENABLE_TG_SENDER_QUEUE", False)
+
+# Дедуп сигналов
+DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "900"))  # 15 минут
 
 # =========================
 # УТИЛИТЫ
@@ -115,11 +122,11 @@ async def report_error(app: web.Application, where: str, exc: Optional[BaseExcep
     tg: Optional[Tg] = app.get("tg")
     if not tg:
         return
-    now = now_s()
+    nowt = now_s()
     last = app.setdefault("_last_error_ts", 0)
-    if now - last < ERROR_REPORT_COOLDOWN_SEC:
+    if nowt - last < ERROR_REPORT_COOLDOWN_SEC:
         return
-    app["_last_error_ts"] = now
+    app["_last_error_ts"] = nowt
 
     title = f"⚠️ <b>Runtime error</b> @ {html.escape(where)}"
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -167,7 +174,6 @@ def average_true_range(data: List[Tuple[float, float, float, float, float]], per
     return total / cnt if cnt else 0.0
 
 def relative_strength_index_fixed(data: List[Tuple[float, float, float, float, float]], period: int = RSI_PERIOD) -> float:
-    """RSI по последним period+1 свечам (простая версия)."""
     if len(data) < period + 1:
         return 50.0
     closes = [bar[3] for bar in data[-(period+1):]]
@@ -187,7 +193,6 @@ def relative_strength_index_fixed(data: List[Tuple[float, float, float, float, f
     return 100.0 - (100.0 / (1.0 + rs))
 
 def momentum_indicator(data: List[Tuple[float, float, float, float, float]], period: int = 5) -> float:
-    """Процентное изменение за N свечей (скорость)."""
     if len(data) < period + 1:
         return 0.0
     current_close = data[-1][3]
@@ -257,15 +262,15 @@ class Tg:
         self.http = http
         self._backoff = 1.0  # seconds
 
-    async def delete_webhook(self, drop_pending_updates: bool = True) -> Dict[str, Any]:
+    async def delete_webhook(self, drop_pending_updates: bool = True) -> None:
         payload = {"drop_pending_updates": drop_pending_updates}
-        async with self.http.post(f"{self.base}/deleteWebhook", json=payload) as r:
-            r.raise_for_status()
-            return await r.json()
+        async with self.http.post(f"{self.base}/deleteWebhook", json=payload, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            with contextlib.suppress(Exception):
+                await r.text()
 
     async def send(self, chat_id: int, text: str) -> None:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        for attempt in range(4):
+        for _ in range(4):
             try:
                 async with self.http.post(f"{self.base}/sendMessage", json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
                     r.raise_for_status()
@@ -273,28 +278,19 @@ class Tg:
                 self._backoff = 1.0
                 return
             except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError, ConnectionResetError):
-                sleep = min(self._backoff, 10.0)
-                await asyncio.sleep(sleep)
-                self._backoff = min(self._backoff * 2, 20.0)
+                sleep = min(self._backoff, 10.0); await asyncio.sleep(sleep); self._backoff = min(self._backoff * 2, 20.0)
             except aiohttp.ClientResponseError as e:
-                # 429/5xx — мягкий повтор
                 if e.status in (429, 500, 502, 503, 504):
-                    sleep = min(self._backoff, 10.0)
-                    await asyncio.sleep(sleep)
-                    self._backoff = min(self._backoff * 2, 20.0)
-                    continue
+                    sleep = min(self._backoff, 10.0); await asyncio.sleep(sleep); self._backoff = min(self._backoff * 2, 20.0); continue
                 raise
 
     async def updates(self, offset: Optional[int], timeout: int = TG_POLL_TIMEOUT) -> Dict[str, Any]:
         """GET getUpdates с ретраями и авто-починкой webhook на 409."""
-        params = {
-            "timeout": timeout,
-            "allowed_updates": json.dumps(["message", "channel_post", "my_chat_member"]),
-        }
+        params = {"timeout": timeout, "allowed_updates": json.dumps(["message", "channel_post", "my_chat_member"])}
         if offset is not None:
             params["offset"] = offset
 
-        for attempt in range(6):
+        for _ in range(6):
             try:
                 async with self.http.get(
                     f"{self.base}/getUpdates",
@@ -307,24 +303,16 @@ class Tg:
                 return data
             except aiohttp.ClientResponseError as e:
                 if e.status == 409:
-                    # Конфликт (висит webhook) — удаляем и повторяем
                     with contextlib.suppress(Exception):
                         await self.delete_webhook(drop_pending_updates=True)
                     await asyncio.sleep(1.0)
                     continue
                 if e.status in (429, 500, 502, 503, 504):
-                    sleep = min(self._backoff, 10.0)
-                    await asyncio.sleep(sleep)
-                    self._backoff = min(self._backoff * 2, 20.0)
-                    continue
+                    sleep = min(self._backoff, 10.0); await asyncio.sleep(sleep); self._backoff = min(self._backoff * 2, 20.0); continue
                 raise
             except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError, ConnectionResetError):
-                sleep = min(self._backoff, 10.0)
-                await asyncio.sleep(sleep)
-                self._backoff = min(self._backoff * 2, 20.0)
-                continue
+                sleep = min(self._backoff, 10.0); await asyncio.sleep(sleep); self._backoff = min(self._backoff * 2, 20.0); continue
 
-        # На крайний случай — пустой ответ, чтобы цикл не падал
         return {"ok": True, "result": []}
 
 class BybitRest:
@@ -334,13 +322,13 @@ class BybitRest:
 
     async def tickers_linear(self) -> List[Dict[str, Any]]:
         url = f"{self.base}/v5/market/tickers?category=linear"
-        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
             r.raise_for_status()
             return (await r.json()).get("result", {}).get("list", []) or []
 
     async def klines(self, category: str, symbol: str, interval: str, limit: int = 200) -> List[Tuple[float, float, float, float, float]]:
         url = f"{self.base}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={min(200, max(1, limit))}"
-        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
             r.raise_for_status()
             data = await r.json()
         arr = (data.get("result") or {}).get("list") or []
@@ -391,9 +379,7 @@ class PositionManager:
 # =========================
 @dataclass
 class SymbolState:
-    # данные только 5m
     k5:  List[Tuple[float, float, float, float, float]] = field(default_factory=list)
-    # индикаторы
     rsi_5m: float = 50.0
     prev_rsi_5m: float = 50.0
     ema_fast: float = 0.0
@@ -402,7 +388,6 @@ class SymbolState:
     support: float = 0.0
     resistance: float = 0.0
     atr: float = 0.0
-    # метки времени / кулдауны
     last_signal_ts: int = 0
     last_position_ts: int = 0
 
@@ -414,6 +399,25 @@ class Market:
         self.last_ws_msg_ts: int = now_ms()
         self.signal_stats: Dict[str, int] = {"total": 0, "long": 0, "short": 0}
         self.last_signal_sent_ts: int = 0
+        # дедуп кэш (key -> expiry_ts)
+        self._dedup: Dict[Tuple[str,str,str,int], int] = {}
+        self._dedup_order: deque = deque(maxlen=3000)
+
+    def dedup_should_emit(self, key: Tuple[str,str,str,int]) -> bool:
+        nowt = now_s()
+        # очистка протухших записей «лениво»
+        while self._dedup_order:
+            k = self._dedup_order[0]
+            if self._dedup.get(k, 0) <= nowt:
+                self._dedup_order.popleft()
+                self._dedup.pop(k, None)
+            else:
+                break
+        if key in self._dedup:
+            return False
+        self._dedup[key] = nowt + DEDUP_TTL_SEC
+        self._dedup_order.append(key)
+        return True
 
 # =========================
 # СКАЛЬП-ДВИЖОК
@@ -456,7 +460,7 @@ class ScalpingEngine:
         ema_fast = st.ema_fast
         ema_slow = st.ema_slow
 
-        # объемный фильтр (можно отключить через USE_VOLUME_FILTER=0)
+        # объёмный фильтр
         if len(st.k5) >= 6:
             avg_vol = sum(b[4] for b in st.k5[-6:-1]) / 5.0
             cur_vol = st.k5[-1][4]
@@ -464,7 +468,7 @@ class ScalpingEngine:
         else:
             volume_ok = True
 
-        # RSI re-entry из зон
+        # RSI re-entry
         long_reentry  = (prev_rsi < RSI_OVERSOLD)   and (rsi >= RSI_OVERSOLD)
         short_reentry = (prev_rsi > RSI_OVERBOUGHT) and (rsi <= RSI_OVERBOUGHT)
 
@@ -509,6 +513,12 @@ class ScalpingEngine:
             rr = (price - tp) / max(1e-9, (sl - price))
 
         if rr < RR_MIN:
+            return None
+
+        # дедуп: ключ = (symbol, side, '5m', последняя закрытая минута)
+        last_bar_close_ts = int(time.time() // (5*60)) * (5*60)
+        key = (sym, side, "5m", last_bar_close_ts)
+        if not self.mkt.dedup_should_emit(key):
             return None
 
         st.last_signal_ts = nowt
@@ -628,11 +638,19 @@ async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
         await report_error(app, "ws_on_message", e)
 
 # =========================
-# Telegram loop (long polling)
+# Telegram loop (long polling, устойчивый)
 # =========================
 async def tg_loop(app: web.Application) -> None:
     tg: Tg = app["tg"]; mkt: Market = app["mkt"]
+    # гарантированно выключаем webhook и чистим очередь
+    with contextlib.suppress(Exception):
+        await tg.delete_webhook(drop_pending_updates=True)
+    # ACK всего, что могло висеть (доп. страховка)
+    with contextlib.suppress(Exception):
+        await tg.updates(offset=2_147_483_647, timeout=1)
+
     offset: Optional[int] = None
+    backoff = 1
     while True:
         try:
             resp = await tg.updates(offset=offset, timeout=TG_POLL_TIMEOUT)
@@ -677,15 +695,17 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id, "Jobs:\n" + "\n".join(jobs))
                 else:
                     await tg.send(chat_id, "Неизвестная команда. /ping /status /diag /jobs")
+            backoff = 1
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.exception("tg_loop error")
             await report_error(app, "tg_loop", e)
-            await asyncio.sleep(2)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 # =========================
-# Universe (symbols) + подписки (только 5m)
+# Universe (symbols) + подписки (5m)
 # =========================
 async def build_universe_once(rest: BybitRest) -> List[str]:
     symbols: List[str] = []
@@ -765,7 +785,7 @@ async def watchdog_loop(app: web.Application) -> None:
             logger.info(f"[watchdog] alive; last WS msg {ago:.1f}s ago; symbols={len(mkt.symbols)}")
             if ago >= STALL_EXIT_SEC:
                 logger.error(f"[watchdog] WS stalled {ago:.1f}s >= {STALL_EXIT_SEC}. Exit for restart.")
-                os._exit(3)
+                os._exit(3)  # позволяем платформе рестартнуть контейнер
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -800,16 +820,18 @@ async def on_startup(app: web.Application) -> None:
     http = aiohttp.ClientSession(
         connector=connector,
         timeout=aiohttp.ClientTimeout(total=60),
-        trust_env=True,  # на всякий случай, если среда даёт системные прокси
+        trust_env=True,
         headers={"Connection": "keep-alive"}
     )
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
 
-    # long polling: убираем webhook
+    # long polling mode: убираем webhook + чистим pending updates
     with contextlib.suppress(Exception):
         await app["tg"].delete_webhook(drop_pending_updates=True)
         logger.info("Telegram webhook deleted (drop_pending_updates=True)")
+    with contextlib.suppress(Exception):
+        await app["tg"].updates(offset=2_147_483_647, timeout=1)
 
     app["rest"] = BybitRest(BYBIT_REST, http)
     app["mkt"] = Market()
@@ -822,7 +844,7 @@ async def on_startup(app: web.Application) -> None:
     app["mkt"].symbols = symbols
     logger.info(f"symbols: {symbols}")
 
-    # Предзагрузка истории (только 5m)
+    # Предзагрузка истории (5m)
     for s in app["mkt"].symbols:
         with contextlib.suppress(Exception):
             app["mkt"].state[s].k5 = await app["rest"].klines("linear", s, TF_SCALP, limit=200)
@@ -843,14 +865,16 @@ async def on_startup(app: web.Application) -> None:
     app["tg_task"] = asyncio.create_task(tg_loop(app))
     app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
 
-    # Уведомление
-    try:
-        targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
-        for chat_id in targets:
-            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.3: polling mode enabled, WS live, engine ready")
-    except Exception as e:
-        logger.warning("startup notify failed")
-        await report_error(app, "on_startup:notify", e)
+    # Уведомление при первом старте (без спама при реконнектах)
+    if not app.get("_banner_sent"):
+        app["_banner_sent"] = True
+        try:
+            targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
+            for chat_id in targets:
+                await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.4: polling mode enabled, WS live, engine ready")
+        except Exception as e:
+            logger.warning("startup notify failed")
+            await report_error(app, "on_startup:notify", e)
 
 async def on_cleanup(app: web.Application) -> None:
     for k in ("ws_task", "keepalive_task", "watchdog_task", "tg_task", "universe_task"):
@@ -874,7 +898,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("🚀 Starting Cryptobot SCALP v10.3 — TF=5m, polling + WS + resilient TG")
+    logger.info("🚀 Starting Cryptobot SCALP v10.4 — TF=5m, polling + WS + resilient TG")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
