@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Cryptobot — Professional Derivatives Signals (Bybit V5, USDT Perpetuals)
-v9.1 — Multi-timeframe confluence + VWAP + EMA + RSI + ATR
-       Long polling (deleteWebhook) + WS klines (5m/15m/1h) + Telegram loop
+Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
+v10.1.1 — Fast RSI + Momentum + Real-time levels (tuned)
+       Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
+       Telegram error reporting (REPORT_ERRORS_TO_TG=1)
+       WS reconnect fix + richer logging
 """
 from __future__ import annotations
+
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import os
 import time
+import traceback
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,7 +25,7 @@ import aiohttp
 from aiohttp import web
 
 # =========================
-# ПРОФЕССИОНАЛЬНЫЙ КОНФИГ
+# БАЗОВЫЙ КОНФИГ
 # =========================
 BYBIT_REST = "https://api.bybit.com"
 BYBIT_WS_PUBLIC_LINEAR = "wss://stream.bybit.com/v5/public/linear"
@@ -28,51 +33,63 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 PORT = int(os.getenv("PORT", "10000"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or ""
+
+def _bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
 ALLOWED_CHAT_IDS = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
 PRIMARY_RECIPIENTS = [i for i in ALLOWED_CHAT_IDS if i < 0] or ALLOWED_CHAT_IDS[:1] or []
-ONLY_CHANNEL = True  # отправлять только в канал(ы), если указаны, иначе всем ALLOWED_CHAT_IDS
+ONLY_CHANNEL = _bool_env("ONLY_CHANNEL", True)  # по умолчанию только в канал(ы)
 
 # Вселенная
 UNIVERSE_REFRESH_SEC = int(os.getenv("UNIVERSE_REFRESH_SEC", "600"))
-TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "2000000"))   # $2M
+TURNOVER_MIN_USD = float(os.getenv("TURNOVER_MIN_USD", "2000000"))
 VOLUME_MIN_USD   = float(os.getenv("VOLUME_MIN_USD",  "2000000"))
-ACTIVE_SYMBOLS   = int(os.getenv("ACTIVE_SYMBOLS",    "40"))
+ACTIVE_SYMBOLS   = int(os.getenv("ACTIVE_SYMBOLS",    "60"))
 CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT"]
 
-# Мультитаймфрейм анализ
-TF_ENTRY   = "5"      # Входной ТФ
-TF_TREND   = "15"     # Тренд
-TF_CONTEXT = "60"     # Контекст
+# =========================
+# SCALPING КОНФИГ (только 5m)
+# =========================
+TF_SCALP = "5"
 
-# Индикаторы
-RSI_PERIOD = 14
-EMA_FAST   = 9
-EMA_SLOW   = 21
-VWAP_PERIOD = 20
-ATR_PERIOD  = 14
-VOL_SMA     = int(os.getenv("VOL_SMA", "20"))
+# Более чувствительные параметры
+RSI_PERIOD     = 14
+RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "40"))  # было 38
+RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "60"))  # было 62
 
-# Пороги сигналов
-RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "32"))
-RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "68"))
+# Быстрые EMA для момента
+EMA_FAST = 5
+EMA_SLOW = 13
 
-VOLUME_SPIKE_MULT   = float(os.getenv("VOLUME_SPIKE_MULT", "1.8"))
-MIN_CONFIRMATIONS   = int(os.getenv("MIN_CONFIRMATIONS",   "2"))   # из 4+
+# Объемный фильтр
+VOLUME_SPIKE_MULT = float(os.getenv("VOLUME_SPIKE_MULT", "1.2"))  # было 1.3
 
-# Риск-менеджмент
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))
-ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.8"))
-TP_MIN_PCT  = float(os.getenv("TP_MIN_PCT",  "0.004"))   # 0.4%
-TP_MAX_PCT  = float(os.getenv("TP_MAX_PCT",  "0.012"))   # 1.2%
-RR_MIN      = float(os.getenv("RR_MIN",      "1.4"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+# Risk management для скальпинга
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "0.8"))
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.5"))
+TP_MIN_PCT  = float(os.getenv("TP_MIN_PCT",  "0.002"))  # 0.2%
+TP_MAX_PCT  = float(os.getenv("TP_MAX_PCT",  "0.008"))  # 0.8% (хард-верх)
+RR_MIN      = float(os.getenv("RR_MIN",      "1.8"))
+
+# Подтверждения
+MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "2"))  # по умолчанию 2
 
 # Антиспам/мониторинг
-SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "120"))
-POSITION_COOLDOWN_SEC = int(os.getenv("POSITION_COOLDOWN_SEC", "300"))
+SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "20"))
+POSITION_COOLDOWN_SEC = int(os.getenv("POSITION_COOLDOWN_SEC", "45"))
 KEEPALIVE_SEC         = int(os.getenv("KEEPALIVE_SEC",         str(13*60)))
 WATCHDOG_SEC          = int(os.getenv("WATCHDOG_SEC",          "60"))
 STALL_EXIT_SEC        = int(os.getenv("STALL_EXIT_SEC",        "300"))
+
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
+
+# Error report
+REPORT_ERRORS_TO_TG = _bool_env("REPORT_ERRORS_TO_TG", False)
+ERROR_REPORT_COOLDOWN_SEC = int(os.getenv("ERROR_REPORT_COOLDOWN_SEC", "180"))
 
 # =========================
 # УТИЛИТЫ
@@ -85,10 +102,44 @@ def setup_logging(level: str) -> None:
     fmt = "%(asctime)s %(levelname)s %(message)s"
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt, force=True)
 
-logger = logging.getLogger("cryptobot.pro")
+logger = logging.getLogger("cryptobot.scalp")
 
 # =========================
-# ПРОФЕССИОНАЛЬНЫЕ ИНДИКАТОРЫ
+# Telegram error reporting
+# =========================
+async def report_error(app: web.Application, where: str, exc: Optional[BaseException] = None, note: Optional[str] = None) -> None:
+    if not REPORT_ERRORS_TO_TG:
+        return
+    tg: Optional[Tg] = app.get("tg")
+    if not tg:
+        return
+    now = now_s()
+    last = app.setdefault("_last_error_ts", 0)
+    if now - last < ERROR_REPORT_COOLDOWN_SEC:
+        return
+    app["_last_error_ts"] = now
+
+    title = f"⚠️ <b>Runtime error</b> @ {html.escape(where)}"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    body = ""
+    if note:
+        body += f"\n<b>Note:</b> {html.escape(note)}"
+    if exc:
+        tb = traceback.format_exc()
+        tail = "\n".join(tb.strip().splitlines()[-25:])
+        body += "\n<pre>" + html.escape(tail[:3500]) + "</pre>"
+    elif note is None:
+        body += "\n(no traceback)"
+    text = f"{title}\n🕒 {ts} UTC{body}"
+
+    targets = (PRIMARY_RECIPIENTS if ONLY_CHANNEL and PRIMARY_RECIPIENTS
+               else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS))
+    for chat_id in targets:
+        with contextlib.suppress(Exception):
+            await tg.send(chat_id, text)
+
+# =========================
+# ИНДИКАТОРЫ
 # =========================
 def exponential_moving_average(values: List[float], period: int) -> float:
     if not values:
@@ -100,56 +151,6 @@ def exponential_moving_average(values: List[float], period: int) -> float:
     for price in values[period:]:
         ema_val = price * k + ema_val * (1 - k)
     return ema_val
-
-def volume_weighted_average_price(data: List[Tuple[float, float, float, float, float]], period: int) -> Tuple[float, float]:
-    if len(data) < period:
-        return 0.0, 0.0
-    window = data[-period:]
-    num = 0.0
-    den = 0.0
-    for _, h, l, c, v in window:
-        tp = (h + l + c) / 3.0
-        num += tp * v
-        den += v
-    if den == 0:
-        return 0.0, 0.0
-    cur_vwap = num / den
-
-    if len(data) >= 2 * period:
-        prev = data[-2*period:-period]
-        num2 = 0.0
-        den2 = 0.0
-        for _, h, l, c, v in prev:
-            tp = (h + l + c) / 3.0
-            num2 += tp * v
-            den2 += v
-        if den2 > 0:
-            prev_vwap = num2 / den2
-            slope = (cur_vwap - prev_vwap) / prev_vwap if prev_vwap != 0 else 0.0
-        else:
-            slope = 0.0
-    else:
-        slope = 0.0
-    return cur_vwap, slope
-
-def relative_strength_index(data: List[Tuple[float, float, float, float, float]], period: int = RSI_PERIOD) -> float:
-    if len(data) < period + 1:
-        return 50.0
-    closes = [bar[3] for bar in data[-(period+1):]]
-    gains = 0.0
-    losses = 0.0
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        if ch > 0:
-            gains += ch
-        else:
-            losses += -ch
-    avg_gain = gains / period
-    avg_loss = losses / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
 
 def average_true_range(data: List[Tuple[float, float, float, float, float]], period: int) -> float:
     if len(data) < period + 1:
@@ -163,16 +164,43 @@ def average_true_range(data: List[Tuple[float, float, float, float, float]], per
         cnt += 1
     return total / cnt if cnt else 0.0
 
-def detect_divergence(price_extremes: List[float], rsi_extremes: List[float]) -> str:
-    if len(price_extremes) < 2 or len(rsi_extremes) < 2:
-        return "NONE"
-    # Bullish: price LL, RSI HL
-    if price_extremes[-1] < price_extremes[-2] and rsi_extremes[-1] > rsi_extremes[-2]:
-        return "BULLISH"
-    # Bearish: price HH, RSI LH
-    if price_extremes[-1] > price_extremes[-2] and rsi_extremes[-1] < rsi_extremes[-2]:
-        return "BEARISH"
-    return "NONE"
+def relative_strength_index_fixed(data: List[Tuple[float, float, float, float, float]], period: int = RSI_PERIOD) -> float:
+    """RSI по последним period+1 свечам (простая, быстрая версия)."""
+    if len(data) < period + 1:
+        return 50.0
+    closes = [bar[3] for bar in data[-(period+1):]]
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i-1]
+        if ch > 0:
+            gains.append(ch); losses.append(0.0)
+        else:
+            gains.append(0.0); losses.append(-ch)
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def momentum_indicator(data: List[Tuple[float, float, float, float, float]], period: int = 5) -> float:
+    """Процентное изменение за N свечей (скорость)."""
+    if len(data) < period + 1:
+        return 0.0
+    current_close = data[-1][3]
+    past_close = data[-(period+1)][3]
+    return (current_close - past_close) / past_close * 100.0
+
+def detect_key_levels(data: List[Tuple[float, float, float, float, float]], lookback: int = 20) -> Tuple[float, float]:
+    """Примитивные уровни: min/max за lookback."""
+    if len(data) < lookback:
+        c = data[-1][3] if data else 0.0
+        return c, c
+    recent = data[-lookback:]
+    highs = [b[1] for b in recent]
+    lows  = [b[2] for b in recent]
+    return min(lows), max(highs)
 
 # =========================
 # КЛИЕНТЫ
@@ -183,45 +211,71 @@ class BybitWS:
         self.http = http
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self.on_message = None
+        self._running: bool = False
+        self._reconnect_delay: float = 1.0
 
     async def connect(self) -> None:
+        """Establish new WS connection."""
+        # Закрываем старый сокет, если он ещё жив
+        with contextlib.suppress(Exception):
+            if self.ws and not self.ws.closed:
+                await self.ws.close()
         self.ws = await self.http.ws_connect(self.url, heartbeat=30)
+        logger.info("BybitWS connected")
 
     async def subscribe(self, topics: List[str]) -> None:
-        if not self.ws:
+        if not self.ws or self.ws.closed:
             await self.connect()
         await self.ws.send_json({"op": "subscribe", "args": topics})
 
     async def unsubscribe(self, topics: List[str]) -> None:
-        if not self.ws:
+        if not self.ws or self.ws.closed:
             return
         await self.ws.send_json({"op": "unsubscribe", "args": topics})
 
     async def run(self) -> None:
-        if not self.ws:
-            await self.connect()
-        try:
-            async for msg in self.ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    if self.on_message:
-                        res = self.on_message(data)
-                        if asyncio.iscoroutine(res):
-                            asyncio.create_task(res)
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("WS connection error, reconnecting...")
-        finally:
+        """Main WS loop with controlled reconnects (no recursive create_task)."""
+        self._running = True
+        self._reconnect_delay = 1.0
+        while self._running:
+            try:
+                if not self.ws or self.ws.closed:
+                    await self.connect()
+
+                async for msg in self.ws:
+                    if not self._running:
+                        break
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if self.on_message:
+                            res = self.on_message(data)
+                            if asyncio.iscoroutine(res):
+                                asyncio.create_task(res)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        logger.warning(f"WS closed or error: {msg.type}, reconnecting...")
+                        break
+
+                # дошли до конца цикла async for → будет reconnect
+            except asyncio.CancelledError:
+                logger.info("BybitWS.run cancelled")
+                break
+            except Exception:
+                logger.exception("WS connection error, reconnecting...")
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 1.5, 30.0)
+            finally:
+                with contextlib.suppress(Exception):
+                    if self.ws and not self.ws.closed:
+                        await self.ws.close()
+
+        logger.info("BybitWS.run stopped")
+
+    async def stop(self) -> None:
+        """Gracefully stop WS loop and close socket."""
+        self._running = False
+        if self.ws and not self.ws.closed:
             with contextlib.suppress(Exception):
-                if self.ws and not self.ws.closed:
-                    await self.ws.close()
-            # reconnection loop
-            await asyncio.sleep(2.0)
-            await self.connect()
-            asyncio.create_task(self.run())
+                await self.ws.close()
 
 class Tg:
     def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
@@ -255,13 +309,6 @@ class BybitRest:
 
     async def tickers_linear(self) -> List[Dict[str, Any]]:
         url = f"{self.base}/v5/market/tickers?category=linear"
-        async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            r.raise_for_status()
-            return (await r.json()).get("result", {}).get("list", []) or []
-
-    async def instruments_info(self, category: str, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        q = f"category={category}" + (f"&symbol={symbol}" if symbol else "")
-        url = f"{self.base}/v5/market/instruments-info?{q}"
         async with self.http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             r.raise_for_status()
             return (await r.json()).get("result", {}).get("list", []) or []
@@ -319,27 +366,19 @@ class PositionManager:
 # =========================
 @dataclass
 class SymbolState:
-    # Мультитаймфрейм данные
+    # данные только 5m
     k5:  List[Tuple[float, float, float, float, float]] = field(default_factory=list)
-    k15: List[Tuple[float, float, float, float, float]] = field(default_factory=list)
-    k60: List[Tuple[float, float, float, float, float]] = field(default_factory=list)
-    # Индикаторы
+    # индикаторы
     rsi_5m: float = 50.0
-    rsi_15m: float = 50.0
     ema_fast: float = 0.0
     ema_slow: float = 0.0
-    vwap: float = 0.0
-    vwap_slope: float = 0.0
+    momentum: float = 0.0
+    support: float = 0.0
+    resistance: float = 0.0
     atr: float = 0.0
-    # Метки времени
+    # метки времени / кулдауны
     last_signal_ts: int = 0
     last_position_ts: int = 0
-    cooldown_ts: Dict[str, int] = field(default_factory=dict)
-    # Экстремумы для дивергенций
-    price_highs: deque = field(default_factory=lambda: deque(maxlen=5))
-    price_lows:  deque = field(default_factory=lambda: deque(maxlen=5))
-    rsi_highs:   deque = field(default_factory=lambda: deque(maxlen=5))
-    rsi_lows:    deque = field(default_factory=lambda: deque(maxlen=5))
 
 class Market:
     def __init__(self):
@@ -351,172 +390,145 @@ class Market:
         self.last_signal_sent_ts: int = 0
 
 # =========================
-# ПРОФЕССИОНАЛЬНАЯ ЛОГИКА СИГНАЛОВ
+# СКАЛЬП-ДВИЖОК
 # =========================
-class ProfessionalEngine:
+class ScalpingEngine:
     def __init__(self, mkt: Market):
         self.mkt = mkt
 
-    def update_indicators(self, sym: str) -> None:
+    def update_indicators_fast(self, sym: str) -> None:
         st = self.mkt.state[sym]
-        # RSI
         if len(st.k5) >= RSI_PERIOD + 1:
-            st.rsi_5m = relative_strength_index(st.k5)
-        if len(st.k15) >= RSI_PERIOD + 1:
-            st.rsi_15m = relative_strength_index(st.k15)
-        # EMA
+            st.rsi_5m = relative_strength_index_fixed(st.k5)
         if len(st.k5) >= EMA_SLOW:
-            closes = [b[3] for b in st.k5]
+            closes = [bar[3] for bar in st.k5]
             st.ema_fast = exponential_moving_average(closes, EMA_FAST)
             st.ema_slow = exponential_moving_average(closes, EMA_SLOW)
-        # VWAP
-        if len(st.k5) >= VWAP_PERIOD:
-            st.vwap, st.vwap_slope = volume_weighted_average_price(st.k5, VWAP_PERIOD)
-        # ATR
-        if len(st.k5) >= ATR_PERIOD + 1:
-            st.atr = average_true_range(st.k5, ATR_PERIOD)
-        # Локальные экстремумы (для простой дивергенции)
-        if len(st.k5) >= 3:
-            # локальный хай
-            if st.k5[-2][1] > st.k5[-3][1] and st.k5[-2][1] > st.k5[-1][1]:
-                st.price_highs.append(st.k5[-2][1])
-                st.rsi_highs.append(st.rsi_5m)
-            # локальный лой
-            if st.k5[-2][2] < st.k5[-3][2] and st.k5[-2][2] < st.k5[-1][2]:
-                st.price_lows.append(st.k5[-2][2])
-                st.rsi_lows.append(st.rsi_5m)
+        st.momentum = momentum_indicator(st.k5)
+        st.support, st.resistance = detect_key_levels(st.k5)
+        if len(st.k5) >= 11:
+            st.atr = average_true_range(st.k5, 10)
 
-    def calculate_trend(self, sym: str) -> Tuple[str, float]:
+    def generate_scalp_signal(self, sym: str) -> Optional[Dict[str, Any]]:
         st = self.mkt.state[sym]
-        if not st.k5:
-            return "NEUTRAL", 0.0
-        price = st.k5[-1][3]
-        score = 0
-        total = 0
-        # EMA alignment
-        if st.ema_fast and st.ema_slow:
-            score += 1 if st.ema_fast > st.ema_slow else -1
-            total += 1
-        # Price vs VWAP
-        if st.vwap:
-            if price > st.vwap and st.vwap_slope >= 0: score += 1
-            if price < st.vwap and st.vwap_slope <= 0: score -= 1
-            total += 1
-        # RSI(15m) tilt
-        if st.rsi_15m:
-            if st.rsi_15m > 55: score += 1
-            elif st.rsi_15m < 45: score -= 1
-            total += 1
-        # High-highs check
-        if len(st.k5) >= 20:
-            recent_high = max(b[1] for b in st.k5[-10:])
-            prev_high   = max(b[1] for b in st.k5[-20:-10])
-            score += 1 if recent_high > prev_high else -1
-            total += 1
-        strength = (score / total) if total else 0.0
-        if strength > 0.2:
-            return "BULLISH", strength
-        if strength < -0.2:
-            return "BEARISH", abs(strength)
-        return "NEUTRAL", abs(strength)
-
-    def generate_signal(self, sym: str) -> Optional[Dict[str, Any]]:
-        st = self.mkt.state[sym]
-        if (len(st.k5) < max(RSI_PERIOD+5, EMA_SLOW+5, VWAP_PERIOD+5) or
-            len(st.k15) < RSI_PERIOD+1 or len(st.k60) < 1):
+        if len(st.k5) < max(RSI_PERIOD + 5, EMA_SLOW + 5):
             return None
 
-        tnow = now_s()
-        if tnow - st.last_position_ts < POSITION_COOLDOWN_SEC:
+        nowt = now_s()
+        # cooldown по позициям
+        if nowt - st.last_position_ts < POSITION_COOLDOWN_SEC:
+            logger.debug(
+                f"[{sym}] skip: position cooldown {nowt - st.last_position_ts}s < {POSITION_COOLDOWN_SEC}s"
+            )
             return None
-
+        # cooldown по сигналам
+        if nowt - st.last_signal_ts < SIGNAL_COOLDOWN_SEC:
+            logger.debug(
+                f"[{sym}] skip: signal cooldown {nowt - st.last_signal_ts}s < {SIGNAL_COOLDOWN_SEC}s"
+            )
+            return None
+        # лимит позиций
         if not self.mkt.position_manager.can_open_position(sym):
+            logger.debug(f"[{sym}] skip: cannot open position (max positions or already open)")
             return None
 
         price = st.k5[-1][3]
-        trend, tstrength = self.calculate_trend(sym)
+        rsi = st.rsi_5m
+        mom = st.momentum
+        ema_fast = st.ema_fast
+        ema_slow = st.ema_slow
 
-        # Volume spike (к последней свече)
-        avg_vol = sum(b[4] for b in st.k5[-VOL_SMA-1:-1]) / max(1, min(VOL_SMA, len(st.k5)-1))
-        vol_spike = st.k5[-1][4] >= VOLUME_SPIKE_MULT * avg_vol if avg_vol > 0 else False
+        # объемный фильтр
+        if len(st.k5) >= 6:
+            avg_vol = sum(b[4] for b in st.k5[-6:-1]) / 5.0
+            cur_vol = st.k5[-1][4]
+            volume_ok = cur_vol > avg_vol * VOLUME_SPIKE_MULT if avg_vol > 0 else True
+        else:
+            volume_ok = True
 
-        # Дивергенции
-        bull_div = detect_divergence(list(st.price_lows), list(st.rsi_lows)) == "BULLISH"
-        bear_div = detect_divergence(list(st.price_highs), list(st.rsi_highs)) == "BEARISH"
+        long_checks = [
+            rsi < RSI_OVERSOLD and rsi > 25,              # не «перепродан» слишком глубоко
+            mom > -1.0,                                   # не обвал
+            (ema_fast > ema_slow) or (price > ema_fast),  # импульс вверх
+            volume_ok,
+            price > st.support                            # выше поддержки
+        ]
+        short_checks = [
+            rsi > RSI_OVERBOUGHT and rsi < 75,            # не «перекуплен» слишком высоко
+            mom < 1.0,                                    # не ракета
+            (ema_fast < ema_slow) or (price < ema_fast),  # импульс вниз
+            volume_ok,
+            price < st.resistance                         # ниже сопротивления
+        ]
 
-        # LONG conditions
-        base_long = st.rsi_5m <= RSI_OVERSOLD and trend in ("BULLISH", "NEUTRAL")
-        conf_long = sum([
-            1 if st.ema_fast > st.ema_slow else 0,
-            1 if (price > st.vwap or st.vwap_slope > 0) else 0,
-            1 if vol_spike else 0,
-            1 if bull_div else 0,
-        ])
-
-        # SHORT conditions
-        base_short = st.rsi_5m >= RSI_OVERBOUGHT and trend in ("BEARISH", "NEUTRAL")
-        conf_short = sum([
-            1 if st.ema_fast < st.ema_slow else 0,
-            1 if (price < st.vwap or st.vwap_slope < 0) else 0,
-            1 if vol_spike else 0,
-            1 if bear_div else 0,
-        ])
-
-        side = None
-        reasons: List[str] = []
-        if base_long and conf_long >= MIN_CONFIRMATIONS:
+        side: Optional[str] = None
+        min_checks = max(2, MIN_CONFIRMATIONS)  # минимум 2 подтверждения
+        if sum(long_checks) >= min_checks:
             side = "LONG"
-            reasons = [
-                f"RSI({RSI_PERIOD})={st.rsi_5m:.1f} ≤ {RSI_OVERSOLD}",
-                f"Тренд: {trend} (сила {tstrength:.2f})",
-                "VWAP восходящий/цена выше VWAP" if (price > st.vwap or st.vwap_slope > 0) else "—",
-                "Объёмный всплеск" if vol_spike else "—",
-                "Бычья дивергенция" if bull_div else "—",
-            ]
-        elif base_short and conf_short >= MIN_CONFIRMATIONS:
+        elif sum(short_checks) >= min_checks:
             side = "SHORT"
-            reasons = [
-                f"RSI({RSI_PERIOD})={st.rsi_5m:.1f} ≥ {RSI_OVERBOUGHT}",
-                f"Тренд: {trend} (сила {tstrength:.2f})",
-                "VWAP нисходящий/цена ниже VWAP" if (price < st.vwap or st.vwap_slope < 0) else "—",
-                "Объёмный всплеск" if vol_spike else "—",
-                "Медвежья дивергенция" if bear_div else "—",
-            ]
-
         if not side:
             return None
 
-        # SL/TP
-        atr_val = st.atr if st.atr > 0 else price * 0.01
+        # SL/TP через ATR (быстро)
+        atr_val = st.atr if st.atr > 0 else price * 0.005  # 0.5% запасной
         if side == "LONG":
-            sl = max(1e-9, price - ATR_SL_MULT * atr_val)
-            tp = price + ATR_TP_MULT * atr_val
+            sl = price - (atr_val * ATR_SL_MULT)
+            tp = price + (atr_val * ATR_TP_MULT)
             tp_pct = (tp - price) / price
-            if tp_pct < TP_MIN_PCT: tp = price * (1 + TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT: tp = price * (1 + TP_MAX_PCT)
+            if tp_pct < TP_MIN_PCT:
+                tp = price * (1 + TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT:
+                tp = price * (1 + TP_MAX_PCT)
             rr = (tp - price) / max(1e-9, (price - sl))
         else:
-            sl = price + ATR_SL_MULT * atr_val
-            tp = price - ATR_TP_MULT * atr_val
+            sl = price + (atr_val * ATR_SL_MULT)
+            tp = price - (atr_val * ATR_TP_MULT)
             tp_pct = (price - tp) / price
-            if tp_pct < TP_MIN_PCT: tp = price * (1 - TP_MIN_PCT)
-            if tp_pct > TP_MAX_PCT: tp = price * (1 - TP_MAX_PCT)
+            if tp_pct < TP_MIN_PCT:
+                tp = price * (1 - TP_MIN_PCT)
+            if tp_pct > TP_MAX_PCT:
+                tp = price * (1 - TP_MAX_PCT)
             rr = (price - tp) / max(1e-9, (sl - price))
 
         if rr < RR_MIN:
+            logger.debug(f"[{sym}] skip: RR {rr:.2f} < RR_MIN {RR_MIN:.2f}")
             return None
 
-        # Кулдаун на направление
-        if tnow - self.mkt.state[sym].cooldown_ts.get(side, 0) < SIGNAL_COOLDOWN_SEC:
-            return None
-        self.mkt.state[sym].cooldown_ts[side] = tnow
+        logger.info(f"[{sym}] {side} signal generated at {price:.6f}, RSI={rsi:.1f}, momentum={mom:.2f}%")
 
-        pos = Position(symbol=sym, side=side, entry_price=price, stop_loss=sl, take_profit=tp, entry_time=tnow)
+        st.last_signal_ts = nowt
+        st.last_position_ts = nowt  # блокируем повторные открытия на короткое время
+        pos = Position(symbol=sym, side=side, entry_price=price, stop_loss=sl, take_profit=tp, entry_time=nowt)
         if not self.mkt.position_manager.open_position(pos):
+            logger.debug(f"[{sym}] skip: position manager rejected open_position")
             return None
-        st.last_position_ts = tnow
         self.mkt.signal_stats["total"] += 1
         self.mkt.signal_stats["long" if side == "LONG" else "short"] += 1
+
+        reasons: List[str] = []
+        if side == "LONG":
+            if long_checks[0]:
+                reasons.append(f"RSI<OS ({RSI_OVERSOLD}) → {rsi:.1f}")
+            if long_checks[1]:
+                reasons.append(f"Momentum {mom:.2f}%")
+            if long_checks[2]:
+                reasons.append("EMA импульс ↑")
+            if long_checks[3]:
+                reasons.append("Объём подтверждает")
+            if long_checks[4]:
+                reasons.append("Выше поддержки")
+        else:
+            if short_checks[0]:
+                reasons.append(f"RSI>OB ({RSI_OVERBOUGHT}) → {rsi:.1f}")
+            if short_checks[1]:
+                reasons.append(f"Momentum {mom:.2f}%")
+            if short_checks[2]:
+                reasons.append("EMA импульс ↓")
+            if short_checks[3]:
+                reasons.append("Объём подтверждает")
+            if short_checks[4]:
+                reasons.append("Ниже сопротивления")
 
         return {
             "symbol": sym,
@@ -525,21 +537,19 @@ class ProfessionalEngine:
             "tp1": tp,
             "sl": sl,
             "rr": rr,
-            "atr": atr_val,
-            "rsi_5m": st.rsi_5m,
-            "rsi_15m": st.rsi_15m,
-            "trend": trend,
-            "trend_strength": tstrength,
-            "vwap": st.vwap,
-            "reason": [r for r in reasons if r != "—"],
-            "position_size": "1-2% от депозита",
-            "confidence": min(90, 50 + 10 * (conf_long if side == "LONG" else conf_short)),
+            "rsi": rsi,
+            "momentum": mom,
+            "support": st.support,
+            "resistance": st.resistance,
+            "timeframe": "5m SCALP",
+            "duration": "5-15min",
+            "confidence": min(90, 40 + (sum(long_checks if side == "LONG" else short_checks)) * 10),
         }
 
 # =========================
-# ФОРМАТИРОВАНИЕ СИГНАЛА
+# ФОРМАТ СИГНАЛА
 # =========================
-def format_pro_signal(sig: Dict[str, Any]) -> str:
+def format_scalp_signal(sig: Dict[str, Any]) -> str:
     symbol = sig["symbol"]
     side = sig["side"]
     entry = sig["entry"]
@@ -550,19 +560,18 @@ def format_pro_signal(sig: Dict[str, Any]) -> str:
     sl_pct = (entry - sl) / entry if side == "LONG" else (sl - entry) / entry
     emoji = "🟢" if side == "LONG" else "🔴"
     lines = [
-        f"{emoji} <b>PRO SIGNAL | {side} | {symbol}</b>",
-        "⏰ ТФ: 5m (вход), 15m (тренд), 1h (контекст)",
-        f"📍 <b>Текущая/Вход:</b> {entry:.6f}",
+        f"{emoji} <b>SCALP SIGNAL | {side} | {symbol}</b>",
+        "⏰ ТФ: 5m (скальп)",
+        f"📍 <b>Цена/Вход:</b> {entry:.6f}",
         f"🛡️ <b>Стоп-Лосс:</b> {sl:.6f} ({pct(abs(sl_pct))})",
         f"🎯 <b>Тейк-Профит:</b> {tp:.6f} ({pct(abs(tp_pct))})",
         f"⚖️ <b>Risk/Reward:</b> {rr:.2f}",
         "",
         "📊 <b>Метрики:</b>",
-        f"• RSI(5m): {sig['rsi_5m']:.1f} | RSI(15m): {sig['rsi_15m']:.1f}",
-        f"• Тренд: {sig['trend']} (сила: {sig['trend_strength']:.2f})",
-        f"• VWAP: {sig['vwap']:.6f}",
-        f"• ATR: {sig['atr']:.6f}",
-        f"• Уверенность: {sig.get('confidence',70)}%",
+        f"• RSI(14): {sig['rsi']:.1f}",
+        f"• Momentum(5): {sig['momentum']:.2f}%",
+        f"• Support/Resistance: {sig['support']:.6f} / {sig['resistance']:.6f}",
+        f"• Уверенность: {sig.get('confidence', 60)}%",
         "",
         "📈 <b>Обоснование:</b>",
     ]
@@ -570,70 +579,106 @@ def format_pro_signal(sig: Dict[str, Any]) -> str:
         lines.append(f"• {r}")
     lines += [
         "",
-        f"💰 <b>Размер позиции:</b> {sig['position_size']}",
-        "⚠️ Это не финансовый совет. Риск ≤ 1% депозита, плечо ≤ x5.",
+        "⚠️ Не финсовет. Риск ≤ 1% депозита.",
         f"⏱️ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         f"#{'LONG' if side=='LONG' else 'SHORT'}_{symbol}"
     ]
     return "\n".join(lines)
 
 # =========================
-# WS message handler (5m/15m/60m)
+# WS message handler (5m)
 # =========================
 async def ws_on_message(app: web.Application, data: Dict[str, Any]) -> None:
-    mkt: Market = app["mkt"]; eng: ProfessionalEngine = app["engine"]; tg: Tg = app["tg"]
-    topic = data.get("topic") or ""
-    mkt.last_ws_msg_ts = now_ms()
-    payload = data.get("data") or []
-    if not payload:
-        return
+    start_time = time.time()
+    try:
+        mkt: Market = app["mkt"]
+        eng: ScalpingEngine = app["engine"]
+        tg: Tg = app["tg"]
 
-    def _upd(buf: List[Tuple[float,float,float,float,float]], p: Dict[str, Any]) -> None:
-        o = float(p["open"]); h = float(p["high"]); l = float(p["low"]); c = float(p["close"]); v = float(p.get("volume") or 0.0)
-        if p.get("confirm") is False and buf:
-            buf[-1] = (o, h, l, c, v)
+        topic = data.get("topic") or ""
+        mkt.last_ws_msg_ts = now_ms()
+        payload = data.get("data") or []
+        if not payload:
+            return
+
+        def _upd(buf: List[Tuple[float, float, float, float, float]], p: Dict[str, Any]) -> None:
+            o = float(p["open"]); h = float(p["high"]); l = float(p["low"]); c = float(p["close"]); v = float(p.get("volume") or 0.0)
+            if p.get("confirm") is False and buf:
+                buf[-1] = (o, h, l, c, v)
+            else:
+                buf.append((o, h, l, c, v))
+                if len(buf) > 1000:
+                    del buf[:len(buf) - 1000]
+
+        if topic.startswith("kline."):
+            parts = topic.split(".")
+            if len(parts) >= 3:
+                interval = parts[1]
+                symbol = parts[2]
+            else:
+                symbol = payload[0].get("symbol") or ""
+                interval = payload[0].get("interval") or TF_SCALP
+
+            st = mkt.state[symbol]
+            for p in payload:
+                if interval == TF_SCALP:
+                    _upd(st.k5, p)
+                    # на закрытии 5m — расчёт и возможный сигнал
+                    if p.get("confirm") is True:
+                        logger.debug(
+                            f"[{symbol}] 5m closed: o={p.get('open')} h={p.get('high')} "
+                            f"l={p.get('low')} c={p.get('close')} v={p.get('volume')}"
+                        )
+                        asyncio.create_task(process_confirmed_candle(app, symbol))
+    except Exception as e:
+        logger.exception("ws_on_message error")
+        await report_error(app, "ws_on_message", e)
+    finally:
+        processing_time = time.time() - start_time
+        if processing_time > 0.1:
+            logger.warning(
+                f"Slow WS message processing: {processing_time:.3f}s for topic={data.get('topic')}"
+            )
+
+
+async def process_confirmed_candle(app: web.Application, symbol: str) -> None:
+    """Асинхронная обработка закрытой 5m-свечи: индикаторы + генерация и отправка сигнала."""
+    try:
+        mkt: Market = app["mkt"]
+        eng: ScalpingEngine = app["engine"]
+        tg: Tg = app["tg"]
+
+        eng.update_indicators_fast(symbol)
+        sig = eng.generate_scalp_signal(symbol)
+        if not sig:
+            return
+
+        logger.info(f"🚨 SIGNAL GENERATED: {sig['symbol']} {sig['side']} at {sig['entry']}")
+
+        text = format_scalp_signal(sig)
+        # только в канал, если ONLY_CHANNEL=1 и есть PRIMARY_RECIPIENTS
+        if ONLY_CHANNEL and PRIMARY_RECIPIENTS:
+            targets = PRIMARY_RECIPIENTS
         else:
-            buf.append((o, h, l, c, v))
-            if len(buf) > 1000:
-                del buf[:len(buf)-1000]
+            targets = (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS)
 
-    if topic.startswith("kline."):
-        # topic: kline.<interval>.<symbol>
-        parts = topic.split(".")
-        if len(parts) >= 3:
-            interval = parts[1]
-            symbol = parts[2]
-        else:
-            symbol = payload[0].get("symbol") or ""
-            interval = payload[0].get("interval") or TF_ENTRY
+        send_tasks: List[asyncio.Task] = []
+        for chat_id in targets:
+            send_tasks.append(asyncio.create_task(tg.send(chat_id, text)))
 
-        st = mkt.state[symbol]
-        for p in payload:
-            if interval == TF_ENTRY:
-                _upd(st.k5, p)
-                if p.get("confirm") is True:
-                    # 5m close -> обновить индикаторы и, возможно, сгенерировать сигнал
-                    eng.update_indicators(symbol)
-                    sig = eng.generate_signal(symbol)
-                    if sig:
-                        text = format_pro_signal(sig)
-                        targets = (PRIMARY_RECIPIENTS if ONLY_CHANNEL and PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS or PRIMARY_RECIPIENTS))
-                        for chat_id in targets:
-                            with contextlib.suppress(Exception):
-                                await tg.send(chat_id, text)
-                        mkt.last_signal_sent_ts = now_ms()
-                        st.last_signal_ts = now_ms()
-            elif interval == TF_TREND:
-                _upd(st.k15, p)
-            elif interval == TF_CONTEXT:
-                _upd(st.k60, p)
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
+            mkt.last_signal_sent_ts = now_ms()
+    except Exception as e:
+        logger.error(f"Error processing confirmed candle for {symbol}: {e}")
+        await report_error(app, f"process_confirmed_candle({symbol})", e)
 
 # =========================
 # Telegram loop (long polling)
 # =========================
 async def tg_loop(app: web.Application) -> None:
     tg: Tg = app["tg"]; mkt: Market = app["mkt"]
-    offset = None
+    offset: Optional[int] = None
     while True:
         try:
             resp = await tg.updates(offset=offset, timeout=25)
@@ -656,7 +701,7 @@ async def tg_loop(app: web.Application) -> None:
                     silent_line = "—" if mkt.last_signal_sent_ts == 0 else f"{(now_ms()-mkt.last_signal_sent_ts)/60000.0:.1f}m"
                     stats = mkt.signal_stats
                     await tg.send(chat_id,
-                        "✅ Online (PRO)\n"
+                        "✅ Online (SCALP)\n"
                         f"Symbols: {len(mkt.symbols)}\n"
                         f"Signals: total={stats.get('total',0)}, long={stats.get('long',0)}, short={stats.get('short',0)}\n"
                         f"TP range: {pct(TP_MIN_PCT)}–{pct(TP_MAX_PCT)} • RR≥{RR_MIN:.2f}\n"
@@ -680,12 +725,13 @@ async def tg_loop(app: web.Application) -> None:
                     await tg.send(chat_id, "Неизвестная команда. /ping /status /diag /jobs")
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
             logger.exception("tg_loop error")
+            await report_error(app, "tg_loop", e)
             await asyncio.sleep(2)
 
 # =========================
-# Universe (symbols) + подписки
+# Universe (symbols) + подписки (только 5m)
 # =========================
 async def build_universe_once(rest: BybitRest) -> List[str]:
     symbols: List[str] = []
@@ -721,24 +767,21 @@ async def universe_refresh_loop(app: web.Application) -> None:
             oldset = set(mkt.symbols)
             add = [s for s in symbols_new if s not in oldset]
             rem = [s for s in mkt.symbols if s not in set(symbols_new)]
+            if rem:
+                args = [f"kline.{TF_SCALP}.{s}" for s in rem]
+                await ws.unsubscribe(args)
+            if add:
+                args = [f"kline.{TF_SCALP}.{s}" for s in add]
+                await ws.subscribe(args)
+                logger.info(f"[WS] Subscribed to {len(args)} topics for {len(add)} symbols")
             if add or rem:
-                if rem:
-                    args = []
-                    for s in rem:
-                        args += [f"kline.{TF_ENTRY}.{s}", f"kline.{TF_TREND}.{s}", f"kline.{TF_CONTEXT}.{s}"]
-                    await ws.unsubscribe(args)
-                if add:
-                    args = []
-                    for s in add:
-                        args += [f"kline.{TF_ENTRY}.{s}", f"kline.{TF_TREND}.{s}", f"kline.{TF_CONTEXT}.{s}"]
-                    await ws.subscribe(args)
-                    logger.info(f"[WS] Subscribed to {len(args)} topics for {len(add)} symbols")
                 mkt.symbols = symbols_new
                 logger.info(f"[universe] +{len(add)} / -{len(rem)} • total={len(mkt.symbols)}")
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
             logger.exception("universe_refresh_loop error")
+            await report_error(app, "universe_refresh_loop", e)
 
 # =========================
 # Фоновые задачи
@@ -755,8 +798,9 @@ async def keepalive_loop(app: web.Application) -> None:
                 await http.get(public_url, timeout=aiohttp.ClientTimeout(total=10))
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
             logger.exception("keepalive error")
+            await report_error(app, "keepalive_loop", e)
 
 async def watchdog_loop(app: web.Application) -> None:
     mkt: Market = app["mkt"]
@@ -770,8 +814,9 @@ async def watchdog_loop(app: web.Application) -> None:
                 os._exit(3)
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as e:
             logger.exception("watchdog error")
+            await report_error(app, "watchdog_loop", e)
 
 # =========================
 # Web app
@@ -793,41 +838,43 @@ async def on_startup(app: web.Application) -> None:
     http = aiohttp.ClientSession()
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
-    # critical for long polling
+    # long polling: убираем webhook
     with contextlib.suppress(Exception):
         await app["tg"].delete_webhook(drop_pending_updates=True)
         logger.info("Telegram webhook deleted (drop_pending_updates=True)")
 
     app["rest"] = BybitRest(BYBIT_REST, http)
     app["mkt"] = Market()
-    app["engine"] = ProfessionalEngine(app["mkt"])
+    app["engine"] = ScalpingEngine(app["mkt"])
     app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: asyncio.create_task(ws_on_message(app, data))
 
-    # Вселенная и начальная подписка
-    symbols = await build_universe_once(app["rest"])
-    app["mkt"].symbols = symbols
-    logger.info(f"symbols: {symbols}")
-
-    # Предзагрузка истории (для корректных индикаторов)
+    # Вселенная
     try:
-        for s in symbols:
-            with contextlib.suppress(Exception):
-                app["mkt"].state[s].k5  = await app["rest"].klines("linear", s, TF_ENTRY,   limit=200)
-                app["mkt"].state[s].k15 = await app["rest"].klines("linear", s, TF_TREND,   limit=200)
-                app["mkt"].state[s].k60 = await app["rest"].klines("linear", s, TF_CONTEXT, limit=200)
-                app["engine"].update_indicators(s)
-        logger.info("[bootstrap] historical klines loaded")
-    except Exception:
-        logger.exception("bootstrap history error")
+        symbols = await build_universe_once(app["rest"])
+        app["mkt"].symbols = symbols
+        logger.info(f"symbols: {symbols}")
+    except Exception as e:
+        await report_error(app, "on_startup:build_universe_once", e)
+        raise
 
+    # Предзагрузка истории (только 5m)
+    try:
+        for s in app["mkt"].symbols:
+            with contextlib.suppress(Exception):
+                app["mkt"].state[s].k5 = await app["rest"].klines("linear", s, TF_SCALP, limit=200)
+                app["engine"].update_indicators_fast(s)
+        logger.info("[bootstrap] 5m klines loaded")
+    except Exception as e:
+        logger.exception("bootstrap history error")
+        await report_error(app, "on_startup:bootstrap_history", e)
+
+    # WS
     await app["ws"].connect()
-    args = []
-    for s in symbols:
-        args += [f"kline.{TF_ENTRY}.{s}", f"kline.{TF_TREND}.{s}", f"kline.{TF_CONTEXT}.{s}"]
+    args = [f"kline.{TF_SCALP}.{s}" for s in app["mkt"].symbols]
     if args:
         await app["ws"].subscribe(args)
-        logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(symbols)} symbols")
+        logger.info(f"[WS] Initial subscribed to {len(args)} topics for {len(app['mkt'].symbols)} symbols")
 
     # Фоновые задачи
     app["ws_task"] = asyncio.create_task(app["ws"].run())
@@ -840,9 +887,10 @@ async def on_startup(app: web.Application) -> None:
     try:
         targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
         for chat_id in targets:
-            await app["tg"].send(chat_id, "🟢 Cryptobot PRO v9.1: polling mode enabled, WS live, MTF engine ready")
-    except Exception:
+            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.1.1: polling mode enabled, WS live, engine ready")
+    except Exception as e:
         logger.warning("startup notify failed")
+        await report_error(app, "on_startup:notify", e)
 
 async def on_cleanup(app: web.Application) -> None:
     for k in ("ws_task", "keepalive_task", "watchdog_task", "tg_task", "universe_task"):
@@ -851,8 +899,9 @@ async def on_cleanup(app: web.Application) -> None:
             t.cancel()
             with contextlib.suppress(Exception):
                 await t
-    if app.get("ws") and app["ws"].ws and not app["ws"].ws.closed:
-        await app["ws"].ws.close()
+    if app.get("ws"):
+        with contextlib.suppress(Exception):
+            await app["ws"].stop()
     if app.get("http"):
         await app["http"].close()
 
@@ -866,7 +915,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("🚀 Starting Professional Cryptobot v9.1 — TF=5m/15m/60m, polling + WS")
+    logger.info("🚀 Starting Cryptobot SCALP v10.1.1 — TF=5m, polling + WS + TG error reports")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
