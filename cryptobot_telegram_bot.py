@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v10.1.1 — Fast RSI + Momentum + Real-time levels (tuned)
+v10.1.2 — Fast RSI + Momentum + Real-time levels (tuned)
        Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
        Telegram error reporting (REPORT_ERRORS_TO_TG=1)
        WS reconnect fix + richer logging
@@ -726,6 +726,12 @@ async def tg_loop(app: web.Application) -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
+            # Частый сетевой шум: Telegram рвёт соединение (Errno 104)
+            if isinstance(e, aiohttp.ClientOSError) and getattr(e, "errno", None) == 104:
+                logger.warning("tg_loop: connection reset by peer (Telegram). Will retry.")
+                await asyncio.sleep(2)
+                continue
+
             logger.exception("tg_loop error")
             await report_error(app, "tg_loop", e)
             await asyncio.sleep(2)
