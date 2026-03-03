@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v10.1.2 — Fast RSI + Momentum + Real-time levels (tuned)
+v11 — Fast RSI + Momentum + Real-time levels (tuned)
        Long polling (deleteWebhook) + WS klines (5m) + Telegram loop
        Telegram error reporting (REPORT_ERRORS_TO_TG=1)
        WS reconnect fix + richer logging
@@ -278,29 +278,66 @@ class BybitWS:
                 await self.ws.close()
 
 class Tg:
-    def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
-        self.base = f"https://api.telegram.org/bot{token}"
-        self.http = http
+    """Упрощенный и надежный клиент для Telegram Bot API"""
+    def __init__(self, token: str):
+        self.token = token
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.session: aiohttp.ClientSession | None = None
 
-    async def delete_webhook(self, drop_pending_updates: bool = True) -> Dict[str, Any]:
-        payload = {"drop_pending_updates": drop_pending_updates}
-        async with self.http.post(f"{self.base}/deleteWebhook", json=payload) as r:
-            r.raise_for_status()
-            return await r.json()
+    async def init(self):
+        if not self.session:
+            # Настройка таймаутов: 10 сек на установку связи, 45 сек на общий запрос
+            timeout = aiohttp.ClientTimeout(total=45, connect=10)
+            self.session = aiohttp.ClientSession(timeout=timeout)
 
-    async def send(self, chat_id: int, text: str) -> None:
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        async with self.http.post(f"{self.base}/sendMessage", json=payload) as r:
-            r.raise_for_status()
-            await r.json()
+    async def delete_webhook(self, drop_pending_updates: bool = False):
+        """Удаляет вебхук и, если нужно, очищает очередь старых сообщений"""
+        url = f"{self.base_url}/deleteWebhook"
+        try:
+            async with self.session.post(url, json={"drop_pending_updates": drop_pending_updates}) as resp:
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Tg.delete_webhook error: {e}")
+            return None
 
-    async def updates(self, offset: Optional[int], timeout: int = 25) -> Dict[str, Any]:
-        payload = {"timeout": timeout, "allowed_updates": ["message", "channel_post", "my_chat_member"]}
-        if offset is not None:
-            payload["offset"] = offset
-        async with self.http.post(f"{self.base}/getUpdates", json=payload, timeout=aiohttp.ClientTimeout(total=timeout+10)) as r:
-            r.raise_for_status()
-            return await r.json()
+    async def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> List[Dict]:
+        """Получение сообщений методом Long Polling"""
+        url = f"{self.base_url}/getUpdates"
+        data = {"timeout": timeout}
+        if offset:
+            data["offset"] = offset
+        
+        try:
+            async with self.session.post(url, json=data, timeout=timeout + 5) as resp:
+                # Если Телеграм вернул ошибку сети (502, 504), просто ждем и идем дальше
+                if resp.status in (502, 503, 504):
+                    logger.warning(f"Telegram API Gateway Error: {resp.status}. Retrying...")
+                    await asyncio.sleep(2)
+                    return []
+                
+                res = await resp.json()
+                return res.get("result", []) if res.get("ok") else []
+        except asyncio.TimeoutError:
+            return []
+        except Exception as e:
+            logger.error(f"Tg.get_updates error: {e}")
+            await asyncio.sleep(3)
+            return []
+
+    async def send(self, chat_id: Any, text: str, parse_mode: str = "HTML") -> bool:
+        """Отправка сообщения"""
+        url = f"{self.base_url}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        try:
+            async with self.session.post(url, json=payload) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.error(f"Tg.send error: {e}")
+            return False
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
 
 class BybitRest:
     def __init__(self, base: str, http: aiohttp.ClientSession) -> None:
@@ -808,21 +845,26 @@ async def keepalive_loop(app: web.Application) -> None:
             logger.exception("keepalive error")
             await report_error(app, "keepalive_loop", e)
 
-async def watchdog_loop(app: web.Application) -> None:
-    mkt: Market = app["mkt"]
+async def watchdog_loop(app: web.Application):
+    """Следит за активностью WebSocket и предотвращает 'зависание' бота"""
+    logger.info("[watchdog] task started")
     while True:
-        try:
-            await asyncio.sleep(WATCHDOG_SEC)
-            ago = (now_ms() - mkt.last_ws_msg_ts) / 1000.0
-            logger.info(f"[watchdog] alive; last WS msg {ago:.1f}s ago; symbols={len(mkt.symbols)}")
-            if ago >= STALL_EXIT_SEC:
-                logger.error(f"[watchdog] WS stalled {ago:.1f}s >= {STALL_EXIT_SEC}. Exit for restart.")
-                os._exit(3)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.exception("watchdog error")
-            await report_error(app, "watchdog_loop", e)
+        await asyncio.sleep(30)
+        now = time.time()
+        
+        # Берем время последнего сообщения от биржи
+        last_ws = app.get("_last_ws_msg_ts", now)
+        diff = now - last_ws
+        
+        # Если сообщений нет более 10 минут (600 сек) — перезапускаем. 
+        # 3 минуты было слишком мало и вызывало ложные перезапуски.
+        if diff > 600:
+            logger.error(f"[watchdog] NO WS ACTIVITY FOR {diff:.1f}s! Triggering restart...")
+            os._exit(1)
+        
+        # Раз в 2 минуты пишем в лог, что всё ок
+        if int(now) % 120 < 31:
+            logger.info(f"[watchdog] system healthy; last market data {diff:.1f}s ago")
 
 # =========================
 # Web app
@@ -846,7 +888,10 @@ async def on_startup(app: web.Application) -> None:
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
     # long polling: убираем webhook
     with contextlib.suppress(Exception):
-        await app["tg"].delete_webhook(drop_pending_updates=True)
+        # drop_pending_updates=True заставляет Telegram забыть все старые сигналы, 
+    	# которые накопились, пока бот был выключен.
+    	logger.info("Initializing Telegram: dropping old updates to prevent signal wave...")
+    	await app["tg"].delete_webhook(drop_pending_updates=True)
         logger.info("Telegram webhook deleted (drop_pending_updates=True)")
 
     app["rest"] = BybitRest(BYBIT_REST, http)
@@ -893,7 +938,7 @@ async def on_startup(app: web.Application) -> None:
     try:
         targets = PRIMARY_RECIPIENTS or ALLOWED_CHAT_IDS
         for chat_id in targets:
-            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v10.1.1: polling mode enabled, WS live, engine ready")
+            await app["tg"].send(chat_id, "🟢 Cryptobot SCALP v11 : polling mode enabled, WS live, engine ready")
     except Exception as e:
         logger.warning("startup notify failed")
         await report_error(app, "on_startup:notify", e)
@@ -921,7 +966,7 @@ def make_app() -> web.Application:
 
 def main() -> None:
     setup_logging(LOG_LEVEL)
-    logger.info("🚀 Starting Cryptobot SCALP v10.1.1 — TF=5m, polling + WS + TG error reports")
+    logger.info("🚀 Starting Cryptobot SCALP v11  — TF=5m, polling + WS + TG error reports")
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
