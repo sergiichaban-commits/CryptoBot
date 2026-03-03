@@ -879,26 +879,22 @@ async def handle_health(request: web.Request) -> web.Response:
         "signals": request.app["mkt"].signal_stats,
     })
 
-async def on_startup(app: web.Application) -> None:
-    setup_logging(LOG_LEVEL)
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_TOKEN")
-    http = aiohttp.ClientSession()
-    app["http"] = http
-    app["tg"] = Tg(TELEGRAM_TOKEN, http)
-    # long polling: убираем webhook
-    with contextlib.suppress(Exception):
-        # drop_pending_updates=True заставляет Telegram забыть все старые сигналы, 
-    	# которые накопились, пока бот был выключен.
-    	logger.info("Initializing Telegram: dropping old updates to prevent signal wave...")
-    	await app["tg"].delete_webhook(drop_pending_updates=True)
-        logger.info("Telegram webhook deleted (drop_pending_updates=True)")
+async def on_startup(app: web.Application):
+    # Код инициализации (Redis, Bybit и прочее)
+    # Убедитесь, что ВСЕ строки ниже имеют одинаковый тип отступов
+    app["tg"] = Tg(TELEGRAM_TOKEN)
+    await app["tg"].init()
 
-    app["rest"] = BybitRest(BYBIT_REST, http)
-    app["mkt"] = Market()
-    app["engine"] = ScalpingEngine(app["mkt"])
-    app["ws"] = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
-    app["ws"].on_message = lambda data: asyncio.create_task(ws_on_message(app, data))
+    # Вот та самая строка, на которой была ошибка
+    logger.info("Telegram webhook deleted (drop_pending_updates=True)")
+    await app["tg"].delete_webhook(drop_pending_updates=True)
+
+    # Запуск циклов (tasks)
+    app["ws_task"] = asyncio.create_task(ws_loop(app))
+    app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
+    app["tg_task"] = asyncio.create_task(tg_loop(app))
+    
+    logger.info("Bot started successfully")
 
     # Вселенная
     try:
