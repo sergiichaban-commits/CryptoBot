@@ -398,7 +398,7 @@ async def on_startup(app: web.Application):
     app["http"] = http
     app["tg"] = Tg(TELEGRAM_TOKEN, http)
     
-    # Очистка очереди сообщений
+    # Очистка очереди (чтобы бот не спамил старыми сигналами после простоя)
     await app["tg"].delete_webhook(drop_pending_updates=True)
     logger.info("🚀 Starting Cryptobot SCALP v11 (Queue cleared)")
 
@@ -418,6 +418,22 @@ async def on_startup(app: web.Application):
     app["watchdog_task"] = asyncio.create_task(watchdog_loop(app))
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["universe_task"] = asyncio.create_task(universe_refresh_loop(app))
+
+    # --- БЛОК УВЕДОМЛЕНИЯ О СТАРТЕ ---
+    try:
+        # Отправляем только в основные чаты (PRIMARY_RECIPIENTS)
+        targets = PRIMARY_RECIPIENTS if PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS[:1] if ALLOWED_CHAT_IDS else [])
+        for chat_id in targets:
+            msg = (
+                "🟢 <b>Cryptobot SCALP v11 Online</b>\n"
+                f"• Режим: Polling (Long updates)\n"
+                f"• Таймфрейм: {TF_SCALP}m\n"
+                f"• Символов: {len(app['mkt'].symbols)}\n"
+                "• WebSockets: Connected"
+            )
+            await app["tg"].send(chat_id, msg)
+    except Exception as e:
+        logger.warning(f"Startup notify failed: {e}")
 
 async def on_cleanup(app: web.Application):
     for k in ("ws_task", "tg_task", "watchdog_task", "keepalive_task", "universe_task"):
