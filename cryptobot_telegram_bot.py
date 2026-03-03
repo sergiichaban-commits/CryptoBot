@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v12 — Fixes over v11:
-  1. Pre-load historical klines on startup (no more 2.5h silence after restart)
-  2. Fixed signal conditions (removed RSI/EMA contradiction)
-  3. Realistic momentum thresholds
-  4. TP_MIN_PCT / TP_MAX_PCT now actually applied
-  5. Batched WS subscribe (max 10 topics per message — Bybit limit)
-  6. Parallel kline preload with semaphore (fast startup)
-  7. Improved /status command
-  8. Signal log to console
+v13 — все фиксы v12 +
+  - MIN_CONFIRMATIONS по умолчанию = 3/4 (было 2/4)
 """
 from __future__ import annotations
 
@@ -63,7 +56,6 @@ CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
 # =========================
 TF_SCALP       = "5"
 RSI_PERIOD     = 14
-# FIX v12: расширены зоны (было 40/60 — слишком близко к нейтральным 50)
 RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD",   "35"))
 RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "65"))
 EMA_FAST       = 5
@@ -75,11 +67,11 @@ ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "0.8"))
 ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.5"))
 TP_MIN_PCT  = float(os.getenv("TP_MIN_PCT",  "0.002"))
 TP_MAX_PCT  = float(os.getenv("TP_MAX_PCT",  "0.012"))
-# FIX v12: снижен RR_MIN (1.8 было слишком строго для 5m ATR)
-RR_MIN            = float(os.getenv("RR_MIN",      "1.5"))
-MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "2"))
+RR_MIN      = float(os.getenv("RR_MIN",      "1.5"))
 
-# FIX v12: SIGNAL_COOLDOWN увеличен — 20 сек было слишком мало
+# v13: минимум 3 совпадения из 4
+MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "3"))
+
 SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "300"))
 POSITION_COOLDOWN_SEC = int(os.getenv("POSITION_COOLDOWN_SEC", "45"))
 KEEPALIVE_SEC         = int(os.getenv("KEEPALIVE_SEC",          str(13 * 60)))
@@ -87,7 +79,6 @@ WATCHDOG_SEC          = int(os.getenv("WATCHDOG_SEC",           "60"))
 STALL_EXIT_SEC        = int(os.getenv("STALL_EXIT_SEC",         "600"))
 MAX_POSITIONS         = int(os.getenv("MAX_POSITIONS",          "5"))
 
-# FIX v12: предзагрузка истории
 PRELOAD_BARS    = int(os.getenv("PRELOAD_BARS",    "100"))
 PRELOAD_WORKERS = int(os.getenv("PRELOAD_WORKERS", "10"))
 
@@ -219,7 +210,6 @@ class BybitWS:
         logger.info("BybitWS connected")
 
     async def subscribe(self, topics: List[str]) -> None:
-        """FIX v12: Bybit принимает максимум 10 топиков за раз."""
         if not self.ws or self.ws.closed:
             await self.connect()
         for i in range(0, len(topics), 10):
@@ -376,16 +366,6 @@ class ScalpingEngine:
         avg_vol   = sum(b[4] for b in st.k5[-6:-1]) / 5.0 if len(st.k5) >= 6 else 0.0
         volume_ok = (st.k5[-1][4] > avg_vol * VOLUME_SPIKE_MULT) if avg_vol > 0 else True
 
-        # ── FIX v12: исправленная логика сигнала ──────────────────────────
-        # v11 имел противоречие: RSI<40 (цена падает) + price>EMA_fast (бычий)
-        # При RSI<35 цена почти всегда НИЖЕ EMA5 — условия взаимоисключали друг друга.
-        #
-        # Новая логика — разворот от уровней:
-        #   LONG:  перепродан + импульс разворачивается вверх
-        #          + (EMA бычий ИЛИ цена у поддержки)
-        #   SHORT: перекуплен + импульс разворачивается вниз
-        #          + (EMA медвежий ИЛИ цена у сопротивления)
-        # ──────────────────────────────────────────────────────────────────
         near_support     = (st.support > 0)    and (price <= st.support    * 1.005)
         near_resistance  = (st.resistance > 0) and (price >= st.resistance * 0.995)
         ema_bullish      = st.ema_fast >= st.ema_slow
@@ -406,6 +386,7 @@ class ScalpingEngine:
             volume_ok,
         ]
 
+        # v13: MIN_CONFIRMATIONS = 3 по умолчанию
         if   sum(long_checks)  >= MIN_CONFIRMATIONS:
             side = "LONG"
         elif sum(short_checks) >= MIN_CONFIRMATIONS:
@@ -417,7 +398,6 @@ class ScalpingEngine:
         sl = price - atr_v * ATR_SL_MULT if side == "LONG" else price + atr_v * ATR_SL_MULT
         tp = price + atr_v * ATR_TP_MULT if side == "LONG" else price - atr_v * ATR_TP_MULT
 
-        # FIX v12: применяем TP_MIN_PCT / TP_MAX_PCT (в v11 были объявлены но не использовались)
         raw_tp_pct = abs(tp - price) / price
         if raw_tp_pct < TP_MIN_PCT:
             tp = (price + price * TP_MIN_PCT) if side == "LONG" else (price - price * TP_MIN_PCT)
@@ -447,14 +427,12 @@ class ScalpingEngine:
 
 
 # =========================
-# FIX v12: ПРЕДЗАГРУЗКА ИСТОРИИ
+# ПРЕДЗАГРУЗКА ИСТОРИИ
 # =========================
 async def preload_symbol(
     rest: BybitRest, mkt: Market, engine: ScalpingEngine,
     sym: str, sem: asyncio.Semaphore,
 ) -> None:
-    """Загружаем исторические klines через REST.
-    Без этого бот молчит ~2.5 часа после каждого рестарта."""
     async with sem:
         try:
             bars = await rest.klines("linear", sym, TF_SCALP, limit=PRELOAD_BARS)
@@ -523,7 +501,8 @@ async def send_signal(app: web.Application, sig: Dict) -> None:
     app["mkt"].last_signal_sent_ts = now_ms()
     logger.info(
         f"Signal: {sig['side']} {sig['symbol']} "
-        f"entry={sig['entry']:.5f} tp={sig['tp']:.5f} sl={sig['sl']:.5f} rr={sig['rr']:.2f}"
+        f"entry={sig['entry']:.5f} tp={sig['tp']:.5f} sl={sig['sl']:.5f} "
+        f"rr={sig['rr']:.2f} checks={sig['checks']}"
     )
 
 
@@ -551,8 +530,9 @@ async def tg_loop(app: web.Application) -> None:
                         if mkt.last_signal_sent_ts else "ещё не было"
                     )
                     await tg.send(cid, (
-                        f"✅ <b>Cryptobot SCALP v12</b>\n"
+                        f"✅ <b>Cryptobot SCALP v13</b>\n"
                         f"Символов: {ready}/{len(mkt.symbols)} готовы\n"
+                        f"Фильтр: {MIN_CONFIRMATIONS}/4 подтверждений\n"
                         f"Сигналов: {stats['total']} (L:{stats['long']} / S:{stats['short']})\n"
                         f"Последний: {last_ago}\n"
                         f"WS: {int((now_ms() - mkt.last_ws_msg_ts) / 1000)}s назад"
@@ -617,7 +597,7 @@ async def on_startup(app: web.Application) -> None:
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
 
     await app["tg"].delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 Starting Cryptobot SCALP v12")
+    logger.info("🚀 Starting Cryptobot SCALP v13")
 
     app["rest"]   = BybitRest(BYBIT_REST, http)
     app["mkt"]    = Market()
@@ -625,31 +605,26 @@ async def on_startup(app: web.Application) -> None:
     app["ws"]     = BybitWS(BYBIT_WS_PUBLIC_LINEAR, http)
     app["ws"].on_message = lambda data: ws_on_message(app, data)
 
-    # 1. Строим список символов
     app["mkt"].symbols = await build_universe_once(app["rest"])
-
-    # 2. FIX v12: предзагружаем историю — без этого сигналов нет 2.5ч после рестарта
     ready = await preload_all(app["rest"], app["mkt"], app["engine"])
 
-    # 3. WebSocket
     await app["ws"].connect()
     await app["ws"].subscribe([f"kline.{TF_SCALP}.{s}" for s in app["mkt"].symbols])
 
-    # 4. Фоновые задачи
     app["ws_task"]        = asyncio.create_task(app["ws"].run())
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
     app["watchdog_task"]  = asyncio.create_task(watchdog_loop(app))
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["universe_task"]  = asyncio.create_task(universe_refresh_loop(app))
 
-    # 5. Уведомление о старте
     try:
         targets = PRIMARY_RECIPIENTS if PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS[:1] if ALLOWED_CHAT_IDS else [])
         for chat_id in targets:
             await app["tg"].send(chat_id, (
-                "🟢 <b>Cryptobot SCALP v12 Online</b>\n"
+                "🟢 <b>Cryptobot SCALP v13 Online</b>\n"
                 f"• Таймфрейм: {TF_SCALP}m\n"
-                f"• Символов: {len(app['mkt'].symbols)} ({ready} готовы к сигналам)\n"
+                f"• Символов: {len(app['mkt'].symbols)} ({ready} готовы)\n"
+                f"• Фильтр: {MIN_CONFIRMATIONS}/4 подтверждений\n"
                 f"• RSI зоны: &lt;{RSI_OVERSOLD} long / &gt;{RSI_OVERBOUGHT} short\n"
                 f"• RR мин: {RR_MIN}  |  Cooldown: {SIGNAL_COOLDOWN_SEC}s\n"
                 "• История: предзагружена ✅\n"
