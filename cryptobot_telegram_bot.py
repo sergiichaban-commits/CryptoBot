@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Cryptobot — SCALPING Signals (Bybit V5, USDT Perpetuals)
-v14 — Полностью новая архитектура (5 шагов):
+v15 — Адаптивный BB Squeeze (перцентильный порог вместо абсолютного):
 
   Шаг 1. Фильтр пула (каждые 15 мин):
            Топ-50 по объёму + ATR(15m) > 1.5% цены
@@ -11,16 +11,25 @@ v14 — Полностью новая архитектура (5 шагов):
                         только SHORT если цена < VWAP
 
   Шаг 3. Триггер (5m):
-           BB Squeeze (сужение полос) → Пробой закрытой свечи
+           BB Squeeze (адаптивный) → Пробой закрытой свечи
            за верхнюю BB (LONG) или нижнюю BB (SHORT)
 
   Шаг 4. Жёсткая фильтрация:
-           Объём пробойной свечи > SMA(20, vol) × 2.0
+           Объём пробойной свечи > SMA(20, vol) × VOL_SPIKE_MULT
            MACD-гистограмма совпадает с направлением и растёт
 
   Шаг 5. Сигнал в Telegram:
            SL — за нижнюю/верхнюю BB или локальный min/max
-           TP — минимум 1% от точки входа
+           TP — минимум TP_MIN_PCT от точки входа
+
+  Изменения v14 → v15:
+    - BB_SQUEEZE_THRESHOLD (абсолютный порог) УДАЛЁН.
+      Вместо него — BB_SQUEEZE_PERCENTILE + BB_SQUEEZE_LOOKBACK.
+      Squeeze теперь определяется не как "bandwidth < 3%", а как
+      "bandwidth в нижних N% от последних LOOKBACK баров того же
+      символа". Это делает фильтр адаптивным к рыночным условиям:
+      в тренде baseline шире — порог автоматически выше.
+    - POSITION_COOLDOWN_SEC удалена (не использовалась в коде).
 """
 from __future__ import annotations
 
@@ -79,13 +88,19 @@ TF_TREND  = "15"
 VWAP_BARS = int(os.getenv("VWAP_BARS", "50"))
 
 # =========================
-# ШАГ 3: ТРИГГЕР BB
+# ШАГ 3: ТРИГГЕР BB (адаптивный Squeeze)
 # =========================
-TF_SCALP             = "5"
-BB_PERIOD            = int(os.getenv("BB_PERIOD",            "20"))
-BB_STDDEV            = float(os.getenv("BB_STDDEV",          "2.0"))
-BB_SQUEEZE_THRESHOLD = float(os.getenv("BB_SQUEEZE_THRESHOLD","0.030")) # bandwidth < 3%
-BB_SQUEEZE_BARS      = int(os.getenv("BB_SQUEEZE_BARS",      "3"))
+TF_SCALP  = "5"
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_STDDEV = float(os.getenv("BB_STDDEV", "2.0"))
+
+# Squeeze считается адаптивно: bandwidth текущих BB_SQUEEZE_BARS свечей
+# должен быть ≤ BB_SQUEEZE_PERCENTILE-му перцентилю bandwidth за
+# последние BB_SQUEEZE_LOOKBACK баров того же символа.
+# Пример: PERCENTILE=0.30, LOOKBACK=50 → сжатие = нижние 30% за 50 баров.
+BB_SQUEEZE_BARS       = int(os.getenv("BB_SQUEEZE_BARS",       "3"))
+BB_SQUEEZE_PERCENTILE = float(os.getenv("BB_SQUEEZE_PERCENTILE", "0.30"))
+BB_SQUEEZE_LOOKBACK   = int(os.getenv("BB_SQUEEZE_LOOKBACK",    "50"))
 
 # =========================
 # ШАГ 4: ФИЛЬТРЫ
@@ -108,10 +123,10 @@ RR_MIN       = float(os.getenv("RR_MIN",       "1.8"))
 # =========================
 # СЛУЖЕБНЫЙ КОНФИГ
 # =========================
-SIGNAL_COOLDOWN_SEC   = int(os.getenv("SIGNAL_COOLDOWN_SEC",   "300"))
-KEEPALIVE_SEC         = int(os.getenv("KEEPALIVE_SEC",          str(13 * 60)))
-WATCHDOG_SEC          = int(os.getenv("WATCHDOG_SEC",           "60"))
-STALL_EXIT_SEC        = int(os.getenv("STALL_EXIT_SEC",         "600"))
+SIGNAL_COOLDOWN_SEC       = int(os.getenv("SIGNAL_COOLDOWN_SEC",       "300"))
+KEEPALIVE_SEC             = int(os.getenv("KEEPALIVE_SEC",              str(13 * 60)))
+WATCHDOG_SEC              = int(os.getenv("WATCHDOG_SEC",               "60"))
+STALL_EXIT_SEC            = int(os.getenv("STALL_EXIT_SEC",             "300"))
 
 PRELOAD_BARS_5M  = int(os.getenv("PRELOAD_BARS_5M",  "100"))
 PRELOAD_BARS_15M = int(os.getenv("PRELOAD_BARS_15M", "100"))
@@ -237,14 +252,53 @@ def calc_vol_sma(data: List[Bar], period: int = VOL_SMA_PERIOD) -> float:
 
 
 def is_bb_squeeze(data: List[Bar]) -> bool:
-    """True если последние BB_SQUEEZE_BARS баров (до текущего) были сжаты."""
-    need = BB_PERIOD + BB_SQUEEZE_BARS + 1
+    """
+    Адаптивный BB Squeeze: True если последние BB_SQUEEZE_BARS свечей
+    были сжаты относительно исторического baseline данного символа.
+
+    Вместо абсолютного порога bandwidth < X% используется перцентиль:
+    динамический порог = BB_SQUEEZE_PERCENTILE-й перцентиль bandwidth
+    за последние BB_SQUEEZE_LOOKBACK баров.
+
+    Это адаптирует фильтр к рыночным условиям:
+    - В тренде baseline bandwidth шире → порог автоматически выше,
+      и фильтр не пропускает ложные сигналы.
+    - В боковике baseline уже → порог ниже, сигналы не пропускаются.
+    - Работает для любых альткоинов независимо от их базовой волатильности.
+
+    Настройка через env:
+      BB_SQUEEZE_PERCENTILE (default 0.30) — нижние 30% = "сжато"
+      BB_SQUEEZE_LOOKBACK   (default 50)   — окно исторического baseline
+      BB_SQUEEZE_BARS       (default 3)    — сколько последних свечей проверять
+    """
+    need = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
     if len(data) < need:
         return False
+
+    # Собираем bandwidth за BB_SQUEEZE_LOOKBACK баров (исторический baseline)
+    lookback_bws: List[float] = []
+    for i in range(BB_SQUEEZE_LOOKBACK, 0, -1):
+        closes = [b[3] for b in data[:-i]]
+        if len(closes) < BB_PERIOD:
+            continue
+        _, _, _, bw = calc_bb(closes)
+        lookback_bws.append(bw)
+
+    if not lookback_bws:
+        return False
+
+    # Вычисляем динамический порог как перцентиль
+    lookback_bws.sort()
+    idx = max(0, int(len(lookback_bws) * BB_SQUEEZE_PERCENTILE) - 1)
+    dynamic_threshold = lookback_bws[idx]
+
+    # Проверяем последние BB_SQUEEZE_BARS свечей
     for offset in range(1, BB_SQUEEZE_BARS + 1):
         closes = [b[3] for b in data[:-offset]]
+        if len(closes) < BB_PERIOD:
+            return False
         _, _, _, bw = calc_bb(closes)
-        if bw >= BB_SQUEEZE_THRESHOLD:
+        if bw >= dynamic_threshold:
             return False
     return True
 
@@ -419,7 +473,9 @@ class ScalpingEngine:
 
     def generate_signal(self, sym: str) -> Optional[Dict]:
         st = self.mkt.state[sym]
-        min_5m  = max(BB_PERIOD + BB_SQUEEZE_BARS + 1, MACD_SLOW + MACD_SIGNAL + 2, VOL_SMA_PERIOD + 1)
+        # Нужно достаточно баров для адаптивного squeeze-окна
+        min_5m  = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
+        min_5m  = max(min_5m, MACD_SLOW + MACD_SIGNAL + 2, VOL_SMA_PERIOD + 1)
         min_15m = ATR_FILTER_PERIOD + 1
         if len(st.k5) < min_5m or len(st.k15) < min_15m:
             return None
@@ -438,7 +494,7 @@ class ScalpingEngine:
         if bias == "NONE":
             return None
 
-        # Шаг 3: BB Squeeze + пробой
+        # Шаг 3: адаптивный BB Squeeze + пробой
         if not is_bb_squeeze(st.k5):
             return None
         breakout_long  = price > st.bb_upper
@@ -450,7 +506,7 @@ class ScalpingEngine:
 
         side = bias
 
-        # Шаг 4a: объём × 2.0
+        # Шаг 4a: объём × VOL_SPIKE_MULT
         cur_vol   = st.k5[-1][4]
         vol_ratio = cur_vol / st.vol_sma if st.vol_sma > 0 else 0.0
         if st.vol_sma > 0 and vol_ratio < VOL_SPIKE_MULT:
@@ -522,8 +578,10 @@ async def preload_symbol(
 ) -> None:
     async with sem:
         try:
-            bars5  = await rest.klines(sym, TF_SCALP,  limit=PRELOAD_BARS_5M)
-            bars15 = await rest.klines(sym, TF_TREND,  limit=PRELOAD_BARS_15M)
+            # Нужно больше баров для адаптивного squeeze-окна
+            bars5_limit  = max(PRELOAD_BARS_5M,  BB_PERIOD + BB_SQUEEZE_LOOKBACK + 10)
+            bars5  = await rest.klines(sym, TF_SCALP, limit=bars5_limit)
+            bars15 = await rest.klines(sym, TF_TREND, limit=PRELOAD_BARS_15M)
             st = mkt.state[sym]
             if bars5:
                 st.k5 = list(bars5[-200:])
@@ -540,7 +598,7 @@ async def preload_all(rest: BybitRest, mkt: Market, engine: ScalpingEngine) -> i
     tasks = [preload_symbol(rest, mkt, engine, sym, sem) for sym in mkt.symbols]
     logger.info(f"Preloading {len(tasks)} symbols (5m + 15m)...")
     await asyncio.gather(*tasks)
-    min_5m = max(BB_PERIOD + BB_SQUEEZE_BARS, MACD_SLOW + MACD_SIGNAL + 2)
+    min_5m = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
     ready  = sum(1 for s in mkt.symbols
                  if len(mkt.state[s].k5) >= min_5m and len(mkt.state[s].k15) >= ATR_FILTER_PERIOD + 1)
     logger.info(f"Preload done: {ready}/{len(mkt.symbols)} ready")
@@ -648,7 +706,7 @@ async def send_signal(app: web.Application, sig: Dict) -> None:
         f" — за {sl_label}\n"
         f"⚖️ RR:           {sig['rr']:.2f}\n"
         f"⏰ Сигнал:      {ts_utc}\n\n"
-        f"📊 <b>Основание:</b> Пробой BB на 5m"
+        f"📊 <b>Основание:</b> BB Squeeze → Пробой на 5m"
         f" + Объём ×{sig['vol_ratio']:.1f}."
         f" Цена {vwap_dir} 15m VWAP (<code>{sig['vwap_15m']:.5f}</code>)."
         f" ATR(15m): {sig['atr_pct']:.2f}%."
@@ -686,7 +744,7 @@ async def tg_loop(app: web.Application) -> None:
                 elif text == "/status":
                     mkt      = app["mkt"]
                     stats    = mkt.signal_stats
-                    min_5    = max(BB_PERIOD + BB_SQUEEZE_BARS, MACD_SLOW + MACD_SIGNAL + 2)
+                    min_5    = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
                     ready    = sum(1 for s in mkt.symbols
                                    if len(mkt.state[s].k5) >= min_5
                                    and len(mkt.state[s].k15) >= ATR_FILTER_PERIOD + 1)
@@ -696,8 +754,9 @@ async def tg_loop(app: web.Application) -> None:
                         if mkt.last_signal_sent_ts else "ещё не было"
                     )
                     await tg.send(cid, (
-                        f"✅ <b>Cryptobot SCALP v14</b>\n"
-                        f"Стратегия: BB Squeeze + VWAP(15m) + MACD + Vol×{VOL_SPIKE_MULT}\n"
+                        f"✅ <b>Cryptobot SCALP v15</b>\n"
+                        f"Стратегия: BB Squeeze (адапт.) + VWAP(15m) + MACD + Vol×{VOL_SPIKE_MULT}\n"
+                        f"Squeeze: перцентиль {int(BB_SQUEEZE_PERCENTILE*100)}% / окно {BB_SQUEEZE_LOOKBACK} баров\n"
                         f"Пул: {len(mkt.symbols)} монет ({volatile} волатильных)\n"
                         f"Готовы: {ready}/{len(mkt.symbols)}\n"
                         f"TP мин: {TP_MIN_PCT*100:.1f}%  |  RR ≥ {RR_MIN}\n"
@@ -755,7 +814,7 @@ async def on_startup(app: web.Application) -> None:
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
 
     await app["tg"].delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 Starting Cryptobot SCALP v14")
+    logger.info("🚀 Starting Cryptobot SCALP v15")
 
     app["rest"]   = BybitRest(BYBIT_REST, http)
     app["mkt"]    = Market()
@@ -782,18 +841,19 @@ async def on_startup(app: web.Application) -> None:
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
     app["universe_task"]  = asyncio.create_task(universe_refresh_loop(app))
 
-    # 5. Уведомление
+    # 5. Уведомление о старте
     try:
         volatile = sum(1 for s in app["mkt"].symbols
                        if app["mkt"].state[s].atr_15m_pct >= ATR_MIN_PCT)
         targets = PRIMARY_RECIPIENTS if PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS[:1] if ALLOWED_CHAT_IDS else [])
         for chat_id in targets:
             await app["tg"].send(chat_id, (
-                "🟢 <b>Cryptobot SCALP v14 Online</b>\n\n"
+                "🟢 <b>Cryptobot SCALP v15 Online</b>\n\n"
                 "<b>Стратегия (5 шагов):</b>\n"
                 f"  1️⃣ Топ-{TOP_SYMBOLS_COUNT} по объёму + ATR(15m) ≥ {ATR_MIN_PCT*100:.1f}%\n"
                 "  2️⃣ Тренд по VWAP(15m)\n"
-                f"  3️⃣ BB Squeeze ({BB_SQUEEZE_BARS} бара) → Пробой на 5m\n"
+                f"  3️⃣ BB Squeeze (адапт. {int(BB_SQUEEZE_PERCENTILE*100)}%‑перцентиль"
+                f" / {BB_SQUEEZE_LOOKBACK} баров) → Пробой на 5m\n"
                 f"  4️⃣ Объём ×{VOL_SPIKE_MULT} + MACD растёт\n"
                 f"  5️⃣ TP ≥ {TP_MIN_PCT*100:.0f}%  |  RR ≥ {RR_MIN}\n\n"
                 f"• Пул: {len(app['mkt'].symbols)} монет ({volatile} волатильных)\n"
