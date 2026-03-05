@@ -253,29 +253,25 @@ def calc_vol_sma(data: List[Bar], period: int = VOL_SMA_PERIOD) -> float:
 
 def is_bb_squeeze(data: List[Bar]) -> bool:
     """
-    Адаптивный BB Squeeze: True если последние BB_SQUEEZE_BARS свечей
-    были сжаты относительно исторического baseline данного символа.
+    Правильная логика BB Squeeze стратегии:
 
-    Вместо абсолютного порога bandwidth < X% используется перцентиль:
-    динамический порог = BB_SQUEEZE_PERCENTILE-й перцентиль bandwidth
-    за последние BB_SQUEEZE_LOOKBACK баров.
+    БЫЛО сжатие недавно (в последних BB_SQUEEZE_BARS+5 барах хотя бы
+    один бар находился ниже динамического порога). Текущий бар может
+    уже выходить из сжатия — это нормально и даже желательно.
 
-    Это адаптирует фильтр к рыночным условиям:
-    - В тренде baseline bandwidth шире → порог автоматически выше,
-      и фильтр не пропускает ложные сигналы.
-    - В боковике baseline уже → порог ниже, сигналы не пропускаются.
-    - Работает для любых альткоинов независимо от их базовой волатильности.
+    Старая логика требовала squeeze И breakout одновременно —
+    взаимоисключающие условия: когда полосы сжаты, цена внутри них;
+    когда цена выбивается за полосы, squeeze уже закончился.
 
-    Настройка через env:
-      BB_SQUEEZE_PERCENTILE (default 0.30) — нижние 30% = "сжато"
-      BB_SQUEEZE_LOOKBACK   (default 50)   — окно исторического baseline
-      BB_SQUEEZE_BARS       (default 3)    — сколько последних свечей проверять
+    Правильный порядок: сжатие → выход → пробой.
+    Детектируем сжатие в недавней истории (1-(BB_SQUEEZE_BARS+5) баров назад).
+    Пробой проверяется отдельно через bb_mid.
     """
-    need = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
+    need = BB_PERIOD + max(BB_SQUEEZE_BARS + 8, BB_SQUEEZE_LOOKBACK) + 1
     if len(data) < need:
         return False
 
-    # Собираем bandwidth за BB_SQUEEZE_LOOKBACK баров (исторический baseline)
+    # Собираем bandwidth за BB_SQUEEZE_LOOKBACK баров (baseline)
     lookback_bws: List[float] = []
     for i in range(BB_SQUEEZE_LOOKBACK, 0, -1):
         closes = [b[3] for b in data[:-i]]
@@ -287,26 +283,22 @@ def is_bb_squeeze(data: List[Bar]) -> bool:
     if not lookback_bws:
         return False
 
-    # Вычисляем динамический порог как перцентиль
     lookback_bws.sort()
     idx = max(0, int(len(lookback_bws) * BB_SQUEEZE_PERCENTILE) - 1)
     dynamic_threshold = lookback_bws[idx]
 
-    # Проверяем последние BB_SQUEEZE_BARS свечей
-    for offset in range(1, BB_SQUEEZE_BARS + 1):
+    # True если ХОТЯ БЫ ОДИН из последних (BB_SQUEEZE_BARS+5) баров был в сжатии
+    check_window = BB_SQUEEZE_BARS + 5
+    for offset in range(1, check_window + 1):
         closes = [b[3] for b in data[:-offset]]
         if len(closes) < BB_PERIOD:
-            return False
+            continue
         _, _, _, bw = calc_bb(closes)
-        if bw >= dynamic_threshold:
-            return False
-    return True
+        if bw < dynamic_threshold:
+            return True
+    return False
 
 
-# =========================
-# КЛИЕНТЫ
-# =========================
-class BybitWS:
     def __init__(self, url: str, http: aiohttp.ClientSession) -> None:
         self.url, self.http = url, http
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -519,8 +511,13 @@ class ScalpingEngine:
         if not is_bb_squeeze(st.k5):
             mkt.filter_stats["squeeze"] += 1
             return None
-        breakout_long  = price > st.bb_upper
-        breakout_short = price < st.bb_lower
+        # Пробой: цена в верхней/нижней половине полос Боллинджера.
+        # Требовать price > bb_upper после squeeze нельзя — это взаимоисключающие
+        # условия (в момент squeeze цена внутри полос, после выхода из squeeze
+        # полосы уже расширились и price > upper).
+        # bb_mid как порог: цена выше средней = бычий импульс, ниже = медвежий.
+        breakout_long  = price > st.bb_mid
+        breakout_short = price < st.bb_mid
         if bias == "LONG"  and not breakout_long:
             mkt.filter_stats["breakout"] += 1
             return None
@@ -783,7 +780,7 @@ async def tg_loop(app: web.Application) -> None:
                         if mkt.last_signal_sent_ts else "ещё не было"
                     )
                     await tg.send(cid, (
-                        f"✅ <b>Cryptobot SCALP v16</b>\n"
+                        f"✅ <b>Cryptobot SCALP v17</b>\n"
                         f"Стратегия: BB Squeeze (адапт.) + VWAP(15m) + MACD + Vol×{VOL_SPIKE_MULT}\n"
                         f"Squeeze: перцентиль {int(BB_SQUEEZE_PERCENTILE*100)}% / окно {BB_SQUEEZE_LOOKBACK} баров\n"
                         f"Пул: {len(mkt.symbols)} монет ({volatile} волатильных)\n"
@@ -868,7 +865,7 @@ async def on_startup(app: web.Application) -> None:
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
 
     await app["tg"].delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 Starting Cryptobot SCALP v16")
+    logger.info("🚀 Starting Cryptobot SCALP v17")
 
     app["rest"]   = BybitRest(BYBIT_REST, http)
     app["mkt"]    = Market()
@@ -902,7 +899,7 @@ async def on_startup(app: web.Application) -> None:
         targets = PRIMARY_RECIPIENTS if PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS[:1] if ALLOWED_CHAT_IDS else [])
         for chat_id in targets:
             await app["tg"].send(chat_id, (
-                "🟢 <b>Cryptobot SCALP v16 Online</b>\n\n"
+                "🟢 <b>Cryptobot SCALP v17 Online</b>\n\n"
                 "<b>Стратегия (5 шагов):</b>\n"
                 f"  1️⃣ Топ-{TOP_SYMBOLS_COUNT} по объёму + ATR(15m) ≥ {ATR_MIN_PCT*100:.1f}%\n"
                 "  2️⃣ Тренд по VWAP(15m)\n"
