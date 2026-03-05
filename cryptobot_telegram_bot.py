@@ -106,7 +106,7 @@ BB_SQUEEZE_LOOKBACK   = int(os.getenv("BB_SQUEEZE_LOOKBACK",    "50"))
 # ШАГ 4: ФИЛЬТРЫ
 # =========================
 VOL_SMA_PERIOD = int(os.getenv("VOL_SMA_PERIOD",  "20"))
-VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.0"))
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "1.5"))
 
 MACD_FAST   = int(os.getenv("MACD_FAST",   "12"))
 MACD_SLOW   = int(os.getenv("MACD_SLOW",   "26"))
@@ -418,6 +418,20 @@ class Market:
         self.last_ws_msg_ts      = now_ms()
         self.signal_stats        = {"total": 0, "long": 0, "short": 0}
         self.last_signal_sent_ts = 0
+        # Счётчики фильтров — сколько символов отвалилось на каждом шаге
+        self.filter_stats: Dict[str, int] = {
+            "checked":   0,
+            "cooldown":  0,
+            "atr":       0,
+            "vwap":      0,
+            "squeeze":   0,
+            "breakout":  0,
+            "volume":    0,
+            "macd":      0,
+            "rr":        0,
+            "passed":    0,
+        }
+        self.filter_stats_reset_ts = now_s()
 
 
 @dataclass
@@ -472,36 +486,46 @@ class ScalpingEngine:
         st.vol_sma = calc_vol_sma(st.k5)
 
     def generate_signal(self, sym: str) -> Optional[Dict]:
-        st = self.mkt.state[sym]
+        st  = self.mkt.state[sym]
+        mkt = self.mkt
         # Нужно достаточно баров для адаптивного squeeze-окна
         min_5m  = BB_PERIOD + max(BB_SQUEEZE_BARS, BB_SQUEEZE_LOOKBACK) + 1
         min_5m  = max(min_5m, MACD_SLOW + MACD_SIGNAL + 2, VOL_SMA_PERIOD + 1)
         min_15m = ATR_FILTER_PERIOD + 1
         if len(st.k5) < min_5m or len(st.k15) < min_15m:
             return None
+
+        mkt.filter_stats["checked"] += 1
+
         nowt = now_s()
         if nowt - st.last_signal_ts < SIGNAL_COOLDOWN_SEC:
+            mkt.filter_stats["cooldown"] += 1
             return None
 
         price = st.k5[-1][3]
 
         # Шаг 1: ATR-фильтр
         if st.atr_15m_pct < ATR_MIN_PCT:
+            mkt.filter_stats["atr"] += 1
             return None
 
         # Шаг 2: тренд по VWAP
         bias = st.trend_bias
         if bias == "NONE":
+            mkt.filter_stats["vwap"] += 1
             return None
 
         # Шаг 3: адаптивный BB Squeeze + пробой
         if not is_bb_squeeze(st.k5):
+            mkt.filter_stats["squeeze"] += 1
             return None
         breakout_long  = price > st.bb_upper
         breakout_short = price < st.bb_lower
         if bias == "LONG"  and not breakout_long:
+            mkt.filter_stats["breakout"] += 1
             return None
         if bias == "SHORT" and not breakout_short:
+            mkt.filter_stats["breakout"] += 1
             return None
 
         side = bias
@@ -510,14 +534,17 @@ class ScalpingEngine:
         cur_vol   = st.k5[-1][4]
         vol_ratio = cur_vol / st.vol_sma if st.vol_sma > 0 else 0.0
         if st.vol_sma > 0 and vol_ratio < VOL_SPIKE_MULT:
+            mkt.filter_stats["volume"] += 1
             return None
 
-        # Шаг 4б: MACD гистограмма в направлении и растёт
+        # Шаг 4б: MACD гистограмма совпадает с направлением (рост не обязателен)
         if side == "LONG":
-            if not (st.macd_hist > 0 and st.macd_hist > st.macd_hist_prev):
+            if not (st.macd_hist > 0):
+                mkt.filter_stats["macd"] += 1
                 return None
         else:
-            if not (st.macd_hist < 0 and st.macd_hist < st.macd_hist_prev):
+            if not (st.macd_hist < 0):
+                mkt.filter_stats["macd"] += 1
                 return None
 
         # Шаг 5: TP / SL
@@ -545,6 +572,7 @@ class ScalpingEngine:
             tp = price * (1 + TP_MAX_PCT) if side == "LONG" else price * (1 - TP_MAX_PCT)
             rr = abs(tp - price) / sl_dist
             if rr < RR_MIN:
+                self.mkt.filter_stats["rr"] += 1
                 return None
 
         tp_pct_out = abs(tp - price) / price * 100.0
@@ -553,6 +581,7 @@ class ScalpingEngine:
         st.last_signal_ts = nowt
         self.mkt.signal_stats["total"] += 1
         self.mkt.signal_stats[side.lower()] += 1
+        self.mkt.filter_stats["passed"] += 1
 
         return {
             "symbol":    sym,
@@ -754,7 +783,7 @@ async def tg_loop(app: web.Application) -> None:
                         if mkt.last_signal_sent_ts else "ещё не было"
                     )
                     await tg.send(cid, (
-                        f"✅ <b>Cryptobot SCALP v15</b>\n"
+                        f"✅ <b>Cryptobot SCALP v16</b>\n"
                         f"Стратегия: BB Squeeze (адапт.) + VWAP(15m) + MACD + Vol×{VOL_SPIKE_MULT}\n"
                         f"Squeeze: перцентиль {int(BB_SQUEEZE_PERCENTILE*100)}% / окно {BB_SQUEEZE_LOOKBACK} баров\n"
                         f"Пул: {len(mkt.symbols)} монет ({volatile} волатильных)\n"
@@ -779,7 +808,32 @@ async def watchdog_loop(app: web.Application) -> None:
 async def keepalive_loop(app: web.Application) -> None:
     while True:
         await asyncio.sleep(KEEPALIVE_SEC)
-        logger.info(f"Keepalive: WS {(now_ms() - app['mkt'].last_ws_msg_ts) / 1000:.1f}s ago")
+        mkt: Market = app["mkt"]
+        fs = mkt.filter_stats
+        elapsed = max(1, now_s() - mkt.filter_stats_reset_ts)
+        logger.info(
+            f"Keepalive: WS {(now_ms() - mkt.last_ws_msg_ts) / 1000:.1f}s ago | "
+            f"Universe: {len(mkt.symbols)} syms | "
+            f"Signals total: {mkt.signal_stats['total']} "
+            f"(L:{mkt.signal_stats['long']} S:{mkt.signal_stats['short']})"
+        )
+        logger.info(
+            f"Filter stats (last {elapsed//60}min): "
+            f"checked={fs['checked']} "
+            f"cooldown={fs['cooldown']} "
+            f"atr={fs['atr']} "
+            f"vwap={fs['vwap']} "
+            f"squeeze={fs['squeeze']} "
+            f"breakout={fs['breakout']} "
+            f"volume={fs['volume']} "
+            f"macd={fs['macd']} "
+            f"rr={fs['rr']} "
+            f"→passed={fs['passed']}"
+        )
+        # Сброс счётчиков
+        for k in fs:
+            fs[k] = 0
+        mkt.filter_stats_reset_ts = now_s()
 
 
 async def universe_refresh_loop(app: web.Application) -> None:
@@ -814,7 +868,7 @@ async def on_startup(app: web.Application) -> None:
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
 
     await app["tg"].delete_webhook(drop_pending_updates=True)
-    logger.info("🚀 Starting Cryptobot SCALP v15")
+    logger.info("🚀 Starting Cryptobot SCALP v16")
 
     app["rest"]   = BybitRest(BYBIT_REST, http)
     app["mkt"]    = Market()
@@ -848,7 +902,7 @@ async def on_startup(app: web.Application) -> None:
         targets = PRIMARY_RECIPIENTS if PRIMARY_RECIPIENTS else (ALLOWED_CHAT_IDS[:1] if ALLOWED_CHAT_IDS else [])
         for chat_id in targets:
             await app["tg"].send(chat_id, (
-                "🟢 <b>Cryptobot SCALP v15 Online</b>\n\n"
+                "🟢 <b>Cryptobot SCALP v16 Online</b>\n\n"
                 "<b>Стратегия (5 шагов):</b>\n"
                 f"  1️⃣ Топ-{TOP_SYMBOLS_COUNT} по объёму + ATR(15m) ≥ {ATR_MIN_PCT*100:.1f}%\n"
                 "  2️⃣ Тренд по VWAP(15m)\n"
