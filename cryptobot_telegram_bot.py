@@ -299,6 +299,10 @@ def is_bb_squeeze(data: List[Bar]) -> bool:
     return False
 
 
+# =========================
+# КЛИЕНТЫ
+# =========================
+class BybitWS:
     def __init__(self, url: str, http: aiohttp.ClientSession) -> None:
         self.url, self.http = url, http
         self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
