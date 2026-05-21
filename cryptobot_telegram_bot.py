@@ -11,6 +11,7 @@ Phase 6 implemented: Telegram signal formatting · signal/update dispatch
 Phase 7 implemented: dry-run mode · /config and /diag commands · target hardening
   Phase 7.1 hotfix: hardened delete_webhook · startup logger · stale comments
 Phase 8A implemented: setup freshness gate · current-price gate · price in signal · setup age in signal
+Phase 8B implemented: Telegram reply keyboard · command_keyboard() · updated phase text
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -675,14 +676,46 @@ class Tg:
             pass
         return []
 
-    async def send(self, chat_id: Any, text: str) -> bool:
+    async def send(
+        self,
+        chat_id: Any,
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         url     = f"{self.base_url}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text":    text,
+            "parse_mode": "HTML",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             async with self.session.post(url, json=payload) as r:
                 return r.status == 200
         except Exception:
             return False
+
+
+def command_keyboard() -> Dict[str, Any]:
+    """
+    Telegram ReplyKeyboardMarkup with quick-access buttons for frequently used
+    no-argument commands.  Attach to messages where keyboard restoration is
+    appropriate (startup notification, /status, /config).
+
+    Intentionally omits commands that require symbol input (/idea, /close,
+    /score) or that can perform irreversible state changes without confirmation.
+    """
+    return {
+        "keyboard": [
+            [{"text": "/status"}, {"text": "/regime"}],
+            [{"text": "/ideas"},  {"text": "/config"}],
+            [{"text": "/diag"},   {"text": "/ping"}],
+        ],
+        "resize_keyboard":   True,
+        "one_time_keyboard": False,
+        "is_persistent":     True,
+    }
 
 
 class BybitRest:
@@ -2919,8 +2952,10 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"SL:{stats['sl_hit']}  Exp:{stats['expired']}\n\n"
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
-        f"<b>Phase:</b> 3 detectors active · Phase 4 gate active · Phase 5 lifecycle active · Phase 6 Telegram active"
-    ))
+        f"<b>Phase:</b> 3 detectors · 4 RR gate · 5 lifecycle · "
+        f"6 Telegram · 7 dry-run · 8A entry gate · 8B buttons\n"
+        f"<i>Command buttons: enabled for mobile Telegram</i>"
+    ), reply_markup=command_keyboard())
 
 
 async def _cmd_regime(app: web.Application, cid: int) -> None:
@@ -3063,7 +3098,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
         f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days\n"
         f"<b>Setup max age:</b> {SETUP_MAX_AGE_HOURS}h"
-    ))
+    ), reply_markup=command_keyboard())
 
 
 async def _cmd_diag(app: web.Application, cid: int) -> None:
@@ -3163,7 +3198,8 @@ async def on_startup(app: web.Application) -> None:
     setup_logging(LOG_LEVEL)
     logger.info(
         "🚀 Starting CryptoBot v18 — Weekly Swing "
-        "(Phase 3 detectors + Phase 4 gate + Phase 5 lifecycle + Phase 6 Telegram + Phase 7 dry-run hardening active)"
+        "(Phases 3–6 active · Phase 7 dry-run/hardening · "
+        "Phase 8A freshness/entry gate · Phase 8B command buttons)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3232,10 +3268,14 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 3</b> detectors: BR + TP + LS active ✅\n"
                 f"<b>Phase 4</b> TP/SL engine + RR gate: active ✅\n"
                 f"<b>Phase 5</b> ActiveIdea lifecycle: active ✅\n"
-                f"<b>Phase 6</b> Telegram signal formatting: active ✅\n\n"
+                f"<b>Phase 6</b> Telegram signal formatting: active ✅\n"
+                f"<b>Phase 7</b> dry-run/config/diag hardening: active ✅\n"
+                f"<b>Phase 8A</b> freshness + entry-zone gate: active ✅\n"
+                f"<b>Phase 8B</b> Telegram command buttons: active ✅\n\n"
+                f"Command buttons: enabled for mobile Telegram\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag"
-            ))
+            ), reply_markup=command_keyboard())
 
 
 async def on_cleanup(app: web.Application) -> None:
