@@ -684,16 +684,27 @@ class Tg:
     ) -> bool:
         url     = f"{self.base_url}/sendMessage"
         payload: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "text":    text,
+            "chat_id":    chat_id,
+            "text":       text,
             "parse_mode": "HTML",
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         try:
             async with self.session.post(url, json=payload) as r:
-                return r.status == 200
-        except Exception:
+                if r.status != 200:
+                    try:
+                        body = await r.json()
+                    except Exception:
+                        body = await r.text()
+                    logger.warning(
+                        f"sendMessage failed chat_id={chat_id} "
+                        f"status={r.status} response={body}"
+                    )
+                    return False
+                return True
+        except Exception as exc:
+            logger.warning(f"sendMessage exception chat_id={chat_id}: {exc}")
             return False
 
 
@@ -2955,7 +2966,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Phase:</b> 3 detectors · 4 RR gate · 5 lifecycle · "
         f"6 Telegram · 7 dry-run · 8A entry gate · 8B buttons\n"
         f"<i>Command buttons: enabled for mobile Telegram</i>"
-    ), reply_markup=command_keyboard())
+    ))
 
 
 async def _cmd_regime(app: web.Application, cid: int) -> None:
@@ -3098,7 +3109,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
         f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days\n"
         f"<b>Setup max age:</b> {SETUP_MAX_AGE_HOURS}h"
-    ), reply_markup=command_keyboard())
+    ))
 
 
 async def _cmd_diag(app: web.Application, cid: int) -> None:
@@ -3275,7 +3286,7 @@ async def on_startup(app: web.Application) -> None:
                 f"Command buttons: enabled for mobile Telegram\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag"
-            ), reply_markup=command_keyboard())
+    ))
 
 
 async def on_cleanup(app: web.Application) -> None:
