@@ -10,6 +10,7 @@ Phase 5 implemented: ActiveIdea creation · idea lifecycle (TP1/TP2/SL/expiry)
 Phase 6 implemented: Telegram signal formatting · signal/update dispatch
 Phase 7 implemented: dry-run mode · /config and /diag commands · target hardening
   Phase 7.1 hotfix: hardened delete_webhook · startup logger · stale comments
+Phase 8A implemented: setup freshness gate · current-price gate · price in signal · setup age in signal
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -66,6 +67,9 @@ REPORT_ERRORS_TO_TG       = _bool_env("REPORT_ERRORS_TO_TG", False)
 ERROR_REPORT_COOLDOWN_SEC = int(os.getenv("ERROR_REPORT_COOLDOWN_SEC", "180"))
 # Default True — safe dry-run until explicitly set to 0/false in production.
 DRY_RUN_MODE              = _bool_env("DRY_RUN_MODE", True)
+# Setups older than this (in hours) are silently skipped in scan_symbol.
+# Default 48 h = 2 days; ensures we don't emit signals for stale historical setups.
+SETUP_MAX_AGE_HOURS       = int(os.getenv("SETUP_MAX_AGE_HOURS", "48"))
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 UNIVERSE: List[str] = [
@@ -769,6 +773,15 @@ class ActiveIdea:
     invalidation: str        # plain-text thesis invalidation note sent in signal
 
     tp1_hit_at:   Optional[int] = None   # unix seconds when TP1 was first tagged
+    # ── Phase 8A additions ───────────────────────────────────────────────────
+    # Price sampled from the latest available bar at the moment the signal was
+    # emitted.  Used to display "Current price" and "IN ENTRY ZONE" in the
+    # Telegram message.  0.0 = not recorded (old ideas or test fixtures).
+    current_price_at_signal: float = 0.0
+    # Millisecond timestamp of the setup confirmation bar (same value as
+    # SetupResult.setup_ts).  Used to display "Setup age" in the signal.
+    # 0 = not recorded.
+    setup_ts: int = 0
 
     @property
     def entry_mid(self) -> float:
@@ -872,6 +885,10 @@ class SetupResult:
     rr_tp2:       float
     invalidation: str
     notes:        str = ""   # optional debug/log info
+    # Millisecond timestamp of the confirmation bar (retest / 4H confirm / sweep confirm).
+    # 0 = unknown (detectors built before Phase 8A, or test fixtures without a bar).
+    # is_setup_fresh() returns False when setup_ts == 0.
+    setup_ts:     int = 0
 
 
 # =============================================================================
@@ -1189,6 +1206,7 @@ def _scan_breakout_side(
                 f"bo_ts={bo_bar[B_TS]} key={key_level:.4f} "
                 f"retest_tf={retest_tf} retest_ts={retest_bar[B_TS]}"
             ),
+            setup_ts     = retest_bar[B_TS],
         )
 
     return None
@@ -1514,6 +1532,7 @@ def _scan_pullback_side(
             f"pullback={pullback_type} duration={len(pullback_bars)} "
             f"sl_extreme={sl_extreme:.4f}"
         ),
+        setup_ts     = last_4h[B_TS],
     )
 
 
@@ -1884,6 +1903,7 @@ def _scan_sweep_side(
             f"sweep_extreme={sweep_bar[B_LOW] if side=='LONG' else sweep_bar[B_HIGH]:.4f} "
             f"confirm_tf={confirm_tf}"
         ),
+        setup_ts     = confirm_bar[B_TS],
     )
 
 
@@ -2209,6 +2229,41 @@ def can_signal(
 # === 10. SWING ENGINE  (Phase 5) ===
 # =============================================================================
 
+# ── Phase 8A helpers ──────────────────────────────────────────────────────────
+
+def get_current_price(state: SymbolState) -> float:
+    """
+    Return the most recent close price from the latest available bar.
+
+    Uses the forming (last) candle intentionally — we want the live market
+    price, not the most recent closed candle.
+    Preference order: 1H → 4H → 1D.
+    Returns 0.0 when no bars are available (prevents false zone rejection).
+    """
+    for bars in (state.bars_1h, state.bars_4h, state.bars_1d):
+        if bars:
+            return bars[-1][B_CLOSE]
+    return 0.0
+
+
+def is_price_in_entry_zone(price: float, entry_low: float, entry_high: float) -> bool:
+    """True when price is within [entry_low, entry_high] (inclusive)."""
+    return entry_low <= price <= entry_high
+
+
+def is_setup_fresh(result: SetupResult) -> bool:
+    """
+    True when the setup confirmation bar is within SETUP_MAX_AGE_HOURS of now.
+
+    Returns False when setup_ts == 0 (unknown timestamp, or pre-Phase-8A
+    detector / test fixture that did not populate setup_ts).
+    This is intentionally strict: a zero setup_ts is treated as stale so
+    that old / test-only results do not accidentally trigger real emissions.
+    """
+    if result.setup_ts <= 0:
+        return False
+    return (now_ms() - result.setup_ts) <= SETUP_MAX_AGE_HOURS * 3_600_000
+
 async def scan_symbol(
     sym: str,
     state: SymbolState,
@@ -2234,6 +2289,28 @@ async def scan_symbol(
 
     result = calc_swing_tpsl(result, state)
 
+    # ── Freshness gate (Phase 8A) ──────────────────────────────────────────────
+    if not is_setup_fresh(result):
+        age_h = ((now_ms() - result.setup_ts) // 3_600_000
+                 if result.setup_ts > 0 else -1)
+        logger.debug(
+            f"scan_symbol {sym}: candidate skipped — stale setup "
+            f"(age {age_h}h, max {SETUP_MAX_AGE_HOURS}h)"
+        )
+        return
+
+    # ── Current price gate (Phase 8A) ─────────────────────────────────────────
+    # px > 0 guard: when bars are unavailable (e.g. early startup, test stubs),
+    # skip the zone check rather than silently blocking the signal.
+    px = get_current_price(state)
+    if px > 0.0 and not is_price_in_entry_zone(px, result.entry_low, result.entry_high):
+        logger.debug(
+            f"scan_symbol {sym}: candidate skipped — "
+            f"price {px:.4f} outside entry zone "
+            f"[{result.entry_low:.4f}–{result.entry_high:.4f}]"
+        )
+        return
+
     if not can_signal(sym, state, mkt, result):
         logger.debug(
             f"scan_symbol {sym}: {result.setup_type} {result.side} "
@@ -2247,21 +2324,23 @@ async def scan_symbol(
     now   = now_s()
     side  = result.side
     idea  = ActiveIdea(
-        symbol       = sym,
-        side         = side,
-        setup_type   = result.setup_type,
-        setup_score  = result.score,
-        entry_low    = result.entry_low,
-        entry_high   = result.entry_high,
-        stop_loss    = result.stop_loss,
-        tp1          = result.tp1,
-        tp2          = result.tp2,
-        rr_tp1       = result.rr_tp1,
-        rr_tp2       = result.rr_tp2,
-        status       = "ACTIVE",
-        emitted_at   = now,
-        expires_at   = now + MAX_IDEA_DURATION_DAYS * 86400,
-        invalidation = result.invalidation,
+        symbol                  = sym,
+        side                    = side,
+        setup_type              = result.setup_type,
+        setup_score             = result.score,
+        entry_low               = result.entry_low,
+        entry_high              = result.entry_high,
+        stop_loss               = result.stop_loss,
+        tp1                     = result.tp1,
+        tp2                     = result.tp2,
+        rr_tp1                  = result.rr_tp1,
+        rr_tp2                  = result.rr_tp2,
+        status                  = "ACTIVE",
+        emitted_at              = now,
+        expires_at              = now + MAX_IDEA_DURATION_DAYS * 86400,
+        invalidation            = result.invalidation,
+        current_price_at_signal = px,
+        setup_ts                = result.setup_ts,
     )
 
     state.active_idea    = idea
@@ -2610,10 +2689,11 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     """
     Render a new-idea Telegram message in HTML.
 
-    Includes: side, symbol, setup label, score, regime, entry zone, SL, TP1,
-    TP2, RR values, expiry note, invalidation thesis, and risk disclaimer.
-    When DRY_RUN_MODE=True, the message is prefixed with a 🧪 DRY RUN banner
-    and the disclaimer is updated accordingly.
+    Includes: side, symbol, setup label, score, regime, current price (Phase 8A),
+    entry zone + IN ENTRY ZONE status, SL, TP1, TP2, RR, setup age, expiry,
+    invalidation condition (renamed from "❌ Invalidation" to "🛑 Idea invalid if"),
+    and risk disclaimer.
+    When DRY_RUN_MODE=True: prefixed with 🧪 DRY RUN banner, adjusted disclaimer.
     No fake probability, no leverage, no position size.
     """
     side_emoji  = "🟢" if idea.side == "LONG" else "🔴"
@@ -2626,20 +2706,38 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
                    if DRY_RUN_MODE else
                    "Not financial advice. Manage risk.")
 
+    # Current price and entry zone status (Phase 8A)
+    if idea.current_price_at_signal > 0.0:
+        price_line  = (f"💵 <b>Current price:</b>  "
+                       f"<code>{idea.current_price_at_signal:.5f}</code>\n")
+        status_line = "✅ <b>Entry status:</b> IN ENTRY ZONE\n"
+    else:
+        price_line  = ""
+        status_line = ""
+
+    # Setup age
+    if idea.setup_ts > 0:
+        age_h       = (now_ms() - idea.setup_ts) // 3_600_000
+        age_line    = f"⏱ Setup age: {age_h}h  |  Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
+    else:
+        age_line    = f"⏱ Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
+
     return (
         f"{dry_banner}"
         f"{side_emoji} <b>{side_label} — {sym_pretty}</b>\n"
         f"<b>{html.escape(setup_label)}</b>  |  Score: {idea.setup_score}/100\n\n"
         f"📊 Regime: {regime_e} {state.regime}\n\n"
+        f"{price_line}"
         f"📍 <b>Entry zone:</b>  "
         f"<code>{idea.entry_low:.5f} – {idea.entry_high:.5f}</code>\n"
+        f"{status_line}"
         f"🛡 <b>Stop Loss:</b>   <code>{idea.stop_loss:.5f}</code>\n\n"
         f"🎯 <b>TP1:</b>  <code>{idea.tp1:.5f}</code>  "
         f"<i>(RR {idea.rr_tp1:.2f})</i>\n"
         f"🎯 <b>TP2:</b>  <code>{idea.tp2:.5f}</code>  "
         f"<i>(RR {idea.rr_tp2:.2f})</i>\n\n"
-        f"⏱ Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
-        f"❌ Invalidation: {html.escape(idea.invalidation)}\n\n"
+        f"{age_line}"
+        f"🛑 <b>Idea invalid if:</b> {html.escape(idea.invalidation)}\n\n"
         f"<i>{disclaimer}</i>"
     )
 
@@ -2963,7 +3061,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"1D={POLL_1D_SEC}s · 1W={POLL_1W_SEC}s · 1M={POLL_1M_SEC}s\n\n"
         f"<b>RR minimum:</b> Tier1 ≥ {RR_MIN_TIER1}  |  Tier2 ≥ {RR_MIN_TIER2}\n"
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
-        f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days"
+        f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days\n"
+        f"<b>Setup max age:</b> {SETUP_MAX_AGE_HOURS}h"
     ))
 
 
