@@ -12,6 +12,8 @@ Phase 7 implemented: dry-run mode · /config and /diag commands · target harden
   Phase 7.1 hotfix: hardened delete_webhook · startup logger · stale comments
 Phase 8A implemented: setup freshness gate · current-price gate · price in signal · setup age in signal
 Phase 8B implemented: Telegram reply keyboard · command_keyboard() · updated phase text
+  Phase 8B.1 hotfix: removed reply_markup from channel sends · Tg.send failure logging
+Phase 8C implemented: ScanDiagnostics counters · keepalive/diag visibility · text cleanup
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -902,6 +904,48 @@ class Market:
     })
     last_poll_ts: int = 0
     poll_count:   int = 0
+
+    # ── Phase 8C scan diagnostics ──────────────────────────────────────────────
+    # diag_last: counters for the current keepalive interval (reset each cycle)
+    # diag_total: cumulative counters since startup
+    diag_last:  "ScanDiagnostics" = field(default_factory=lambda: ScanDiagnostics())
+    diag_total: "ScanDiagnostics" = field(default_factory=lambda: ScanDiagnostics())
+
+
+@dataclass
+class ScanDiagnostics:
+    """
+    Lightweight per-scan-cycle counters that explain why candidates do or do
+    not become active ideas.  Two instances live on Market:
+      diag_last  — reset every keepalive cycle; shows what just happened.
+      diag_total — cumulative since startup; useful for long-term trends.
+
+    Counter semantics (mirrors the scan_symbol flow):
+      symbols_checked    — entered scan_symbol
+      symbols_not_ready  — symbol state not ready yet
+      active_idea_lock   — symbol already has an active idea
+      detector_none      — run_setup_pipeline() returned None
+      setup_stale        — is_setup_fresh() returned False
+      price_missing      — get_current_price() returned 0.0
+      outside_entry_zone — price known but outside [entry_low, entry_high]
+      tpsl_fail          — calc_swing_tpsl produced degenerate geometry (rr≤0)
+      rr_fail            — passes_rr_gate() returned False
+      signal_gate_fail   — can_signal() returned False (score/regime/BTC filter)
+      new_idea           — ActiveIdea successfully created
+      errors             — unexpected exception caught inside scan_symbol
+    """
+    symbols_checked:    int = 0
+    symbols_not_ready:  int = 0
+    active_idea_lock:   int = 0
+    detector_none:      int = 0
+    setup_stale:        int = 0
+    price_missing:      int = 0
+    outside_entry_zone: int = 0
+    tpsl_fail:          int = 0
+    rr_fail:            int = 0
+    signal_gate_fail:   int = 0
+    new_idea:           int = 0
+    errors:             int = 0
 
 
 @dataclass
@@ -2315,102 +2359,154 @@ async def scan_symbol(
     app: web.Application,
 ) -> None:
     """
-    Phase 5: Full per-symbol scan pipeline — detector → TP/SL engine → gate
-    → ActiveIdea creation.
+    Phase 5 / Phase 8C: Full per-symbol scan pipeline with diagnostic counters.
 
-    Steps executed:
-      1. run_setup_pipeline(state)            → SetupResult | None
-      2. calc_swing_tpsl(result, state)       → finalised TP1/TP2/RR
-      3. can_signal(sym, state, mkt, result)  → emission gate
-      4. If gate passes: create ActiveIdea, update stats, logger.info
+    Flow:
+      ready check → active-idea lock → detector → tpsl → freshness gate
+      → price gate → RR gate → can_signal gate → create ActiveIdea → send
 
-    Phase 6 sends the formatted Telegram signal after ActiveIdea creation.
-    ActiveIdea remains active even if Telegram dispatch fails.
+    Every exit point increments the appropriate ScanDiagnostics counter on
+    mkt.diag_last and mkt.diag_total so keepalive and /diag can explain why
+    candidates did not become ideas.
+
+    Phase 6 Telegram dispatch happens after idea creation; idea remains active
+    even if Telegram send fails.
     """
-    result = run_setup_pipeline(state)
-    if result is None:
-        return
+    d = mkt.diag_last   # last-cycle counters (reset each keepalive)
+    t = mkt.diag_total  # cumulative since startup
 
-    result = calc_swing_tpsl(result, state)
-
-    # ── Freshness gate (Phase 8A) ──────────────────────────────────────────────
-    if not is_setup_fresh(result):
-        age_h = ((now_ms() - result.setup_ts) // 3_600_000
-                 if result.setup_ts > 0 else -1)
-        logger.debug(
-            f"scan_symbol {sym}: candidate skipped — stale setup "
-            f"(age {age_h}h, max {SETUP_MAX_AGE_HOURS}h)"
-        )
-        return
-
-    # ── Current price gate (Phase 8A) ─────────────────────────────────────────
-    # px > 0 guard: when bars are unavailable (e.g. early startup, test stubs),
-    # skip the zone check rather than silently blocking the signal.
-    px = get_current_price(state)
-    if px > 0.0 and not is_price_in_entry_zone(px, result.entry_low, result.entry_high):
-        logger.debug(
-            f"scan_symbol {sym}: candidate skipped — "
-            f"price {px:.4f} outside entry zone "
-            f"[{result.entry_low:.4f}–{result.entry_high:.4f}]"
-        )
-        return
-
-    if not can_signal(sym, state, mkt, result):
-        logger.debug(
-            f"scan_symbol {sym}: {result.setup_type} {result.side} "
-            f"score={result.score} "
-            f"rr_tp1={result.rr_tp1:.2f} rr_tp2={result.rr_tp2:.2f} "
-            f"gate=FAIL"
-        )
-        return
-
-    # ── Create ActiveIdea ─────────────────────────────────────────────────────
-    now   = now_s()
-    side  = result.side
-    idea  = ActiveIdea(
-        symbol                  = sym,
-        side                    = side,
-        setup_type              = result.setup_type,
-        setup_score             = result.score,
-        entry_low               = result.entry_low,
-        entry_high              = result.entry_high,
-        stop_loss               = result.stop_loss,
-        tp1                     = result.tp1,
-        tp2                     = result.tp2,
-        rr_tp1                  = result.rr_tp1,
-        rr_tp2                  = result.rr_tp2,
-        status                  = "ACTIVE",
-        emitted_at              = now,
-        expires_at              = now + MAX_IDEA_DURATION_DAYS * 86400,
-        invalidation            = result.invalidation,
-        current_price_at_signal = px,
-        setup_ts                = result.setup_ts,
-    )
-
-    state.active_idea    = idea
-    state.last_signal_ts = now
-
-    mkt.signal_stats["total"] += 1
-    if side == "LONG":
-        mkt.signal_stats["long"]  += 1
-    else:
-        mkt.signal_stats["short"] += 1
-
-    logger.info(
-        f"NEW IDEA {sym} {side} {result.setup_type} score={result.score} "
-        f"entry={result.entry_low:.4f}–{result.entry_high:.4f} "
-        f"sl={result.stop_loss:.4f} "
-        f"tp1={result.tp1:.4f}(RR{result.rr_tp1:.2f}) "
-        f"tp2={result.tp2:.4f}(RR{result.rr_tp2:.2f})"
-    )
-
-    # ── Telegram dispatch (Phase 6) ───────────────────────────────────────────
-    # ActiveIdea is created regardless of Telegram success/failure.
     try:
-        await send_signal(app, idea, state)
-    except Exception as e:
-        logger.warning(f"send_signal failed {sym}: {e}")
-        await report_error(app, f"send_signal/{sym}", e)
+        d.symbols_checked += 1
+        t.symbols_checked += 1
+
+        # ── Pre-flight: skip immediately if symbol is not ready ───────────────
+        if not state.ready:
+            d.symbols_not_ready += 1
+            t.symbols_not_ready += 1
+            return
+
+        # ── Pre-flight: symbol already has an active idea ─────────────────────
+        if state.active_idea is not None:
+            d.active_idea_lock += 1
+            t.active_idea_lock += 1
+            return
+
+        # ── Detector ──────────────────────────────────────────────────────────
+        result = run_setup_pipeline(state)
+        if result is None:
+            d.detector_none += 1
+            t.detector_none += 1
+            return
+
+        # ── TP/SL engine ──────────────────────────────────────────────────────
+        result = calc_swing_tpsl(result, state)
+        if result.rr_tp2 <= 0.0:
+            # Degenerate geometry (risk ≤ 0 in calc_swing_tpsl)
+            d.tpsl_fail += 1
+            t.tpsl_fail += 1
+            return
+
+        # ── Freshness gate (Phase 8A) ─────────────────────────────────────────
+        if not is_setup_fresh(result):
+            age_h = ((now_ms() - result.setup_ts) // 3_600_000
+                     if result.setup_ts > 0 else -1)
+            logger.debug(
+                f"scan_symbol {sym}: stale setup "
+                f"(age {age_h}h, max {SETUP_MAX_AGE_HOURS}h)"
+            )
+            d.setup_stale += 1
+            t.setup_stale += 1
+            return
+
+        # ── Current price gate (Phase 8A) ─────────────────────────────────────
+        px = get_current_price(state)
+        if px <= 0.0:
+            # Price unavailable — count but do not block (bars may not be loaded yet)
+            d.price_missing += 1
+            t.price_missing += 1
+        elif not is_price_in_entry_zone(px, result.entry_low, result.entry_high):
+            logger.debug(
+                f"scan_symbol {sym}: price {px:.4f} outside entry zone "
+                f"[{result.entry_low:.4f}–{result.entry_high:.4f}]"
+            )
+            d.outside_entry_zone += 1
+            t.outside_entry_zone += 1
+            return
+
+        # ── RR gate (split out for diagnostics) ───────────────────────────────
+        if not passes_rr_gate(result, sym):
+            logger.debug(
+                f"scan_symbol {sym}: RR gate fail "
+                f"rr_tp2={result.rr_tp2:.2f}"
+            )
+            d.rr_fail += 1
+            t.rr_fail += 1
+            return
+
+        # ── Signal gate (score floor / regime / BTC regime) ───────────────────
+        if not can_signal(sym, state, mkt, result):
+            logger.debug(
+                f"scan_symbol {sym}: {result.setup_type} {result.side} "
+                f"score={result.score} gate=FAIL"
+            )
+            d.signal_gate_fail += 1
+            t.signal_gate_fail += 1
+            return
+
+        # ── Create ActiveIdea ─────────────────────────────────────────────────
+        now   = now_s()
+        side  = result.side
+        idea  = ActiveIdea(
+            symbol                  = sym,
+            side                    = side,
+            setup_type              = result.setup_type,
+            setup_score             = result.score,
+            entry_low               = result.entry_low,
+            entry_high              = result.entry_high,
+            stop_loss               = result.stop_loss,
+            tp1                     = result.tp1,
+            tp2                     = result.tp2,
+            rr_tp1                  = result.rr_tp1,
+            rr_tp2                  = result.rr_tp2,
+            status                  = "ACTIVE",
+            emitted_at              = now,
+            expires_at              = now + MAX_IDEA_DURATION_DAYS * 86400,
+            invalidation            = result.invalidation,
+            current_price_at_signal = px,
+            setup_ts                = result.setup_ts,
+        )
+
+        state.active_idea    = idea
+        state.last_signal_ts = now
+
+        mkt.signal_stats["total"] += 1
+        if side == "LONG":
+            mkt.signal_stats["long"]  += 1
+        else:
+            mkt.signal_stats["short"] += 1
+
+        d.new_idea += 1
+        t.new_idea += 1
+
+        logger.info(
+            f"NEW IDEA {sym} {side} {result.setup_type} score={result.score} "
+            f"entry={result.entry_low:.4f}–{result.entry_high:.4f} "
+            f"sl={result.stop_loss:.4f} "
+            f"tp1={result.tp1:.4f}(RR{result.rr_tp1:.2f}) "
+            f"tp2={result.tp2:.4f}(RR{result.rr_tp2:.2f})"
+        )
+
+        # ── Telegram dispatch (Phase 6) ───────────────────────────────────────
+        try:
+            await send_signal(app, idea, state)
+        except Exception as e:
+            logger.warning(f"send_signal failed {sym}: {e}")
+            await report_error(app, f"send_signal/{sym}", e)
+
+    except Exception as exc:
+        d.errors += 1
+        t.errors += 1
+        raise
 
 
 # =============================================================================
@@ -2963,9 +3059,8 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"SL:{stats['sl_hit']}  Exp:{stats['expired']}\n\n"
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
-        f"<b>Phase:</b> 3 detectors · 4 RR gate · 5 lifecycle · "
-        f"6 Telegram · 7 dry-run · 8A entry gate · 8B buttons\n"
-        f"<i>Command buttons: enabled for mobile Telegram</i>"
+        f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
+        f"8A entry gate · 8B.1 safe-send · 8C diag"
     ))
 
 
@@ -3113,7 +3208,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
 
 
 async def _cmd_diag(app: web.Application, cid: int) -> None:
-    """Compact real-time diagnostics snapshot."""
+    """Compact real-time diagnostics snapshot including scan gate counters."""
     tg:  Tg     = app["tg"]
     mkt: Market = app["mkt"]
 
@@ -3124,9 +3219,11 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
     btc_scanned = mkt.state["BTCUSDT"].last_scanned_ts if "BTCUSDT" in mkt.state else 0
     btc_scan_ago = (f"{now_s() - btc_scanned}s ago" if btc_scanned else "never")
     mode = "🧪 DRY RUN" if DRY_RUN_MODE else "✅ LIVE SIGNALS"
-
     nr_str = (", ".join(s.replace("USDT","") for s in not_ready)
               if not_ready else "—")
+
+    d = mkt.diag_last    # last keepalive interval
+    t = mkt.diag_total   # cumulative since startup
 
     await tg.send(cid, (
         f"🔬 <b>Diagnostics</b>\n\n"
@@ -3136,7 +3233,33 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"<b>Active ideas:</b> {active}\n"
         f"<b>BTC regime:</b> {_regime_emoji(mkt.btc_regime)} {mkt.btc_regime}\n"
         f"<b>BTC last scan:</b> {btc_scan_ago}\n"
-        f"<b>Not ready (≤10):</b> {nr_str}"
+        f"<b>Not ready (≤10):</b> {nr_str}\n\n"
+        f"<b>Last-cycle scan (since keepalive reset):</b>\n"
+        f"  checked={d.symbols_checked}  "
+        f"not_ready={d.symbols_not_ready}  "
+        f"lock={d.active_idea_lock}\n"
+        f"  detector_none={d.detector_none}  "
+        f"stale={d.setup_stale}  "
+        f"price_miss={d.price_missing}\n"
+        f"  outside_zone={d.outside_entry_zone}  "
+        f"tpsl_fail={d.tpsl_fail}  "
+        f"rr_fail={d.rr_fail}\n"
+        f"  gate_fail={d.signal_gate_fail}  "
+        f"new_idea={d.new_idea}  "
+        f"errors={d.errors}\n\n"
+        f"<b>Since startup (total):</b>\n"
+        f"  checked={t.symbols_checked}  "
+        f"detector_none={t.detector_none}  "
+        f"stale={t.setup_stale}\n"
+        f"  outside_zone={t.outside_entry_zone}  "
+        f"rr_fail={t.rr_fail}  "
+        f"gate_fail={t.signal_gate_fail}  "
+        f"new={t.new_idea}\n\n"
+        f"<b>Current gates:</b>\n"
+        f"  Setup max age: {SETUP_MAX_AGE_HOURS}h\n"
+        f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
+        f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
+        f"  Entry zone required: yes (price > 0)"
     ))
 
 
@@ -3172,6 +3295,7 @@ async def keepalive_loop(app: web.Application) -> None:
         ready    = sum(1 for s in mkt.symbols if mkt.state[s].ready)
         active   = sum(1 for s in mkt.symbols if mkt.state[s].active_idea is not None)
         poll_ago = now_s() - mkt.last_poll_ts if mkt.last_poll_ts else -1
+        d = mkt.diag_last
         logger.info(
             f"Keepalive | Mode: {'DRY RUN' if DRY_RUN_MODE else 'LIVE'} | "
             f"BTC: {mkt.btc_regime} | "
@@ -3180,8 +3304,16 @@ async def keepalive_loop(app: web.Application) -> None:
             f"Polls: {mkt.poll_count} | "
             f"Last poll: {poll_ago}s ago | "
             f"Ideas: {mkt.signal_stats['total']} "
-            f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']})"
+            f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']}) | "
+            f"Scan diag: checked={d.symbols_checked} "
+            f"not_ready={d.symbols_not_ready} lock={d.active_idea_lock} "
+            f"detector_none={d.detector_none} stale={d.setup_stale} "
+            f"price_miss={d.price_missing} outside_zone={d.outside_entry_zone} "
+            f"tpsl_fail={d.tpsl_fail} rr_fail={d.rr_fail} "
+            f"gate_fail={d.signal_gate_fail} new={d.new_idea} errors={d.errors}"
         )
+        # Reset last-cycle counters for the next keepalive window
+        mkt.diag_last = ScanDiagnostics()
 
 
 async def watchdog_loop(app: web.Application) -> None:
@@ -3210,7 +3342,8 @@ async def on_startup(app: web.Application) -> None:
     logger.info(
         "🚀 Starting CryptoBot v18 — Weekly Swing "
         "(Phases 3–6 active · Phase 7 dry-run/hardening · "
-        "Phase 8A freshness/entry gate · Phase 8B command buttons)"
+        "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
+        "Phase 8C gate diagnostics)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3282,8 +3415,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 6</b> Telegram signal formatting: active ✅\n"
                 f"<b>Phase 7</b> dry-run/config/diag hardening: active ✅\n"
                 f"<b>Phase 8A</b> freshness + entry-zone gate: active ✅\n"
-                f"<b>Phase 8B</b> Telegram command buttons: active ✅\n\n"
-                f"Command buttons: enabled for mobile Telegram\n"
+                f"<b>Phase 8B.1</b> channel-safe Telegram send: active ✅\n"
+                f"<b>Phase 8C</b> gate diagnostics: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag"
     ))
