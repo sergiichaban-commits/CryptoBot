@@ -14,6 +14,7 @@ Phase 8A implemented: setup freshness gate · current-price gate · price in sig
 Phase 8B implemented: Telegram reply keyboard · command_keyboard() · updated phase text
   Phase 8B.1 hotfix: removed reply_markup from channel sends · Tg.send failure logging
 Phase 8C implemented: ScanDiagnostics counters · keepalive/diag visibility · text cleanup
+Phase 8D implemented: validate_actionable_setup · SETUP_CONTEXT_MAX_DAYS · RR_FROM_CURRENT_PRICE · refined diag counters
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -70,9 +71,15 @@ REPORT_ERRORS_TO_TG       = _bool_env("REPORT_ERRORS_TO_TG", False)
 ERROR_REPORT_COOLDOWN_SEC = int(os.getenv("ERROR_REPORT_COOLDOWN_SEC", "180"))
 # Default True — safe dry-run until explicitly set to 0/false in production.
 DRY_RUN_MODE              = _bool_env("DRY_RUN_MODE", True)
-# Setups older than this (in hours) are silently skipped in scan_symbol.
-# Default 48 h = 2 days; ensures we don't emit signals for stale historical setups.
-SETUP_MAX_AGE_HOURS       = int(os.getenv("SETUP_MAX_AGE_HOURS", "48"))
+# SETUP_MAX_AGE_HOURS (48h) is the legacy strict freshness gate.
+# Phase 8D replaces it with a two-tier model:
+#   SETUP_CONTEXT_MAX_DAYS — how old the structural context may be (swing timeframe)
+#   ENTRY_ZONE_REQUIRED    — current price must be inside entry zone at scan time
+#   RR_FROM_CURRENT_PRICE  — recalculate RR from live price instead of entry_mid
+SETUP_MAX_AGE_HOURS       = int(os.getenv("SETUP_MAX_AGE_HOURS",    "48"))   # legacy
+SETUP_CONTEXT_MAX_DAYS    = int(os.getenv("SETUP_CONTEXT_MAX_DAYS", "30"))
+ENTRY_ZONE_REQUIRED       = _bool_env("ENTRY_ZONE_REQUIRED",     True)
+RR_FROM_CURRENT_PRICE     = _bool_env("RR_FROM_CURRENT_PRICE",   True)
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 UNIVERSE: List[str] = [
@@ -713,8 +720,12 @@ class Tg:
 def command_keyboard() -> Dict[str, Any]:
     """
     Telegram ReplyKeyboardMarkup with quick-access buttons for frequently used
-    no-argument commands.  Attach to messages where keyboard restoration is
-    appropriate (startup notification, /status, /config).
+    no-argument commands.
+
+    Preserved for possible future private/group use (e.g. personal admin chats).
+    It MUST NOT be attached to channel broadcasts — Telegram channels reject
+    ReplyKeyboardMarkup and the message will silently fail to deliver.
+    (Phase 8B.1 removed reply_markup from all channel sends.)
 
     Intentionally omits commands that require symbol input (/idea, /close,
     /score) or that can perform irreversible state changes without confirmation.
@@ -920,32 +931,40 @@ class ScanDiagnostics:
       diag_last  — reset every keepalive cycle; shows what just happened.
       diag_total — cumulative since startup; useful for long-term trends.
 
-    Counter semantics (mirrors the scan_symbol flow):
-      symbols_checked    — entered scan_symbol
-      symbols_not_ready  — symbol state not ready yet
-      active_idea_lock   — symbol already has an active idea
-      detector_none      — run_setup_pipeline() returned None
-      setup_stale        — is_setup_fresh() returned False
-      price_missing      — get_current_price() returned 0.0
-      outside_entry_zone — price known but outside [entry_low, entry_high]
-      tpsl_fail          — calc_swing_tpsl produced degenerate geometry (rr≤0)
-      rr_fail            — passes_rr_gate() returned False
-      signal_gate_fail   — can_signal() returned False (score/regime/BTC filter)
-      new_idea           — ActiveIdea successfully created
-      errors             — unexpected exception caught inside scan_symbol
+    Counter semantics (mirrors the scan_symbol / validate_actionable_setup flow):
+      symbols_checked       — entered scan_symbol
+      symbols_not_ready     — symbol state not ready yet
+      active_idea_lock      — symbol already has an active idea
+      detector_none         — run_setup_pipeline() returned None
+      context_too_old       — setup_ts=0 or age > SETUP_CONTEXT_MAX_DAYS
+      price_missing         — get_current_price() returned 0.0
+      outside_entry_zone    — price known but outside [entry_low, entry_high]
+      already_hit_tp        — TP1 or TP2 already touched since setup_ts
+      already_hit_sl        — SL already touched since setup_ts
+      invalidated_since_setup — setup explicitly invalidated since setup_ts
+      tpsl_fail             — calc_swing_tpsl produced degenerate geometry (rr≤0)
+      rr_current_fail       — RR below threshold (current-price or entry_mid)
+      signal_gate_fail      — can_signal() returned False (score/regime/BTC filter)
+      actionable_ok         — validate_actionable_setup() returned ok
+      new_idea              — ActiveIdea successfully created
+      errors                — unexpected exception caught inside scan_symbol
     """
-    symbols_checked:    int = 0
-    symbols_not_ready:  int = 0
-    active_idea_lock:   int = 0
-    detector_none:      int = 0
-    setup_stale:        int = 0
-    price_missing:      int = 0
-    outside_entry_zone: int = 0
-    tpsl_fail:          int = 0
-    rr_fail:            int = 0
-    signal_gate_fail:   int = 0
-    new_idea:           int = 0
-    errors:             int = 0
+    symbols_checked:        int = 0
+    symbols_not_ready:      int = 0
+    active_idea_lock:       int = 0
+    detector_none:          int = 0
+    context_too_old:        int = 0
+    price_missing:          int = 0
+    outside_entry_zone:     int = 0
+    already_hit_tp:         int = 0
+    already_hit_sl:         int = 0
+    invalidated_since_setup: int = 0
+    tpsl_fail:              int = 0
+    rr_current_fail:        int = 0
+    signal_gate_fail:       int = 0
+    actionable_ok:          int = 0
+    new_idea:               int = 0
+    errors:                 int = 0
 
 
 @dataclass
@@ -2352,6 +2371,144 @@ def is_setup_fresh(result: SetupResult) -> bool:
         return False
     return (now_ms() - result.setup_ts) <= SETUP_MAX_AGE_HOURS * 3_600_000
 
+
+# ── Phase 8D helpers ──────────────────────────────────────────────────────────
+
+def calc_rr_from_current(
+    side: str,
+    current_price: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+) -> Tuple[float, float]:
+    """
+    Recalculate TP1/TP2 risk-reward ratios using the current market price as
+    the risk reference point rather than entry_mid.
+
+    LONG:  risk = current_price − stop_loss
+           rr   = (tp − current_price) / risk
+    SHORT: risk = stop_loss − current_price
+           rr   = (current_price − tp) / risk
+
+    Returns (rr_tp1, rr_tp2).  Returns (0.0, 0.0) when risk ≤ 0 (current price
+    has moved past stop-loss or equals it — bad geometry).
+    """
+    if side == "LONG":
+        risk = current_price - stop_loss
+    else:
+        risk = stop_loss - current_price
+
+    if risk <= 0.0:
+        return 0.0, 0.0
+
+    if side == "LONG":
+        rr1 = (tp1 - current_price) / risk
+        rr2 = (tp2 - current_price) / risk
+    else:
+        rr1 = (current_price - tp1) / risk
+        rr2 = (current_price - tp2) / risk
+
+    return round(rr1, 2), round(rr2, 2)
+
+
+def validate_actionable_setup(
+    result: SetupResult,
+    state: SymbolState,
+    current_price: float,
+) -> Tuple[bool, str]:
+    """
+    Determine whether a detected setup is actionable at the current market price.
+
+    Separates structural context age (SETUP_CONTEXT_MAX_DAYS, default 30 days)
+    from the strict 48-hour SETUP_MAX_AGE_HOURS gate used in Phase 8A.
+    A valid swing structure may be identified from weeks of price action, but
+    the signal is only emitted when the setup is actionable *right now*.
+
+    Checks (in order):
+      1. context_too_old    — setup_ts = 0 or age > SETUP_CONTEXT_MAX_DAYS
+      2. price_missing      — current_price ≤ 0.0 (bars not loaded yet)
+      3. outside_entry_zone — price outside [entry_low, entry_high]  (when
+                              ENTRY_ZONE_REQUIRED is True)
+      4. already_hit_tp     — any 4H/1D bar since setup_ts touched TP1 or TP2
+      5. already_hit_sl     — any 4H/1D bar since setup_ts or current price
+                              touched / crossed stop_loss
+      6. bad geometry       — current_price on the wrong side of stop_loss
+
+    Returns (True, "ok") or (False, reason_string).
+    Reason strings correspond to ScanDiagnostics field names.
+
+    Note: invalidated_since_setup is reserved for future structural invalidation
+    detection (e.g. retest failure).  Currently never returned; the SL check
+    covers the most important case.
+    """
+    side = result.side
+
+    # 1. Context age
+    if result.setup_ts <= 0:
+        return False, "context_too_old"
+    age_ms = now_ms() - result.setup_ts
+    if age_ms > SETUP_CONTEXT_MAX_DAYS * 86_400_000:
+        return False, "context_too_old"
+
+    # 2. Price availability (needed for zone and geometry checks)
+    if current_price <= 0.0:
+        return False, "price_missing"
+
+    # 3. Entry zone (when required)
+    if ENTRY_ZONE_REQUIRED:
+        if not is_price_in_entry_zone(current_price, result.entry_low, result.entry_high):
+            return False, "outside_entry_zone"
+
+    # 4 & 5. Scan bars since setup_ts for TP/SL touches
+    #        Use 4H bars (more granular) then 1D for sweep.
+    #        Priority: TP2 hit > SL hit > TP1 hit (worst case surfaces first).
+    for bars in (state.bars_4h, state.bars_1d):
+        for bar in bars:
+            if bar[B_TS] < result.setup_ts:
+                continue
+            if side == "LONG":
+                if bar[B_HIGH] >= result.tp2:
+                    return False, "already_hit_tp"
+                if bar[B_LOW] <= result.stop_loss:
+                    return False, "already_hit_sl"
+                if bar[B_HIGH] >= result.tp1:
+                    return False, "already_hit_tp"
+            else:  # SHORT
+                if bar[B_LOW] <= result.tp2:
+                    return False, "already_hit_tp"
+                if bar[B_HIGH] >= result.stop_loss:
+                    return False, "already_hit_sl"
+                if bar[B_LOW] <= result.tp1:
+                    return False, "already_hit_tp"
+
+    # 6. Geometry: current price must still be on the correct side of SL
+    if side == "LONG" and current_price <= result.stop_loss:
+        return False, "already_hit_sl"
+    if side == "SHORT" and current_price >= result.stop_loss:
+        return False, "already_hit_sl"
+
+    return True, "ok"
+
+
+def _diag_actionable_fail(
+    d: ScanDiagnostics,
+    t: ScanDiagnostics,
+    reason: str,
+) -> None:
+    """Increment the ScanDiagnostics counter that matches a validate_actionable_setup reason."""
+    if reason == "context_too_old":
+        d.context_too_old += 1; t.context_too_old += 1
+    elif reason == "price_missing":
+        d.price_missing += 1; t.price_missing += 1
+    elif reason == "outside_entry_zone":
+        d.outside_entry_zone += 1; t.outside_entry_zone += 1
+    elif reason == "already_hit_tp":
+        d.already_hit_tp += 1; t.already_hit_tp += 1
+    elif reason == "already_hit_sl":
+        d.already_hit_sl += 1; t.already_hit_sl += 1
+    elif reason == "invalidated_since_setup":
+        d.invalidated_since_setup += 1; t.invalidated_since_setup += 1
+
 async def scan_symbol(
     sym: str,
     state: SymbolState,
@@ -2359,18 +2516,16 @@ async def scan_symbol(
     app: web.Application,
 ) -> None:
     """
-    Phase 5 / Phase 8C: Full per-symbol scan pipeline with diagnostic counters.
+    Phase 5 / Phase 8C / Phase 8D: Full per-symbol scan pipeline.
 
-    Flow:
-      ready check → active-idea lock → detector → tpsl → freshness gate
-      → price gate → RR gate → can_signal gate → create ActiveIdea → send
+    Phase 8D replaces the strict 48h is_setup_fresh gate with:
+      validate_actionable_setup() — checks context age (SETUP_CONTEXT_MAX_DAYS),
+      price zone (ENTRY_ZONE_REQUIRED), and whether TP/SL was already touched.
+    When RR_FROM_CURRENT_PRICE=True the result's rr_tp1/rr_tp2 are recalculated
+    from current market price before the RR gate and ActiveIdea creation.
 
-    Every exit point increments the appropriate ScanDiagnostics counter on
-    mkt.diag_last and mkt.diag_total so keepalive and /diag can explain why
-    candidates did not become ideas.
-
-    Phase 6 Telegram dispatch happens after idea creation; idea remains active
-    even if Telegram send fails.
+    Every exit point increments the appropriate ScanDiagnostics counter so
+    keepalive and /diag can explain why candidates did not become ideas.
     """
     d = mkt.diag_last   # last-cycle counters (reset each keepalive)
     t = mkt.diag_total  # cumulative since startup
@@ -2406,41 +2561,33 @@ async def scan_symbol(
             t.tpsl_fail += 1
             return
 
-        # ── Freshness gate (Phase 8A) ─────────────────────────────────────────
-        if not is_setup_fresh(result):
-            age_h = ((now_ms() - result.setup_ts) // 3_600_000
-                     if result.setup_ts > 0 else -1)
-            logger.debug(
-                f"scan_symbol {sym}: stale setup "
-                f"(age {age_h}h, max {SETUP_MAX_AGE_HOURS}h)"
-            )
-            d.setup_stale += 1
-            t.setup_stale += 1
-            return
-
-        # ── Current price gate (Phase 8A) ─────────────────────────────────────
+        # ── Actionable validation (Phase 8D) ─────────────────────────────────
+        # Replaces: is_setup_fresh + price gate (Phase 8A).
+        # Checks: context age, price in zone, bars-since-setup for TP/SL hits.
         px = get_current_price(state)
-        if px <= 0.0:
-            # Price unavailable — count but do not block (bars may not be loaded yet)
-            d.price_missing += 1
-            t.price_missing += 1
-        elif not is_price_in_entry_zone(px, result.entry_low, result.entry_high):
-            logger.debug(
-                f"scan_symbol {sym}: price {px:.4f} outside entry zone "
-                f"[{result.entry_low:.4f}–{result.entry_high:.4f}]"
-            )
-            d.outside_entry_zone += 1
-            t.outside_entry_zone += 1
+        valid, reason = validate_actionable_setup(result, state, px)
+        if not valid:
+            _diag_actionable_fail(d, t, reason)
+            logger.debug(f"scan_symbol {sym}: actionable fail — {reason}")
             return
 
-        # ── RR gate (split out for diagnostics) ───────────────────────────────
+        d.actionable_ok += 1
+        t.actionable_ok += 1
+
+        # ── Optional: update RR from current price ────────────────────────────
+        if RR_FROM_CURRENT_PRICE and px > 0.0:
+            rr1_px, rr2_px = calc_rr_from_current(
+                result.side, px, result.stop_loss, result.tp1, result.tp2
+            )
+            result = _dc_replace(result, rr_tp1=rr1_px, rr_tp2=rr2_px)
+
+        # ── RR gate ───────────────────────────────────────────────────────────
         if not passes_rr_gate(result, sym):
             logger.debug(
-                f"scan_symbol {sym}: RR gate fail "
-                f"rr_tp2={result.rr_tp2:.2f}"
+                f"scan_symbol {sym}: RR gate fail rr_tp2={result.rr_tp2:.2f}"
             )
-            d.rr_fail += 1
-            t.rr_fail += 1
+            d.rr_current_fail += 1
+            t.rr_current_fail += 1
             return
 
         # ── Signal gate (score floor / regime / BTC regime) ───────────────────
@@ -3060,7 +3207,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable"
     ))
 
 
@@ -3203,7 +3350,10 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>RR minimum:</b> Tier1 ≥ {RR_MIN_TIER1}  |  Tier2 ≥ {RR_MIN_TIER2}\n"
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
         f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days\n"
-        f"<b>Setup max age:</b> {SETUP_MAX_AGE_HOURS}h"
+        f"<b>Setup context max:</b> {SETUP_CONTEXT_MAX_DAYS}d  "
+        f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
+        f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
+        f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}"
     ))
 
 
@@ -3239,27 +3389,35 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"not_ready={d.symbols_not_ready}  "
         f"lock={d.active_idea_lock}\n"
         f"  detector_none={d.detector_none}  "
-        f"stale={d.setup_stale}  "
+        f"ctx_old={d.context_too_old}  "
         f"price_miss={d.price_missing}\n"
         f"  outside_zone={d.outside_entry_zone}  "
-        f"tpsl_fail={d.tpsl_fail}  "
-        f"rr_fail={d.rr_fail}\n"
-        f"  gate_fail={d.signal_gate_fail}  "
+        f"hit_tp={d.already_hit_tp}  "
+        f"hit_sl={d.already_hit_sl}\n"
+        f"  tpsl_fail={d.tpsl_fail}  "
+        f"rr_curr={d.rr_current_fail}  "
+        f"gate_fail={d.signal_gate_fail}\n"
+        f"  actionable_ok={d.actionable_ok}  "
         f"new_idea={d.new_idea}  "
         f"errors={d.errors}\n\n"
         f"<b>Since startup (total):</b>\n"
         f"  checked={t.symbols_checked}  "
         f"detector_none={t.detector_none}  "
-        f"stale={t.setup_stale}\n"
+        f"ctx_old={t.context_too_old}\n"
         f"  outside_zone={t.outside_entry_zone}  "
-        f"rr_fail={t.rr_fail}  "
+        f"hit_tp={t.already_hit_tp}  "
+        f"hit_sl={t.already_hit_sl}\n"
+        f"  rr_curr={t.rr_current_fail}  "
         f"gate_fail={t.signal_gate_fail}  "
+        f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates:</b>\n"
-        f"  Setup max age: {SETUP_MAX_AGE_HOURS}h\n"
+        f"<b>Current gates (Phase 8D):</b>\n"
+        f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
+        f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
+        f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
+        f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
-        f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
-        f"  Entry zone required: yes (price > 0)"
+        f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}"
     ))
 
 
@@ -3307,10 +3465,12 @@ async def keepalive_loop(app: web.Application) -> None:
             f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']}) | "
             f"Scan diag: checked={d.symbols_checked} "
             f"not_ready={d.symbols_not_ready} lock={d.active_idea_lock} "
-            f"detector_none={d.detector_none} stale={d.setup_stale} "
+            f"detector_none={d.detector_none} ctx_old={d.context_too_old} "
             f"price_miss={d.price_missing} outside_zone={d.outside_entry_zone} "
-            f"tpsl_fail={d.tpsl_fail} rr_fail={d.rr_fail} "
-            f"gate_fail={d.signal_gate_fail} new={d.new_idea} errors={d.errors}"
+            f"hit_tp={d.already_hit_tp} hit_sl={d.already_hit_sl} "
+            f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
+            f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
+            f"new={d.new_idea} errors={d.errors}"
         )
         # Reset last-cycle counters for the next keepalive window
         mkt.diag_last = ScanDiagnostics()
@@ -3343,7 +3503,7 @@ async def on_startup(app: web.Application) -> None:
         "🚀 Starting CryptoBot v18 — Weekly Swing "
         "(Phases 3–6 active · Phase 7 dry-run/hardening · "
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
-        "Phase 8C gate diagnostics)"
+        "Phase 8C gate diagnostics · Phase 8D actionable swing validation)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3414,9 +3574,10 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 5</b> ActiveIdea lifecycle: active ✅\n"
                 f"<b>Phase 6</b> Telegram signal formatting: active ✅\n"
                 f"<b>Phase 7</b> dry-run/config/diag hardening: active ✅\n"
-                f"<b>Phase 8A</b> freshness + entry-zone gate: active ✅\n"
+                f"<b>Phase 8A</b> entry-zone/current-price foundation: active ✅\n"
                 f"<b>Phase 8B.1</b> channel-safe Telegram send: active ✅\n"
-                f"<b>Phase 8C</b> gate diagnostics: active ✅\n\n"
+                f"<b>Phase 8C</b> gate diagnostics: active ✅\n"
+                f"<b>Phase 8D</b> actionable swing validation: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag"
     ))
