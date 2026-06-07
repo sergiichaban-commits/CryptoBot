@@ -15,6 +15,7 @@ Phase 8B implemented: Telegram reply keyboard · command_keyboard() · updated p
   Phase 8B.1 hotfix: removed reply_markup from channel sends · Tg.send failure logging
 Phase 8C implemented: ScanDiagnostics counters · keepalive/diag visibility · text cleanup
 Phase 8D implemented: validate_actionable_setup · SETUP_CONTEXT_MAX_DAYS · RR_FROM_CURRENT_PRICE · refined diag counters
+Phase 8E implemented: PendingSetup watchlist · /watchlist command · validate_actionable_setup reordering
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -922,6 +923,12 @@ class Market:
     diag_last:  "ScanDiagnostics" = field(default_factory=lambda: ScanDiagnostics())
     diag_total: "ScanDiagnostics" = field(default_factory=lambda: ScanDiagnostics())
 
+    # ── Phase 8E watchlist ────────────────────────────────────────────────────
+    # One PendingSetup per symbol.  Key = symbol string.
+    # A pending setup is a valid structural setup whose current price is outside
+    # the entry zone.  It does not generate a trade signal; it is informational.
+    pending_setups: Dict[str, "PendingSetup"] = field(default_factory=dict)
+
 
 @dataclass
 class ScanDiagnostics:
@@ -965,6 +972,44 @@ class ScanDiagnostics:
     actionable_ok:          int = 0
     new_idea:               int = 0
     errors:                 int = 0
+
+
+@dataclass
+class PendingSetup:
+    """
+    A valid structural setup whose current price is outside the entry zone.
+    Does NOT generate a trade signal — informational/watchlist only (Phase 8E).
+
+    Stored in Market.pending_setups[sym] (one per symbol, newest replaces old).
+    Cleared when the detector returns None, TP/SL was already touched, setup
+    context is too old, the symbol has an active idea, or price enters the zone
+    and a real signal fires.
+    """
+    symbol:         str
+    side:           str    # "LONG" | "SHORT"
+    setup_type:     str
+    score:          int
+
+    entry_low:      float
+    entry_high:     float
+    stop_loss:      float
+    tp1:            float
+    tp2:            float
+    rr_tp1:         float
+    rr_tp2:         float
+
+    current_price:  float
+    distance_pct:   float  # abs % distance from px to nearest entry boundary
+    distance_side:  str    # "BELOW_ENTRY_ZONE" | "ABOVE_ENTRY_ZONE" | "IN_ENTRY_ZONE"
+    reason:         str    # normally "outside_entry_zone"
+
+    setup_ts:       int    # ms timestamp of confirmation bar
+    setup_age_h:    int    # hours since confirmation bar
+    updated_at:     int    # unix seconds when this record was last written
+
+    regime:         str    # symbol-level regime
+    btc_regime:     str    # global BTC regime at time of update
+    invalidation:   str    # from SetupResult.invalidation
 
 
 @dataclass
@@ -2419,27 +2464,22 @@ def validate_actionable_setup(
     """
     Determine whether a detected setup is actionable at the current market price.
 
-    Separates structural context age (SETUP_CONTEXT_MAX_DAYS, default 30 days)
-    from the strict 48-hour SETUP_MAX_AGE_HOURS gate used in Phase 8A.
-    A valid swing structure may be identified from weeks of price action, but
-    the signal is only emitted when the setup is actionable *right now*.
+    Phase 8E reordering (safety improvement):
+    TP/SL bar scans now run BEFORE the outside_entry_zone check.
+    This prevents polluting the watchlist with setups whose TP or SL was
+    already hit even when the price happens to be outside the entry zone.
 
     Checks (in order):
-      1. context_too_old    — setup_ts = 0 or age > SETUP_CONTEXT_MAX_DAYS
-      2. price_missing      — current_price ≤ 0.0 (bars not loaded yet)
-      3. outside_entry_zone — price outside [entry_low, entry_high]  (when
-                              ENTRY_ZONE_REQUIRED is True)
-      4. already_hit_tp     — any 4H/1D bar since setup_ts touched TP1 or TP2
-      5. already_hit_sl     — any 4H/1D bar since setup_ts or current price
-                              touched / crossed stop_loss
-      6. bad geometry       — current_price on the wrong side of stop_loss
+      1. context_too_old       — setup_ts = 0 or age > SETUP_CONTEXT_MAX_DAYS
+      2. price_missing         — current_price ≤ 0.0
+      3. already_hit_tp / sl  — any 4H/1D bar since setup_ts touched target/stop
+      4. bad geometry          — current_price on the wrong side of stop_loss
+      5. outside_entry_zone    — price outside [entry_low, entry_high]
+                                 (only when ENTRY_ZONE_REQUIRED is True)
+      6. ok
 
     Returns (True, "ok") or (False, reason_string).
     Reason strings correspond to ScanDiagnostics field names.
-
-    Note: invalidated_since_setup is reserved for future structural invalidation
-    detection (e.g. retest failure).  Currently never returned; the SL check
-    covers the most important case.
     """
     side = result.side
 
@@ -2450,18 +2490,12 @@ def validate_actionable_setup(
     if age_ms > SETUP_CONTEXT_MAX_DAYS * 86_400_000:
         return False, "context_too_old"
 
-    # 2. Price availability (needed for zone and geometry checks)
+    # 2. Price availability
     if current_price <= 0.0:
         return False, "price_missing"
 
-    # 3. Entry zone (when required)
-    if ENTRY_ZONE_REQUIRED:
-        if not is_price_in_entry_zone(current_price, result.entry_low, result.entry_high):
-            return False, "outside_entry_zone"
-
-    # 4 & 5. Scan bars since setup_ts for TP/SL touches
-    #        Use 4H bars (more granular) then 1D for sweep.
-    #        Priority: TP2 hit > SL hit > TP1 hit (worst case surfaces first).
+    # 3. Scan bars since setup_ts for TP/SL touches (Phase 8E: before zone check)
+    #    Priority: TP2 hit > SL hit > TP1 hit (worst case surfaces first).
     for bars in (state.bars_4h, state.bars_1d):
         for bar in bars:
             if bar[B_TS] < result.setup_ts:
@@ -2481,11 +2515,17 @@ def validate_actionable_setup(
                 if bar[B_LOW] <= result.tp1:
                     return False, "already_hit_tp"
 
-    # 6. Geometry: current price must still be on the correct side of SL
+    # 4. Geometry: current price must still be on the correct side of SL
     if side == "LONG" and current_price <= result.stop_loss:
         return False, "already_hit_sl"
     if side == "SHORT" and current_price >= result.stop_loss:
         return False, "already_hit_sl"
+
+    # 5. Entry zone (when required) — after TP/SL checks so stale setups
+    #    don't appear as "outside_zone" pending items
+    if ENTRY_ZONE_REQUIRED:
+        if not is_price_in_entry_zone(current_price, result.entry_low, result.entry_high):
+            return False, "outside_entry_zone"
 
     return True, "ok"
 
@@ -2509,6 +2549,79 @@ def _diag_actionable_fail(
     elif reason == "invalidated_since_setup":
         d.invalidated_since_setup += 1; t.invalidated_since_setup += 1
 
+
+# ── Phase 8E watchlist helpers ────────────────────────────────────────────────
+
+def calc_distance_to_entry_zone(
+    price: float,
+    entry_low: float,
+    entry_high: float,
+) -> Tuple[float, str]:
+    """
+    Return (distance_pct, distance_side) describing how far the current price
+    is from the entry zone.
+
+      price < entry_low  → (pct_below, "BELOW_ENTRY_ZONE")
+      price > entry_high → (pct_above, "ABOVE_ENTRY_ZONE")
+      price in zone      → (0.0,       "IN_ENTRY_ZONE")
+      price ≤ 0          → (0.0,       "UNKNOWN")
+    """
+    if price <= 0.0:
+        return 0.0, "UNKNOWN"
+    if price < entry_low:
+        return round((entry_low - price) / price * 100.0, 2), "BELOW_ENTRY_ZONE"
+    if price > entry_high:
+        return round((price - entry_high) / price * 100.0, 2), "ABOVE_ENTRY_ZONE"
+    return 0.0, "IN_ENTRY_ZONE"
+
+
+def make_pending_setup(
+    sym: str,
+    state: SymbolState,
+    mkt: Market,
+    result: SetupResult,
+    current_price: float,
+    reason: str,
+) -> PendingSetup:
+    """Build a PendingSetup from the current scan context."""
+    dist_pct, dist_side = calc_distance_to_entry_zone(
+        current_price, result.entry_low, result.entry_high
+    )
+    age_h = int((now_ms() - result.setup_ts) / 3_600_000) if result.setup_ts > 0 else -1
+    return PendingSetup(
+        symbol        = sym,
+        side          = result.side,
+        setup_type    = result.setup_type,
+        score         = result.score,
+        entry_low     = result.entry_low,
+        entry_high    = result.entry_high,
+        stop_loss     = result.stop_loss,
+        tp1           = result.tp1,
+        tp2           = result.tp2,
+        rr_tp1        = result.rr_tp1,
+        rr_tp2        = result.rr_tp2,
+        current_price = current_price,
+        distance_pct  = dist_pct,
+        distance_side = dist_side,
+        reason        = reason,
+        setup_ts      = result.setup_ts,
+        setup_age_h   = age_h,
+        updated_at    = now_s(),
+        regime        = state.regime,
+        btc_regime    = mkt.btc_regime,
+        invalidation  = result.invalidation,
+    )
+
+
+def clear_pending_setup(mkt: Market, sym: str, reason: str = "") -> None:
+    """Remove a pending setup for a symbol, if one exists."""
+    if sym in mkt.pending_setups:
+        del mkt.pending_setups[sym]
+        logger.debug(
+            f"clear_pending_setup {sym}"
+            + (f" ({reason})" if reason else "")
+        )
+
 async def scan_symbol(
     sym: str,
     state: SymbolState,
@@ -2516,16 +2629,15 @@ async def scan_symbol(
     app: web.Application,
 ) -> None:
     """
-    Phase 5 / Phase 8C / Phase 8D: Full per-symbol scan pipeline.
+    Phase 5 / Phase 8C / Phase 8D / Phase 8E: Full per-symbol scan pipeline.
 
-    Phase 8D replaces the strict 48h is_setup_fresh gate with:
-      validate_actionable_setup() — checks context age (SETUP_CONTEXT_MAX_DAYS),
-      price zone (ENTRY_ZONE_REQUIRED), and whether TP/SL was already touched.
-    When RR_FROM_CURRENT_PRICE=True the result's rr_tp1/rr_tp2 are recalculated
-    from current market price before the RR gate and ActiveIdea creation.
-
-    Every exit point increments the appropriate ScanDiagnostics counter so
-    keepalive and /diag can explain why candidates did not become ideas.
+    Phase 8D: validate_actionable_setup replaces the strict 48h gate.
+    Phase 8E: pending setups (watchlist) tracked when price is outside zone.
+      - outside_entry_zone → PendingSetup created/updated in mkt.pending_setups.
+      - Any invalidating reason → pending cleared.
+      - Signal fires → pending cleared.
+      - Active idea exists → pending cleared.
+    Pending setups are INFORMATIONAL ONLY; they never trigger signals.
     """
     d = mkt.diag_last   # last-cycle counters (reset each keepalive)
     t = mkt.diag_total  # cumulative since startup
@@ -2544,6 +2656,7 @@ async def scan_symbol(
         if state.active_idea is not None:
             d.active_idea_lock += 1
             t.active_idea_lock += 1
+            clear_pending_setup(mkt, sym, "active_idea")
             return
 
         # ── Detector ──────────────────────────────────────────────────────────
@@ -2551,24 +2664,35 @@ async def scan_symbol(
         if result is None:
             d.detector_none += 1
             t.detector_none += 1
+            clear_pending_setup(mkt, sym, "detector_none")
             return
 
         # ── TP/SL engine ──────────────────────────────────────────────────────
         result = calc_swing_tpsl(result, state)
         if result.rr_tp2 <= 0.0:
-            # Degenerate geometry (risk ≤ 0 in calc_swing_tpsl)
             d.tpsl_fail += 1
             t.tpsl_fail += 1
+            clear_pending_setup(mkt, sym, "tpsl_fail")
             return
 
-        # ── Actionable validation (Phase 8D) ─────────────────────────────────
-        # Replaces: is_setup_fresh + price gate (Phase 8A).
-        # Checks: context age, price in zone, bars-since-setup for TP/SL hits.
+        # ── Actionable validation (Phase 8D / 8E) ────────────────────────────
         px = get_current_price(state)
         valid, reason = validate_actionable_setup(result, state, px)
         if not valid:
             _diag_actionable_fail(d, t, reason)
-            logger.debug(f"scan_symbol {sym}: actionable fail — {reason}")
+            if reason == "outside_entry_zone":
+                # Price is outside zone but setup is structurally valid — watchlist it
+                mkt.pending_setups[sym] = make_pending_setup(
+                    sym, state, mkt, result, px, reason
+                )
+                logger.debug(
+                    f"pending_setup updated {sym} {result.side} {result.setup_type} "
+                    f"dist={mkt.pending_setups[sym].distance_pct:.2f}% "
+                    f"{mkt.pending_setups[sym].distance_side}"
+                )
+            else:
+                # Setup is invalidated for a real reason — clear any stale pending
+                clear_pending_setup(mkt, sym, reason)
             return
 
         d.actionable_ok += 1
@@ -2588,6 +2712,7 @@ async def scan_symbol(
             )
             d.rr_current_fail += 1
             t.rr_current_fail += 1
+            clear_pending_setup(mkt, sym, "rr_current_fail")
             return
 
         # ── Signal gate (score floor / regime / BTC regime) ───────────────────
@@ -2598,9 +2723,11 @@ async def scan_symbol(
             )
             d.signal_gate_fail += 1
             t.signal_gate_fail += 1
+            clear_pending_setup(mkt, sym, "signal_gate_fail")
             return
 
         # ── Create ActiveIdea ─────────────────────────────────────────────────
+        clear_pending_setup(mkt, sym, "signal_firing")   # no longer pending
         now   = now_s()
         side  = result.side
         idea  = ActiveIdea(
@@ -3177,6 +3304,8 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_config(app, cid)
                 elif text == "/diag":
                     await _cmd_diag(app, cid)
+                elif text in ("/watchlist", "/pending"):
+                    await _cmd_watchlist(app, cid)
         except Exception:
             await asyncio.sleep(5)
 
@@ -3199,7 +3328,8 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<i>{html.escape(mkt.btc_regime_reason)}</i>\n\n"
         f"<b>Universe:</b> {len(mkt.symbols)} symbols\n"
         f"<b>Ready:</b> {ready}/{len(mkt.symbols)}\n"
-        f"<b>Active ideas:</b> {active}\n\n"
+        f"<b>Active ideas:</b> {active}\n"
+        f"<b>Pending setups:</b> {len(mkt.pending_setups)}\n\n"
         f"<b>Ideas:</b> {stats['total']} total  "
         f"(L:{stats['long']} / S:{stats['short']})\n"
         f"TP1:{stats['tp1_hit']}  TP2:{stats['tp2_hit']}  "
@@ -3207,7 +3337,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist"
     ))
 
 
@@ -3330,6 +3460,60 @@ async def _cmd_close(app: web.Application, cid: int, sym: str) -> None:
         ))
 
 
+async def _cmd_watchlist(app: web.Application, cid: int) -> None:
+    """
+    /watchlist — show pending setups sorted by distance to entry zone (ascending).
+    Pending setups are valid structural setups where current price is outside
+    the entry zone.  They are informational only; no trade signal is sent.
+    """
+    tg:  Tg     = app["tg"]
+    mkt: Market = app["mkt"]
+
+    if not mkt.pending_setups:
+        await tg.send(cid, "📭 <b>No pending setups.</b>")
+        return
+
+    # Sort by distance ascending (closest to entry zone first)
+    setups = sorted(mkt.pending_setups.values(), key=lambda p: p.distance_pct)
+    total  = len(setups)
+    shown  = setups[:10]
+
+    lines = [f"📌 <b>Pending Setups / Watchlist</b>  ({total} total)\n"]
+    for i, p in enumerate(shown, 1):
+        side_e      = "🟢" if p.side == "LONG" else "🔴"
+        sym_pretty  = p.symbol.replace("USDT", "/USDT")
+        setup_label = _SETUP_LABELS.get(p.setup_type, p.setup_type.replace("_", " "))
+        regime_e    = _regime_emoji(p.regime)
+
+        if p.distance_side == "BELOW_ENTRY_ZONE":
+            dist_str = (f"<b>{p.distance_pct:.2f}% below</b> entry zone "
+                        f"— needs +{p.distance_pct:.2f}% move to entry")
+        elif p.distance_side == "ABOVE_ENTRY_ZONE":
+            dist_str = (f"<b>{p.distance_pct:.2f}% above</b> entry zone "
+                        f"— needs -{p.distance_pct:.2f}% move to entry")
+        else:
+            dist_str = "in entry zone"
+
+        lines.append(
+            f"{i}) {side_e} <b>{sym_pretty} {p.side}</b> — {html.escape(setup_label)}\n"
+            f"   Score: {p.score}/100 | Regime: {regime_e} {p.regime}\n"
+            f"   Current: <code>{p.current_price:.5f}</code>  "
+            f"Distance: {dist_str}\n"
+            f"   Entry: <code>{p.entry_low:.5f} – {p.entry_high:.5f}</code>\n"
+            f"   SL: <code>{p.stop_loss:.5f}</code>  "
+            f"TP1: <code>{p.tp1:.5f}</code> (RR {p.rr_tp1:.2f})  "
+            f"TP2: <code>{p.tp2:.5f}</code> (RR {p.rr_tp2:.2f})\n"
+            f"   Setup age: {p.setup_age_h}h  "
+            f"Updated: {int(now_s()-p.updated_at)}s ago\n"
+            f"   <i>Waiting for price to return to entry zone</i>"
+        )
+
+    if total > 10:
+        lines.append(f"\n<i>Showing 10 of {total} pending setups.</i>")
+
+    await tg.send(cid, "\n\n".join(lines))
+
+
 async def _cmd_config(app: web.Application, cid: int) -> None:
     """Show sanitised bot configuration — no token or raw chat IDs exposed."""
     tg:  Tg     = app["tg"]
@@ -3353,7 +3537,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Setup context max:</b> {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
-        f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}"
+        f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
+        f"<b>Watchlist:</b> enabled"
     ))
 
 
@@ -3374,6 +3559,27 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
 
     d = mkt.diag_last    # last keepalive interval
     t = mkt.diag_total   # cumulative since startup
+    pending_n = len(mkt.pending_setups)
+
+    # Pending summary block
+    if pending_n > 0:
+        closest = sorted(mkt.pending_setups.values(), key=lambda p: p.distance_pct)[:5]
+        p_lines = [f"<b>Closest pending ({min(pending_n,5)} of {pending_n}):</b>"]
+        for i, p in enumerate(closest, 1):
+            sym_s   = p.symbol.replace("USDT", "")
+            setup_s = (p.setup_type
+                       .replace("BREAKOUT_RETEST", "BR")
+                       .replace("TREND_PULLBACK", "TP")
+                       .replace("LIQUIDITY_SWEEP", "LS"))
+            p_lines.append(
+                f"  {i}. {sym_s} {p.side} {setup_s} "
+                f"dist={p.distance_pct:.2f}% "
+                f"px={p.current_price:.4f} "
+                f"zone={p.entry_low:.4f}–{p.entry_high:.4f}"
+            )
+        pending_block = "\n".join(p_lines) + "\n\n"
+    else:
+        pending_block = ""
 
     await tg.send(cid, (
         f"🔬 <b>Diagnostics</b>\n\n"
@@ -3381,9 +3587,11 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Ready:</b> {ready}/{len(mkt.symbols)}\n"
         f"<b>Active ideas:</b> {active}\n"
+        f"<b>Pending setups:</b> {pending_n}\n"
         f"<b>BTC regime:</b> {_regime_emoji(mkt.btc_regime)} {mkt.btc_regime}\n"
         f"<b>BTC last scan:</b> {btc_scan_ago}\n"
         f"<b>Not ready (≤10):</b> {nr_str}\n\n"
+        f"{pending_block}"
         f"<b>Last-cycle scan (since keepalive reset):</b>\n"
         f"  checked={d.symbols_checked}  "
         f"not_ready={d.symbols_not_ready}  "
@@ -3411,13 +3619,14 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D):</b>\n"
+        f"<b>Current gates (Phase 8D/8E):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
-        f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}"
+        f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
+        f"  Watchlist: enabled"
     ))
 
 
@@ -3459,6 +3668,7 @@ async def keepalive_loop(app: web.Application) -> None:
             f"BTC: {mkt.btc_regime} | "
             f"Ready: {ready}/{len(mkt.symbols)} | "
             f"Active ideas: {active} | "
+            f"Pending: {len(mkt.pending_setups)} | "
             f"Polls: {mkt.poll_count} | "
             f"Last poll: {poll_ago}s ago | "
             f"Ideas: {mkt.signal_stats['total']} "
@@ -3503,7 +3713,8 @@ async def on_startup(app: web.Application) -> None:
         "🚀 Starting CryptoBot v18 — Weekly Swing "
         "(Phases 3–6 active · Phase 7 dry-run/hardening · "
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
-        "Phase 8C gate diagnostics · Phase 8D actionable swing validation)"
+        "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
+        "Phase 8E pending setup watchlist)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3577,9 +3788,10 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8A</b> entry-zone/current-price foundation: active ✅\n"
                 f"<b>Phase 8B.1</b> channel-safe Telegram send: active ✅\n"
                 f"<b>Phase 8C</b> gate diagnostics: active ✅\n"
-                f"<b>Phase 8D</b> actionable swing validation: active ✅\n\n"
+                f"<b>Phase 8D</b> actionable swing validation: active ✅\n"
+                f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag"
+                f"/close SYMBOL /config /diag /watchlist"
     ))
 
 
