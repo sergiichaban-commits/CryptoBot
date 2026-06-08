@@ -18,6 +18,7 @@ Phase 8D implemented: validate_actionable_setup · SETUP_CONTEXT_MAX_DAYS · RR_
 Phase 8E implemented: PendingSetup watchlist · /watchlist command · validate_actionable_setup reordering
 Phase 8F implemented: CandidateEval · collect_setup_candidates · choose_best_candidate · evaluate_candidate · multi-candidate scan_symbol
 Phase 8G implemented: CandidateDebug · /candidates command · dead-candidate diagnostics buffer
+Phase 8H implemented: LIQUIDITY_SWEEP_MAX_AGE_HOURS · is_liquidity_sweep_recent · LS recency gate in evaluate_candidate
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -85,6 +86,10 @@ ENTRY_ZONE_REQUIRED       = _bool_env("ENTRY_ZONE_REQUIRED",     True)
 RR_FROM_CURRENT_PRICE     = _bool_env("RR_FROM_CURRENT_PRICE",   True)
 # Max DEAD candidate debug records kept in memory (diagnostics only, not a trading param).
 CANDIDATE_DEBUG_MAX       = int(os.getenv("CANDIDATE_DEBUG_MAX", "100"))
+# Phase 8H: Liquidity Sweep confirmation must be at most this old to be actionable.
+# This is a STRICTER gate than SETUP_CONTEXT_MAX_DAYS (30d); it applies only to LS.
+# Default 96h = 4 days.  BR and TP are not affected.
+LIQUIDITY_SWEEP_MAX_AGE_HOURS = int(os.getenv("LIQUIDITY_SWEEP_MAX_AGE_HOURS", "96"))
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 UNIVERSE: List[str] = [
@@ -995,6 +1000,8 @@ class ScanDiagnostics:
     actionable_ok:          int = 0
     new_idea:               int = 0
     errors:                 int = 0
+    # Phase 8H: LS candidates too old for the LS-specific freshness gate
+    liquidity_sweep_too_old: int = 0
 
 
 @dataclass
@@ -2637,6 +2644,8 @@ def _diag_actionable_fail(
         d.rr_current_fail += 1; t.rr_current_fail += 1
     elif reason == "signal_gate_fail":
         d.signal_gate_fail += 1; t.signal_gate_fail += 1
+    elif reason == "liquidity_sweep_too_old":
+        d.liquidity_sweep_too_old += 1; t.liquidity_sweep_too_old += 1
     else:
         logger.debug(f"_diag_actionable_fail: unhandled reason '{reason}'")
 
@@ -2714,7 +2723,29 @@ def clear_pending_setup(mkt: Market, sym: str, reason: str = "") -> None:
         )
 
 
-# ── Phase 8G dead-candidate diagnostics helpers ───────────────────────────────
+# ── Phase 8H: Liquidity Sweep recency helpers ─────────────────────────────────
+
+def is_liquidity_sweep_recent(result: SetupResult) -> bool:
+    """
+    Return True when the candidate is NOT a Liquidity Sweep, or when it IS a
+    Liquidity Sweep whose confirmation bar is within LIQUIDITY_SWEEP_MAX_AGE_HOURS.
+
+    This is a STRICTER gate than SETUP_CONTEXT_MAX_DAYS (30 days):
+      BR and TP are not affected (always return True here).
+      LS with setup_ts = 0 is treated as stale (False).
+    """
+    if result.setup_type != "LIQUIDITY_SWEEP":
+        return True
+    if result.setup_ts <= 0:
+        return False
+    return (now_ms() - result.setup_ts) <= LIQUIDITY_SWEEP_MAX_AGE_HOURS * 3_600_000
+
+
+def liquidity_sweep_age_h(result: SetupResult) -> int:
+    """Return hours since the LS confirmation bar, or -1 when setup_ts is unknown."""
+    if result.setup_ts <= 0:
+        return -1
+    return int((now_ms() - result.setup_ts) / 3_600_000)
 
 def add_candidate_debug(mkt: Market, item: CandidateDebug) -> None:
     """Append a CandidateDebug record and trim to CANDIDATE_DEBUG_MAX."""
@@ -2839,6 +2870,13 @@ def evaluate_candidate(
     result = calc_swing_tpsl(raw_result, state)
     if result.rr_tp2 <= 0.0:
         return CandidateEval(result, "DEAD", "tpsl_fail", candidate_source=source)
+
+    # 1b. Phase 8H: Liquidity Sweep recency gate (stricter than SETUP_CONTEXT_MAX_DAYS)
+    #     Applied before TP/SL bar-scan so stale LS shows as ls_old, not hit_tp/hit_sl.
+    if not is_liquidity_sweep_recent(result):
+        return CandidateEval(
+            result, "DEAD", "liquidity_sweep_too_old", candidate_source=source
+        )
 
     # 2. Current price
     px = get_current_price(state)
@@ -3582,7 +3620,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency"
     ))
 
 
@@ -3711,15 +3749,16 @@ _SETUP_ABBREV = {
     "LIQUIDITY_SWEEP": "LS",
 }
 _REASON_ABBREV = {
-    "already_hit_tp":       "hit_tp",
-    "already_hit_sl":       "hit_sl",
-    "outside_entry_zone":   "outside_zone",
-    "rr_current_fail":      "rr_curr",
-    "signal_gate_fail":     "gate_fail",
-    "tpsl_fail":            "tpsl_fail",
-    "context_too_old":      "ctx_old",
-    "price_missing":        "price_miss",
-    "invalidated_since_setup": "invalidated",
+    "already_hit_tp":           "hit_tp",
+    "already_hit_sl":           "hit_sl",
+    "outside_entry_zone":       "outside_zone",
+    "rr_current_fail":          "rr_curr",
+    "signal_gate_fail":         "gate_fail",
+    "tpsl_fail":                "tpsl_fail",
+    "context_too_old":          "ctx_old",
+    "price_missing":            "price_miss",
+    "invalidated_since_setup":  "invalidated",
+    "liquidity_sweep_too_old":  "ls_old",
 }
 
 
@@ -3865,6 +3904,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
+        f"<b>Liquidity Sweep max age:</b> {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h\n"
         f"<b>Watchlist:</b> enabled\n"
         f"<b>Candidate selection:</b> enabled\n"
         f"<b>Dead candidate diagnostics:</b> enabled\n"
@@ -3964,6 +4004,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"hit_sl={d.already_hit_sl}\n"
         f"  tpsl_fail={d.tpsl_fail}  "
         f"rr_curr={d.rr_current_fail}  "
+        f"ls_old={d.liquidity_sweep_too_old}  "
         f"gate_fail={d.signal_gate_fail}\n"
         f"  actionable_ok={d.actionable_ok}  "
         f"new_idea={d.new_idea}  "
@@ -3977,12 +4018,15 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"hit_tp={t.already_hit_tp}  "
         f"hit_sl={t.already_hit_sl}\n"
         f"  rr_curr={t.rr_current_fail}  "
+        f"ls_old={t.liquidity_sweep_too_old}  "
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D/8E):</b>\n"
+        f"<b>Current gates (Phase 8D/8E/8H):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
+        f"  LS max age: {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h  "
+        f"(BR/TP not restricted)\n"
         f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
@@ -4046,6 +4090,7 @@ async def keepalive_loop(app: web.Application) -> None:
             f"price_miss={d.price_missing} outside_zone={d.outside_entry_zone} "
             f"hit_tp={d.already_hit_tp} hit_sl={d.already_hit_sl} "
             f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
+            f"ls_old={d.liquidity_sweep_too_old} "
             f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
             f"new={d.new_idea} errors={d.errors}"
         )
@@ -4082,7 +4127,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
         "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
         "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
-        "Phase 8G dead candidate diagnostics)"
+        "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4159,7 +4204,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8D</b> actionable swing validation: active ✅\n"
                 f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n"
                 f"<b>Phase 8F</b> actionable candidate selection: active ✅\n"
-                f"<b>Phase 8G</b> dead candidate diagnostics: active ✅\n\n"
+                f"<b>Phase 8G</b> dead candidate diagnostics: active ✅\n"
+                f"<b>Phase 8H</b> Liquidity Sweep recency gate: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
