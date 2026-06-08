@@ -16,6 +16,7 @@ Phase 8B implemented: Telegram reply keyboard · command_keyboard() · updated p
 Phase 8C implemented: ScanDiagnostics counters · keepalive/diag visibility · text cleanup
 Phase 8D implemented: validate_actionable_setup · SETUP_CONTEXT_MAX_DAYS · RR_FROM_CURRENT_PRICE · refined diag counters
 Phase 8E implemented: PendingSetup watchlist · /watchlist command · validate_actionable_setup reordering
+Phase 8F implemented: CandidateEval · collect_setup_candidates · choose_best_candidate · evaluate_candidate · multi-candidate scan_symbol
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -938,14 +939,23 @@ class ScanDiagnostics:
       diag_last  — reset every keepalive cycle; shows what just happened.
       diag_total — cumulative since startup; useful for long-term trends.
 
-    Counter semantics (mirrors the scan_symbol / validate_actionable_setup flow):
+    Phase 8F note: reason counters (hit_tp, hit_sl, rr_current_fail, …) are
+    now CANDIDATE-level, not symbol-level.  A single scan_symbol() call may
+    evaluate up to 3 candidates (BR / TP / LS) and increment each counter once
+    per candidate, so totals may exceed symbols_checked.
+
+    Counter semantics:
       symbols_checked       — entered scan_symbol
       symbols_not_ready     — symbol state not ready yet
       active_idea_lock      — symbol already has an active idea
-      detector_none         — run_setup_pipeline() returned None
+      detector_none         — collect_setup_candidates() returned empty list
+      candidates_total      — candidates evaluated (across all symbols)
+      candidates_actionable — candidates that passed all gates
+      candidates_pending    — candidates alive but price outside entry zone
+      candidates_dead       — candidates rejected by TP/SL/context/RR/gate
       context_too_old       — setup_ts=0 or age > SETUP_CONTEXT_MAX_DAYS
       price_missing         — get_current_price() returned 0.0
-      outside_entry_zone    — price known but outside [entry_low, entry_high]
+      outside_entry_zone    — price outside zone (pending candidate)
       already_hit_tp        — TP1 or TP2 already touched since setup_ts
       already_hit_sl        — SL already touched since setup_ts
       invalidated_since_setup — setup explicitly invalidated since setup_ts
@@ -960,6 +970,10 @@ class ScanDiagnostics:
     symbols_not_ready:      int = 0
     active_idea_lock:       int = 0
     detector_none:          int = 0
+    candidates_total:       int = 0
+    candidates_actionable:  int = 0
+    candidates_pending:     int = 0
+    candidates_dead:        int = 0
     context_too_old:        int = 0
     price_missing:          int = 0
     outside_entry_zone:     int = 0
@@ -1041,6 +1055,32 @@ class SetupResult:
     # 0 = unknown (detectors built before Phase 8A, or test fixtures without a bar).
     # is_setup_fresh() returns False when setup_ts == 0.
     setup_ts:     int = 0
+
+
+@dataclass
+class CandidateEval:
+    """
+    Result of evaluating a single SetupResult through the Phase 8F pipeline.
+
+    Phase 8F collects up to 3 candidates (one per detector) and evaluates each
+    independently, then chooses the best actionable one.
+
+    status:
+      "ACTIONABLE" — all gates pass; ready to fire a signal
+      "PENDING"    — setup is alive but price outside entry zone; goes to watchlist
+      "DEAD"       — setup is stale, invalidated, or fails an early gate
+      "NONE"       — no detector result (result is None)
+
+    reason corresponds to the first failing gate or "ok" for actionable.
+    """
+    result:          Optional[SetupResult]
+    status:          str    # "ACTIONABLE" | "PENDING" | "DEAD" | "NONE"
+    reason:          str    # "ok" | gate name that failed
+    rr_ok:           bool = False
+    signal_ok:       bool = False
+    actionable_ok:   bool = False
+    pending_ok:      bool = False
+    candidate_source: str = ""   # "BREAKOUT_RETEST" | "TREND_PULLBACK" | "LIQUIDITY_SWEEP"
 
 
 # =============================================================================
@@ -2548,6 +2588,14 @@ def _diag_actionable_fail(
         d.already_hit_sl += 1; t.already_hit_sl += 1
     elif reason == "invalidated_since_setup":
         d.invalidated_since_setup += 1; t.invalidated_since_setup += 1
+    elif reason == "tpsl_fail":
+        d.tpsl_fail += 1; t.tpsl_fail += 1
+    elif reason == "rr_current_fail":
+        d.rr_current_fail += 1; t.rr_current_fail += 1
+    elif reason == "signal_gate_fail":
+        d.signal_gate_fail += 1; t.signal_gate_fail += 1
+    else:
+        logger.debug(f"_diag_actionable_fail: unhandled reason '{reason}'")
 
 
 # ── Phase 8E watchlist helpers ────────────────────────────────────────────────
@@ -2622,6 +2670,115 @@ def clear_pending_setup(mkt: Market, sym: str, reason: str = "") -> None:
             + (f" ({reason})" if reason else "")
         )
 
+# ── Phase 8F helpers ─────────────────────────────────────────────────────────
+
+def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
+    """
+    Run all three detectors and return every candidate whose score meets the
+    floor for the current regime.
+
+    Score floor (per regime, same rule as run_setup_pipeline):
+      NEUTRAL regime → score >= MIN_SCORE_CHOP  (85)
+      Other regimes  → score >= MIN_SCORE_NORMAL (55)
+
+    Returns at most 3 SetupResult objects (one per detector type).
+    Order: [BREAKOUT_RETEST, TREND_PULLBACK, LIQUIDITY_SWEEP] (skipping None).
+    """
+    floor = MIN_SCORE_CHOP if state.regime == "NEUTRAL" else MIN_SCORE_NORMAL
+    candidates: List[SetupResult] = []
+    for detector in (detect_breakout_retest, detect_trend_pullback, detect_liquidity_sweep):
+        r = detector(state)
+        if r is not None and r.score >= floor:
+            candidates.append(r)
+    return candidates
+
+
+def choose_best_candidate(candidates: List[SetupResult]) -> Optional[SetupResult]:
+    """
+    Apply the original run_setup_pipeline priority logic to a pre-filtered list.
+
+    Priority rules (preserved from run_setup_pipeline spec):
+      1. BREAKOUT_RETEST beats TREND_PULLBACK by default.
+      2. LIQUIDITY_SWEEP overrides the leader only when
+         ls.score >= LIQUIDITY_SWEEP_PRIORITY_SCORE AND ls.score > leader.score.
+      3. LIQUIDITY_SWEEP is selected as sole candidate when no BR/TP exists
+         and ls.score >= MIN_SCORE_NORMAL.
+    """
+    if not candidates:
+        return None
+
+    br = next((c for c in candidates if c.setup_type == "BREAKOUT_RETEST"), None)
+    tp = next((c for c in candidates if c.setup_type == "TREND_PULLBACK"),   None)
+    ls = next((c for c in candidates if c.setup_type == "LIQUIDITY_SWEEP"),  None)
+
+    winner = br or tp   # BR takes priority; fallback to TP
+
+    if ls is not None:
+        can_override = ls.score >= LIQUIDITY_SWEEP_PRIORITY_SCORE
+        if can_override and (winner is None or ls.score > winner.score):
+            winner = ls
+        elif winner is None and ls.score >= MIN_SCORE_NORMAL:
+            winner = ls
+
+    return winner
+
+
+def evaluate_candidate(
+    sym: str,
+    state: SymbolState,
+    mkt: Market,
+    raw_result: SetupResult,
+) -> CandidateEval:
+    """
+    Evaluate a single detector result through the full gate sequence.
+
+    Returns a CandidateEval describing whether this candidate is ACTIONABLE,
+    PENDING (alive but price outside zone), or DEAD (failed an early gate).
+
+    The score floor is NOT re-applied here; collect_setup_candidates() already
+    filtered by floor.  This function applies structural and market gates only.
+    """
+    source = raw_result.setup_type
+
+    # 1. TP/SL geometry via calc_swing_tpsl
+    result = calc_swing_tpsl(raw_result, state)
+    if result.rr_tp2 <= 0.0:
+        return CandidateEval(result, "DEAD", "tpsl_fail", candidate_source=source)
+
+    # 2. Current price
+    px = get_current_price(state)
+
+    # 3. Actionable validation
+    valid, reason = validate_actionable_setup(result, state, px)
+    if not valid:
+        if reason == "outside_entry_zone":
+            return CandidateEval(
+                result, "PENDING", "outside_entry_zone",
+                pending_ok=True, candidate_source=source
+            )
+        return CandidateEval(result, "DEAD", reason, candidate_source=source)
+
+    # 4. Update RR from current price
+    if RR_FROM_CURRENT_PRICE and px > 0.0:
+        rr1_px, rr2_px = calc_rr_from_current(
+            result.side, px, result.stop_loss, result.tp1, result.tp2
+        )
+        result = _dc_replace(result, rr_tp1=rr1_px, rr_tp2=rr2_px)
+
+    # 5. RR gate
+    if not passes_rr_gate(result, sym):
+        return CandidateEval(result, "DEAD", "rr_current_fail", rr_ok=False, candidate_source=source)
+
+    # 6. Signal gate (score/regime/BTC)
+    if not can_signal(sym, state, mkt, result):
+        return CandidateEval(result, "DEAD", "signal_gate_fail", rr_ok=True, candidate_source=source)
+
+    return CandidateEval(
+        result, "ACTIONABLE", "ok",
+        rr_ok=True, signal_ok=True, actionable_ok=True, candidate_source=source
+    )
+
+
 async def scan_symbol(
     sym: str,
     state: SymbolState,
@@ -2629,15 +2786,20 @@ async def scan_symbol(
     app: web.Application,
 ) -> None:
     """
-    Phase 5 / Phase 8C / Phase 8D / Phase 8E: Full per-symbol scan pipeline.
+    Phase 5 / Phase 8C / Phase 8D / Phase 8E / Phase 8F.
 
-    Phase 8D: validate_actionable_setup replaces the strict 48h gate.
-    Phase 8E: pending setups (watchlist) tracked when price is outside zone.
-      - outside_entry_zone → PendingSetup created/updated in mkt.pending_setups.
-      - Any invalidating reason → pending cleared.
-      - Signal fires → pending cleared.
-      - Active idea exists → pending cleared.
-    Pending setups are INFORMATIONAL ONLY; they never trigger signals.
+    Phase 8F change (candidate-aware selection):
+    Instead of picking one winner and then validating it, all three detectors
+    are run in parallel; every candidate is evaluated independently through the
+    full gate sequence.  The best ACTIONABLE candidate fires a signal; the best
+    PENDING candidate (alive but price outside zone) updates the watchlist;
+    dead/stale candidates are individually counted in diagnostics.
+
+    This prevents a dead high-priority setup (e.g. BR already hit TP) from
+    blocking a live lower-priority setup (e.g. LS still in zone).
+
+    Diagnostics note: reason counters (hit_tp, hit_sl, …) are candidate-level,
+    so they may exceed symbols_checked when multiple candidates are evaluated.
     """
     d = mkt.diag_last   # last-cycle counters (reset each keepalive)
     t = mkt.diag_total  # cumulative since startup
@@ -2659,123 +2821,104 @@ async def scan_symbol(
             clear_pending_setup(mkt, sym, "active_idea")
             return
 
-        # ── Detector ──────────────────────────────────────────────────────────
-        result = run_setup_pipeline(state)
-        if result is None:
+        # ── Phase 8F: collect all viable candidates ────────────────────────────
+        candidates = collect_setup_candidates(state)
+        if not candidates:
             d.detector_none += 1
             t.detector_none += 1
             clear_pending_setup(mkt, sym, "detector_none")
             return
 
-        # ── TP/SL engine ──────────────────────────────────────────────────────
-        result = calc_swing_tpsl(result, state)
-        if result.rr_tp2 <= 0.0:
-            d.tpsl_fail += 1
-            t.tpsl_fail += 1
-            clear_pending_setup(mkt, sym, "tpsl_fail")
+        # ── Evaluate each candidate independently ─────────────────────────────
+        evals: List[CandidateEval] = [
+            evaluate_candidate(sym, state, mkt, c) for c in candidates
+        ]
+
+        # Update diagnostics — candidate-level (may exceed symbols_checked)
+        for ev in evals:
+            d.candidates_total += 1; t.candidates_total += 1
+            if ev.status == "ACTIONABLE":
+                d.candidates_actionable += 1; t.candidates_actionable += 1
+                d.actionable_ok += 1;         t.actionable_ok += 1
+            elif ev.status == "PENDING":
+                d.candidates_pending += 1; t.candidates_pending += 1
+                d.outside_entry_zone += 1;  t.outside_entry_zone += 1
+            else:  # DEAD
+                d.candidates_dead += 1; t.candidates_dead += 1
+                _diag_actionable_fail(d, t, ev.reason)
+
+        # ── Prefer ACTIONABLE candidate ───────────────────────────────────────
+        actionable = [ev.result for ev in evals if ev.status == "ACTIONABLE" and ev.result]
+        if actionable:
+            result = choose_best_candidate(actionable)
+            if result is None:
+                clear_pending_setup(mkt, sym, "no_actionable_winner")
+                return
+
+            clear_pending_setup(mkt, sym, "signal_firing")
+            px   = get_current_price(state)
+            now  = now_s()
+            side = result.side
+            idea = ActiveIdea(
+                symbol                  = sym,
+                side                    = side,
+                setup_type              = result.setup_type,
+                setup_score             = result.score,
+                entry_low               = result.entry_low,
+                entry_high              = result.entry_high,
+                stop_loss               = result.stop_loss,
+                tp1                     = result.tp1,
+                tp2                     = result.tp2,
+                rr_tp1                  = result.rr_tp1,
+                rr_tp2                  = result.rr_tp2,
+                status                  = "ACTIVE",
+                emitted_at              = now,
+                expires_at              = now + MAX_IDEA_DURATION_DAYS * 86400,
+                invalidation            = result.invalidation,
+                current_price_at_signal = px,
+                setup_ts                = result.setup_ts,
+            )
+            state.active_idea    = idea
+            state.last_signal_ts = now
+            mkt.signal_stats["total"] += 1
+            if side == "LONG":
+                mkt.signal_stats["long"]  += 1
+            else:
+                mkt.signal_stats["short"] += 1
+            d.new_idea += 1
+            t.new_idea += 1
+            logger.info(
+                f"NEW IDEA {sym} {side} {result.setup_type} score={result.score} "
+                f"entry={result.entry_low:.4f}–{result.entry_high:.4f} "
+                f"sl={result.stop_loss:.4f} "
+                f"tp1={result.tp1:.4f}(RR{result.rr_tp1:.2f}) "
+                f"tp2={result.tp2:.4f}(RR{result.rr_tp2:.2f})"
+            )
+            try:
+                await send_signal(app, idea, state)
+            except Exception as e:
+                logger.warning(f"send_signal failed {sym}: {e}")
+                await report_error(app, f"send_signal/{sym}", e)
             return
 
-        # ── Actionable validation (Phase 8D / 8E) ────────────────────────────
-        px = get_current_price(state)
-        valid, reason = validate_actionable_setup(result, state, px)
-        if not valid:
-            _diag_actionable_fail(d, t, reason)
-            if reason == "outside_entry_zone":
-                # Price is outside zone but setup is structurally valid — watchlist it
+        # ── No actionable — check for pending (alive but outside zone) ────────
+        pending = [ev.result for ev in evals if ev.status == "PENDING" and ev.result]
+        if pending:
+            best_pending = choose_best_candidate(pending)
+            if best_pending is not None:
+                px = get_current_price(state)
                 mkt.pending_setups[sym] = make_pending_setup(
-                    sym, state, mkt, result, px, reason
+                    sym, state, mkt, best_pending, px, "outside_entry_zone"
                 )
                 logger.debug(
-                    f"pending_setup updated {sym} {result.side} {result.setup_type} "
-                    f"dist={mkt.pending_setups[sym].distance_pct:.2f}% "
+                    f"pending_setup updated {sym} "
+                    f"{mkt.pending_setups[sym].distance_pct:.2f}% "
                     f"{mkt.pending_setups[sym].distance_side}"
                 )
-            else:
-                # Setup is invalidated for a real reason — clear any stale pending
-                clear_pending_setup(mkt, sym, reason)
             return
 
-        d.actionable_ok += 1
-        t.actionable_ok += 1
-
-        # ── Optional: update RR from current price ────────────────────────────
-        if RR_FROM_CURRENT_PRICE and px > 0.0:
-            rr1_px, rr2_px = calc_rr_from_current(
-                result.side, px, result.stop_loss, result.tp1, result.tp2
-            )
-            result = _dc_replace(result, rr_tp1=rr1_px, rr_tp2=rr2_px)
-
-        # ── RR gate ───────────────────────────────────────────────────────────
-        if not passes_rr_gate(result, sym):
-            logger.debug(
-                f"scan_symbol {sym}: RR gate fail rr_tp2={result.rr_tp2:.2f}"
-            )
-            d.rr_current_fail += 1
-            t.rr_current_fail += 1
-            clear_pending_setup(mkt, sym, "rr_current_fail")
-            return
-
-        # ── Signal gate (score floor / regime / BTC regime) ───────────────────
-        if not can_signal(sym, state, mkt, result):
-            logger.debug(
-                f"scan_symbol {sym}: {result.setup_type} {result.side} "
-                f"score={result.score} gate=FAIL"
-            )
-            d.signal_gate_fail += 1
-            t.signal_gate_fail += 1
-            clear_pending_setup(mkt, sym, "signal_gate_fail")
-            return
-
-        # ── Create ActiveIdea ─────────────────────────────────────────────────
-        clear_pending_setup(mkt, sym, "signal_firing")   # no longer pending
-        now   = now_s()
-        side  = result.side
-        idea  = ActiveIdea(
-            symbol                  = sym,
-            side                    = side,
-            setup_type              = result.setup_type,
-            setup_score             = result.score,
-            entry_low               = result.entry_low,
-            entry_high              = result.entry_high,
-            stop_loss               = result.stop_loss,
-            tp1                     = result.tp1,
-            tp2                     = result.tp2,
-            rr_tp1                  = result.rr_tp1,
-            rr_tp2                  = result.rr_tp2,
-            status                  = "ACTIVE",
-            emitted_at              = now,
-            expires_at              = now + MAX_IDEA_DURATION_DAYS * 86400,
-            invalidation            = result.invalidation,
-            current_price_at_signal = px,
-            setup_ts                = result.setup_ts,
-        )
-
-        state.active_idea    = idea
-        state.last_signal_ts = now
-
-        mkt.signal_stats["total"] += 1
-        if side == "LONG":
-            mkt.signal_stats["long"]  += 1
-        else:
-            mkt.signal_stats["short"] += 1
-
-        d.new_idea += 1
-        t.new_idea += 1
-
-        logger.info(
-            f"NEW IDEA {sym} {side} {result.setup_type} score={result.score} "
-            f"entry={result.entry_low:.4f}–{result.entry_high:.4f} "
-            f"sl={result.stop_loss:.4f} "
-            f"tp1={result.tp1:.4f}(RR{result.rr_tp1:.2f}) "
-            f"tp2={result.tp2:.4f}(RR{result.rr_tp2:.2f})"
-        )
-
-        # ── Telegram dispatch (Phase 6) ───────────────────────────────────────
-        try:
-            await send_signal(app, idea, state)
-        except Exception as e:
-            logger.warning(f"send_signal failed {sym}: {e}")
-            await report_error(app, f"send_signal/{sym}", e)
+        # ── All candidates dead — clear any stale pending ─────────────────────
+        clear_pending_setup(mkt, sym, "no_alive_candidates")
 
     except Exception as exc:
         d.errors += 1
@@ -3337,7 +3480,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates"
     ))
 
 
@@ -3538,7 +3681,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
-        f"<b>Watchlist:</b> enabled"
+        f"<b>Watchlist:</b> enabled\n"
+        f"<b>Candidate selection:</b> enabled"
     ))
 
 
@@ -3596,6 +3740,10 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  checked={d.symbols_checked}  "
         f"not_ready={d.symbols_not_ready}  "
         f"lock={d.active_idea_lock}\n"
+        f"  candidates: total={d.candidates_total}  "
+        f"action={d.candidates_actionable}  "
+        f"pend={d.candidates_pending}  "
+        f"dead={d.candidates_dead}\n"
         f"  detector_none={d.detector_none}  "
         f"ctx_old={d.context_too_old}  "
         f"price_miss={d.price_missing}\n"
@@ -3610,8 +3758,9 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"errors={d.errors}\n\n"
         f"<b>Since startup (total):</b>\n"
         f"  checked={t.symbols_checked}  "
-        f"detector_none={t.detector_none}  "
-        f"ctx_old={t.context_too_old}\n"
+        f"candidates_total={t.candidates_total}  "
+        f"detector_none={t.detector_none}\n"
+        f"  ctx_old={t.context_too_old}\n"
         f"  outside_zone={t.outside_entry_zone}  "
         f"hit_tp={t.already_hit_tp}  "
         f"hit_sl={t.already_hit_sl}\n"
@@ -3675,7 +3824,12 @@ async def keepalive_loop(app: web.Application) -> None:
             f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']}) | "
             f"Scan diag: checked={d.symbols_checked} "
             f"not_ready={d.symbols_not_ready} lock={d.active_idea_lock} "
-            f"detector_none={d.detector_none} ctx_old={d.context_too_old} "
+            f"detector_none={d.detector_none} "
+            f"cands: total={d.candidates_total} "
+            f"action={d.candidates_actionable} "
+            f"pend={d.candidates_pending} "
+            f"dead={d.candidates_dead} | "
+            f"ctx_old={d.context_too_old} "
             f"price_miss={d.price_missing} outside_zone={d.outside_entry_zone} "
             f"hit_tp={d.already_hit_tp} hit_sl={d.already_hit_sl} "
             f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
@@ -3714,7 +3868,7 @@ async def on_startup(app: web.Application) -> None:
         "(Phases 3–6 active · Phase 7 dry-run/hardening · "
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
         "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
-        "Phase 8E pending setup watchlist)"
+        "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3789,7 +3943,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8B.1</b> channel-safe Telegram send: active ✅\n"
                 f"<b>Phase 8C</b> gate diagnostics: active ✅\n"
                 f"<b>Phase 8D</b> actionable swing validation: active ✅\n"
-                f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n\n"
+                f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n"
+                f"<b>Phase 8F</b> actionable candidate selection: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist"
     ))
