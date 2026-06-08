@@ -17,6 +17,7 @@ Phase 8C implemented: ScanDiagnostics counters · keepalive/diag visibility · t
 Phase 8D implemented: validate_actionable_setup · SETUP_CONTEXT_MAX_DAYS · RR_FROM_CURRENT_PRICE · refined diag counters
 Phase 8E implemented: PendingSetup watchlist · /watchlist command · validate_actionable_setup reordering
 Phase 8F implemented: CandidateEval · collect_setup_candidates · choose_best_candidate · evaluate_candidate · multi-candidate scan_symbol
+Phase 8G implemented: CandidateDebug · /candidates command · dead-candidate diagnostics buffer
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -82,6 +83,8 @@ SETUP_MAX_AGE_HOURS       = int(os.getenv("SETUP_MAX_AGE_HOURS",    "48"))   # l
 SETUP_CONTEXT_MAX_DAYS    = int(os.getenv("SETUP_CONTEXT_MAX_DAYS", "30"))
 ENTRY_ZONE_REQUIRED       = _bool_env("ENTRY_ZONE_REQUIRED",     True)
 RR_FROM_CURRENT_PRICE     = _bool_env("RR_FROM_CURRENT_PRICE",   True)
+# Max DEAD candidate debug records kept in memory (diagnostics only, not a trading param).
+CANDIDATE_DEBUG_MAX       = int(os.getenv("CANDIDATE_DEBUG_MAX", "100"))
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 UNIVERSE: List[str] = [
@@ -930,6 +933,12 @@ class Market:
     # the entry zone.  It does not generate a trade signal; it is informational.
     pending_setups: Dict[str, "PendingSetup"] = field(default_factory=dict)
 
+    # ── Phase 8G dead-candidate diagnostics ──────────────────────────────────
+    # Rolling buffer of recent DEAD CandidateDebug records (newest last).
+    # Trimmed to CANDIDATE_DEBUG_MAX entries.  Read-only from the bot perspective;
+    # inspected via /candidates command.  Does not affect signal generation.
+    candidate_debug: List["CandidateDebug"] = field(default_factory=list)
+
 
 @dataclass
 class ScanDiagnostics:
@@ -1081,6 +1090,40 @@ class CandidateEval:
     actionable_ok:   bool = False
     pending_ok:      bool = False
     candidate_source: str = ""   # "BREAKOUT_RETEST" | "TREND_PULLBACK" | "LIQUIDITY_SWEEP"
+
+
+@dataclass
+class CandidateDebug:
+    """
+    Diagnostic snapshot of one evaluated candidate.  Stored in
+    Market.candidate_debug (rolling buffer, newest-last, max CANDIDATE_DEBUG_MAX).
+    Used by /candidates (/dead) command.  Diagnostics only — does not affect
+    signal generation or filters.
+    """
+    symbol:        str
+    side:          str    # "LONG" | "SHORT"
+    setup_type:    str
+    score:         int
+
+    status:        str    # "ACTIONABLE" | "PENDING" | "DEAD"
+    reason:        str    # first failing gate name, or "ok"
+
+    current_price: float
+    entry_low:     float
+    entry_high:    float
+    stop_loss:     float
+    tp1:           float
+    tp2:           float
+    rr_tp1:        float
+    rr_tp2:        float
+
+    setup_ts:      int    # ms
+    setup_age_h:   int    # hours since confirmation bar
+    updated_at:    int    # unix seconds
+
+    regime:        str
+    btc_regime:    str
+    notes:         str = ""
 
 
 # =============================================================================
@@ -2670,6 +2713,58 @@ def clear_pending_setup(mkt: Market, sym: str, reason: str = "") -> None:
             + (f" ({reason})" if reason else "")
         )
 
+
+# ── Phase 8G dead-candidate diagnostics helpers ───────────────────────────────
+
+def add_candidate_debug(mkt: Market, item: CandidateDebug) -> None:
+    """Append a CandidateDebug record and trim to CANDIDATE_DEBUG_MAX."""
+    mkt.candidate_debug.append(item)
+    excess = len(mkt.candidate_debug) - CANDIDATE_DEBUG_MAX
+    if excess > 0:
+        del mkt.candidate_debug[:excess]
+
+
+def make_candidate_debug(
+    sym: str,
+    state: SymbolState,
+    mkt: Market,
+    ev: CandidateEval,
+) -> Optional[CandidateDebug]:
+    """
+    Build a CandidateDebug snapshot from a CandidateEval.
+    Returns None when ev.result is None (NONE-status candidates).
+    """
+    if ev.result is None:
+        return None
+    result = ev.result
+    px = get_current_price(state)
+    age_h = (
+        int((now_ms() - result.setup_ts) / 3_600_000)
+        if result.setup_ts > 0 else -1
+    )
+    return CandidateDebug(
+        symbol        = sym,
+        side          = result.side,
+        setup_type    = result.setup_type,
+        score         = result.score,
+        status        = ev.status,
+        reason        = ev.reason,
+        current_price = px,
+        entry_low     = result.entry_low,
+        entry_high    = result.entry_high,
+        stop_loss     = result.stop_loss,
+        tp1           = result.tp1,
+        tp2           = result.tp2,
+        rr_tp1        = result.rr_tp1,
+        rr_tp2        = result.rr_tp2,
+        setup_ts      = result.setup_ts,
+        setup_age_h   = age_h,
+        updated_at    = now_s(),
+        regime        = state.regime,
+        btc_regime    = mkt.btc_regime,
+        notes         = getattr(result, 'notes', '') or "",
+    )
+
 # ── Phase 8F helpers ─────────────────────────────────────────────────────────
 
 def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
@@ -2846,6 +2941,10 @@ async def scan_symbol(
             else:  # DEAD
                 d.candidates_dead += 1; t.candidates_dead += 1
                 _diag_actionable_fail(d, t, ev.reason)
+                # Phase 8G: record dead candidate for /candidates command
+                dbg = make_candidate_debug(sym, state, mkt, ev)
+                if dbg is not None:
+                    add_candidate_debug(mkt, dbg)
 
         # ── Prefer ACTIONABLE candidate ───────────────────────────────────────
         actionable = [ev.result for ev in evals if ev.status == "ACTIONABLE" and ev.result]
@@ -3449,6 +3548,8 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_diag(app, cid)
                 elif text in ("/watchlist", "/pending"):
                     await _cmd_watchlist(app, cid)
+                elif text in ("/candidates", "/dead"):
+                    await _cmd_candidates(app, cid)
         except Exception:
             await asyncio.sleep(5)
 
@@ -3472,7 +3573,8 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Universe:</b> {len(mkt.symbols)} symbols\n"
         f"<b>Ready:</b> {ready}/{len(mkt.symbols)}\n"
         f"<b>Active ideas:</b> {active}\n"
-        f"<b>Pending setups:</b> {len(mkt.pending_setups)}\n\n"
+        f"<b>Pending setups:</b> {len(mkt.pending_setups)}\n"
+        f"<b>Recent dead candidates:</b> {len(mkt.candidate_debug)}\n\n"
         f"<b>Ideas:</b> {stats['total']} total  "
         f"(L:{stats['long']} / S:{stats['short']})\n"
         f"TP1:{stats['tp1_hit']}  TP2:{stats['tp2_hit']}  "
@@ -3480,7 +3582,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag"
     ))
 
 
@@ -3603,6 +3705,88 @@ async def _cmd_close(app: web.Application, cid: int, sym: str) -> None:
         ))
 
 
+_SETUP_ABBREV = {
+    "BREAKOUT_RETEST": "BR",
+    "TREND_PULLBACK":  "TP",
+    "LIQUIDITY_SWEEP": "LS",
+}
+_REASON_ABBREV = {
+    "already_hit_tp":       "hit_tp",
+    "already_hit_sl":       "hit_sl",
+    "outside_entry_zone":   "outside_zone",
+    "rr_current_fail":      "rr_curr",
+    "signal_gate_fail":     "gate_fail",
+    "tpsl_fail":            "tpsl_fail",
+    "context_too_old":      "ctx_old",
+    "price_missing":        "price_miss",
+    "invalidated_since_setup": "invalidated",
+}
+
+
+async def _cmd_candidates(app: web.Application, cid: int) -> None:
+    """
+    /candidates (/dead) — show recent DEAD candidates from the diagnostic buffer.
+    Read-only; diagnostics only; does not affect signal generation.
+    """
+    tg:  Tg     = app["tg"]
+    mkt: Market = app["mkt"]
+
+    records = mkt.candidate_debug   # newest-last
+    if not records:
+        await tg.send(cid, "📭 <b>No recent dead candidates.</b>")
+        return
+
+    total    = len(records)
+    shown_r  = list(reversed(records))[:10]   # newest first, max 10
+
+    # Summary counts
+    from collections import Counter
+    reason_c  = Counter(_REASON_ABBREV.get(r.reason, r.reason) for r in records)
+    det_c     = Counter(_SETUP_ABBREV.get(r.setup_type, r.setup_type) for r in records)
+    now_ts    = now_s()
+
+    reason_str = "  ".join(f"{k}={v}" for k, v in reason_c.most_common())
+    det_str    = "  ".join(f"{k}={v}" for k, v in sorted(det_c.items()))
+
+    lines = [
+        f"🧪 <b>Candidate Diagnostics — recent DEAD candidates</b>\n",
+        f"<b>Summary:</b>\n"
+        f"  total stored: {total}\n"
+        f"  reasons: {reason_str}\n"
+        f"  detectors: {det_str}",
+    ]
+
+    for i, rec in enumerate(shown_r, 1):
+        side_e     = "🟢" if rec.side == "LONG" else "🔴"
+        sym_pretty = rec.symbol.replace("USDT", "/USDT")
+        det_abbr   = _SETUP_ABBREV.get(rec.setup_type, rec.setup_type)
+        reason_lbl = _REASON_ABBREV.get(rec.reason, rec.reason)
+        regime_e   = _regime_emoji(rec.regime)
+        age_ago    = int(now_ts - rec.updated_at)
+
+        lines.append(
+            f"\n{i}) {side_e} <b>{sym_pretty}</b> — {det_abbr}\n"
+            f"Reason: <b>{reason_lbl}</b> | Score: {rec.score}/100 | "
+            f"Regime: {regime_e} {rec.regime}\n"
+            f"Current: <code>{rec.current_price:.5f}</code>\n"
+            f"Entry: <code>{rec.entry_low:.5f} – {rec.entry_high:.5f}</code>\n"
+            f"SL: <code>{rec.stop_loss:.5f}</code>\n"
+            f"TP1: <code>{rec.tp1:.5f}</code> (RR {rec.rr_tp1:.2f})  "
+            f"TP2: <code>{rec.tp2:.5f}</code> (RR {rec.rr_tp2:.2f})\n"
+            f"Setup age: {rec.setup_age_h}h | Updated: {age_ago}s ago"
+        )
+
+    if total > 10:
+        lines.append(f"\n<i>Showing 10 of {total} stored records. "
+                     f"Buffer max: {CANDIDATE_DEBUG_MAX}.</i>")
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = (text[:3800] +
+                "\n\n<i>Output truncated to stay within Telegram message size limit.</i>")
+    await tg.send(cid, text)
+
+
 async def _cmd_watchlist(app: web.Application, cid: int) -> None:
     """
     /watchlist — show pending setups sorted by distance to entry zone (ascending).
@@ -3682,7 +3866,9 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"<b>Watchlist:</b> enabled\n"
-        f"<b>Candidate selection:</b> enabled"
+        f"<b>Candidate selection:</b> enabled\n"
+        f"<b>Dead candidate diagnostics:</b> enabled\n"
+        f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}"
     ))
 
 
@@ -3725,6 +3911,31 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
     else:
         pending_block = ""
 
+    # Dead-candidate summary block (Phase 8G)
+    dead_n = len(mkt.candidate_debug)
+    if dead_n > 0:
+        from collections import Counter as _Ctr
+        r_ctr   = _Ctr(_REASON_ABBREV.get(r.reason, r.reason) for r in mkt.candidate_debug)
+        det_ctr = _Ctr(_SETUP_ABBREV.get(r.setup_type, r.setup_type) for r in mkt.candidate_debug)
+        r_str   = "  ".join(f"{k}={v}" for k, v in r_ctr.most_common())
+        det_str = "  ".join(f"{k}={v}" for k, v in sorted(det_ctr.items()))
+        recent3 = list(reversed(mkt.candidate_debug))[:3]
+        top3    = "\n".join(
+            f"  {i}. {r.symbol.replace('USDT','')} {r.side} "
+            f"{_SETUP_ABBREV.get(r.setup_type, r.setup_type)} "
+            f"reason={_REASON_ABBREV.get(r.reason, r.reason)} "
+            f"score={r.score} age={r.setup_age_h}h"
+            for i, r in enumerate(recent3, 1)
+        )
+        dead_block = (
+            f"<b>Recent dead candidates: {dead_n} stored</b>\n"
+            f"Dead reasons: {r_str}\n"
+            f"Dead detectors: {det_str}\n"
+            f"Recent dead:\n{top3}\n\n"
+        )
+    else:
+        dead_block = ""
+
     await tg.send(cid, (
         f"🔬 <b>Diagnostics</b>\n\n"
         f"<b>Mode:</b> {mode}\n"
@@ -3736,6 +3947,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"<b>BTC last scan:</b> {btc_scan_ago}\n"
         f"<b>Not ready (≤10):</b> {nr_str}\n\n"
         f"{pending_block}"
+        f"{dead_block}"
         f"<b>Last-cycle scan (since keepalive reset):</b>\n"
         f"  checked={d.symbols_checked}  "
         f"not_ready={d.symbols_not_ready}  "
@@ -3818,6 +4030,7 @@ async def keepalive_loop(app: web.Application) -> None:
             f"Ready: {ready}/{len(mkt.symbols)} | "
             f"Active ideas: {active} | "
             f"Pending: {len(mkt.pending_setups)} | "
+            f"Dead debug: {len(mkt.candidate_debug)} | "
             f"Polls: {mkt.poll_count} | "
             f"Last poll: {poll_ago}s ago | "
             f"Ideas: {mkt.signal_stats['total']} "
@@ -3868,7 +4081,8 @@ async def on_startup(app: web.Application) -> None:
         "(Phases 3–6 active · Phase 7 dry-run/hardening · "
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
         "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
-        "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection)"
+        "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
+        "Phase 8G dead candidate diagnostics)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -3944,9 +4158,10 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8C</b> gate diagnostics: active ✅\n"
                 f"<b>Phase 8D</b> actionable swing validation: active ✅\n"
                 f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n"
-                f"<b>Phase 8F</b> actionable candidate selection: active ✅\n\n"
+                f"<b>Phase 8F</b> actionable candidate selection: active ✅\n"
+                f"<b>Phase 8G</b> dead candidate diagnostics: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /watchlist"
+                f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
 
 
