@@ -19,6 +19,7 @@ Phase 8E implemented: PendingSetup watchlist · /watchlist command · validate_a
 Phase 8F implemented: CandidateEval · collect_setup_candidates · choose_best_candidate · evaluate_candidate · multi-candidate scan_symbol
 Phase 8G implemented: CandidateDebug · /candidates command · dead-candidate diagnostics buffer
 Phase 8H implemented: LIQUIDITY_SWEEP_MAX_AGE_HOURS · is_liquidity_sweep_recent · LS recency gate in evaluate_candidate
+Phase 8I implemented: candidate_debug_key dedup · add_candidate_debug returns bool · candidate_debug_dedup counter · report_error runtime_state fix
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -247,10 +248,15 @@ async def report_error(
     if not tg:
         return
     t    = now_s()
-    last = app.setdefault("_last_error_ts", 0)
+    # Use runtime_state dict (set in on_startup) instead of mutating app directly.
+    # Mutating app after startup triggers aiohttp DeprecationWarning.
+    runtime_state = app.get("runtime_state")
+    if runtime_state is None:
+        runtime_state = {"last_error_ts": 0}
+    last = runtime_state.get("last_error_ts", 0)
     if t - last < ERROR_REPORT_COOLDOWN_SEC:
         return
-    app["_last_error_ts"] = t
+    runtime_state["last_error_ts"] = t
     ts   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     body = f"\n<b>Note:</b> {html.escape(note)}" if note else ""
     if exc:
@@ -1002,6 +1008,8 @@ class ScanDiagnostics:
     errors:                 int = 0
     # Phase 8H: LS candidates too old for the LS-specific freshness gate
     liquidity_sweep_too_old: int = 0
+    # Phase 8I: existing candidate_debug record updated in place (dedup hit)
+    candidate_debug_dedup:  int = 0
 
 
 @dataclass
@@ -2747,12 +2755,42 @@ def liquidity_sweep_age_h(result: SetupResult) -> int:
         return -1
     return int((now_ms() - result.setup_ts) / 3_600_000)
 
-def add_candidate_debug(mkt: Market, item: CandidateDebug) -> None:
-    """Append a CandidateDebug record and trim to CANDIDATE_DEBUG_MAX."""
+def candidate_debug_key(item: CandidateDebug) -> Tuple[str, str, str, int, str]:
+    """
+    Dedup key for a CandidateDebug record.
+    Same symbol + detector + side + setup confirmation timestamp + rejection reason
+    identifies the same diagnostic candidate across repeated scan cycles.
+    """
+    return (item.symbol, item.setup_type, item.side, item.setup_ts, item.reason)
+
+
+def add_candidate_debug(mkt: Market, item: CandidateDebug) -> bool:
+    """
+    Append a CandidateDebug record with deduplication.
+
+    If a record with the same key already exists:
+      - update it in place with the newer snapshot
+      - move it to the end so newest-first display works
+      - return False (dedup hit; existing updated)
+
+    If no matching record exists:
+      - append new record
+      - trim to CANDIDATE_DEBUG_MAX (oldest first removed)
+      - return True (new record appended)
+    """
+    key = candidate_debug_key(item)
+    for i, old in enumerate(mkt.candidate_debug):
+        if candidate_debug_key(old) == key:
+            mkt.candidate_debug[i] = item
+            # Bubble to end so newest-first display sees it first
+            mkt.candidate_debug.append(mkt.candidate_debug.pop(i))
+            return False  # dedup: updated existing
+
     mkt.candidate_debug.append(item)
     excess = len(mkt.candidate_debug) - CANDIDATE_DEBUG_MAX
     if excess > 0:
         del mkt.candidate_debug[:excess]
+    return True  # new record appended
 
 
 def make_candidate_debug(
@@ -2979,10 +3017,13 @@ async def scan_symbol(
             else:  # DEAD
                 d.candidates_dead += 1; t.candidates_dead += 1
                 _diag_actionable_fail(d, t, ev.reason)
-                # Phase 8G: record dead candidate for /candidates command
+                # Phase 8G/8I: record dead candidate; count dedup hits
                 dbg = make_candidate_debug(sym, state, mkt, ev)
                 if dbg is not None:
-                    add_candidate_debug(mkt, dbg)
+                    appended = add_candidate_debug(mkt, dbg)
+                    if not appended:
+                        d.candidate_debug_dedup += 1
+                        t.candidate_debug_dedup += 1
 
         # ── Prefer ACTIONABLE candidate ───────────────────────────────────────
         actionable = [ev.result for ev in evals if ev.status == "ACTIONABLE" and ev.result]
@@ -3612,7 +3653,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Ready:</b> {ready}/{len(mkt.symbols)}\n"
         f"<b>Active ideas:</b> {active}\n"
         f"<b>Pending setups:</b> {len(mkt.pending_setups)}\n"
-        f"<b>Recent dead candidates:</b> {len(mkt.candidate_debug)}\n\n"
+        f"<b>Recent dead candidates:</b> {len(mkt.candidate_debug)} unique\n\n"
         f"<b>Ideas:</b> {stats['total']} total  "
         f"(L:{stats['long']} / S:{stats['short']})\n"
         f"TP1:{stats['tp1_hit']}  TP2:{stats['tp2_hit']}  "
@@ -3620,7 +3661,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup"
     ))
 
 
@@ -3790,7 +3831,7 @@ async def _cmd_candidates(app: web.Application, cid: int) -> None:
     lines = [
         f"🧪 <b>Candidate Diagnostics — recent DEAD candidates</b>\n",
         f"<b>Summary:</b>\n"
-        f"  total stored: {total}\n"
+        f"  unique stored: {total}\n"
         f"  reasons: {reason_str}\n"
         f"  detectors: {det_str}",
     ]
@@ -3816,7 +3857,7 @@ async def _cmd_candidates(app: web.Application, cid: int) -> None:
         )
 
     if total > 10:
-        lines.append(f"\n<i>Showing 10 of {total} stored records. "
+        lines.append(f"\n<i>Showing 10 of {total} unique stored records. "
                      f"Buffer max: {CANDIDATE_DEBUG_MAX}.</i>")
 
     text = "\n".join(lines)
@@ -3908,7 +3949,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Watchlist:</b> enabled\n"
         f"<b>Candidate selection:</b> enabled\n"
         f"<b>Dead candidate diagnostics:</b> enabled\n"
-        f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}"
+        f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}\n"
+        f"<b>Candidate debug dedup:</b> enabled"
     ))
 
 
@@ -3968,7 +4010,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
             for i, r in enumerate(recent3, 1)
         )
         dead_block = (
-            f"<b>Recent dead candidates: {dead_n} stored</b>\n"
+            f"<b>Recent dead candidates: {dead_n} unique stored</b>\n"
             f"Dead reasons: {r_str}\n"
             f"Dead detectors: {det_str}\n"
             f"Recent dead:\n{top3}\n\n"
@@ -4005,6 +4047,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  tpsl_fail={d.tpsl_fail}  "
         f"rr_curr={d.rr_current_fail}  "
         f"ls_old={d.liquidity_sweep_too_old}  "
+        f"debug_dedup={d.candidate_debug_dedup}  "
         f"gate_fail={d.signal_gate_fail}\n"
         f"  actionable_ok={d.actionable_ok}  "
         f"new_idea={d.new_idea}  "
@@ -4019,6 +4062,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"hit_sl={t.already_hit_sl}\n"
         f"  rr_curr={t.rr_current_fail}  "
         f"ls_old={t.liquidity_sweep_too_old}  "
+        f"debug_dedup={t.candidate_debug_dedup}  "
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
@@ -4091,6 +4135,7 @@ async def keepalive_loop(app: web.Application) -> None:
             f"hit_tp={d.already_hit_tp} hit_sl={d.already_hit_sl} "
             f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
             f"ls_old={d.liquidity_sweep_too_old} "
+            f"debug_dedup={d.candidate_debug_dedup} "
             f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
             f"new={d.new_idea} errors={d.errors}"
         )
@@ -4127,7 +4172,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8A freshness/entry gate · Phase 8B.1 channel-safe send · "
         "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
         "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
-        "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate)"
+        "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate · "
+        "Phase 8I candidate debug dedup)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4170,6 +4216,10 @@ async def on_startup(app: web.Application) -> None:
         mkt.btc_regime_reason = mkt.state["BTCUSDT"].regime_reason
 
     # 5. Start background tasks
+    # runtime_state is a plain mutable dict used by report_error() and other
+    # helpers that need to persist small values without mutating the app mapping
+    # after startup (which triggers aiohttp DeprecationWarning).
+    app["runtime_state"] = {"last_error_ts": 0}
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
     app["watchdog_task"]  = asyncio.create_task(watchdog_loop(app))
@@ -4205,7 +4255,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8E</b> watchlist / pending setups: active ✅\n"
                 f"<b>Phase 8F</b> actionable candidate selection: active ✅\n"
                 f"<b>Phase 8G</b> dead candidate diagnostics: active ✅\n"
-                f"<b>Phase 8H</b> Liquidity Sweep recency gate: active ✅\n\n"
+                f"<b>Phase 8H</b> Liquidity Sweep recency gate: active ✅\n"
+                f"<b>Phase 8I</b> candidate debug dedup: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
