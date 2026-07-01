@@ -20,6 +20,8 @@ Phase 8F implemented: CandidateEval · collect_setup_candidates · choose_best_c
 Phase 8G implemented: CandidateDebug · /candidates command · dead-candidate diagnostics buffer
 Phase 8H implemented: LIQUIDITY_SWEEP_MAX_AGE_HOURS · is_liquidity_sweep_recent · LS recency gate in evaluate_candidate
 Phase 8I implemented: candidate_debug_key dedup · add_candidate_debug returns bool · candidate_debug_dedup counter · report_error runtime_state fix
+Phase 8J implemented: TP/SL percentage ranges in signal and command outputs
+Phase 8K implemented: Fresh Entry Retest gate for older Liquidity Sweep candidates
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -89,8 +91,13 @@ RR_FROM_CURRENT_PRICE     = _bool_env("RR_FROM_CURRENT_PRICE",   True)
 CANDIDATE_DEBUG_MAX       = int(os.getenv("CANDIDATE_DEBUG_MAX", "100"))
 # Phase 8H: Liquidity Sweep confirmation must be at most this old to be actionable.
 # This is a STRICTER gate than SETUP_CONTEXT_MAX_DAYS (30d); it applies only to LS.
-# Default 96h = 4 days.  BR and TP are not affected.
-LIQUIDITY_SWEEP_MAX_AGE_HOURS = int(os.getenv("LIQUIDITY_SWEEP_MAX_AGE_HOURS", "96"))
+# Default 168h = 7 days.  BR and TP are not affected.
+LIQUIDITY_SWEEP_MAX_AGE_HOURS = int(os.getenv("LIQUIDITY_SWEEP_MAX_AGE_HOURS", "168"))
+# Phase 8K: Older LS candidates need a fresh return into the entry zone.
+# If LS setup_age > LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS, the latest entry-zone
+# return/touch must be no older than ENTRY_RETEST_MAX_AGE_HOURS.
+LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS = int(os.getenv("LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS", "96"))
+ENTRY_RETEST_MAX_AGE_HOURS = int(os.getenv("ENTRY_RETEST_MAX_AGE_HOURS", "48"))
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 UNIVERSE: List[str] = [
@@ -982,6 +989,7 @@ class ScanDiagnostics:
       tpsl_fail             — calc_swing_tpsl produced degenerate geometry (rr≤0)
       rr_current_fail       — RR below threshold (current-price or entry_mid)
       signal_gate_fail      — can_signal() returned False (score/regime/BTC filter)
+      entry_retest_too_old  — old LS returned/touched entry zone too long ago
       actionable_ok         — validate_actionable_setup() returned ok
       new_idea              — ActiveIdea successfully created
       errors                — unexpected exception caught inside scan_symbol
@@ -1003,6 +1011,7 @@ class ScanDiagnostics:
     tpsl_fail:              int = 0
     rr_current_fail:        int = 0
     signal_gate_fail:       int = 0
+    entry_retest_too_old:   int = 0
     actionable_ok:          int = 0
     new_idea:               int = 0
     errors:                 int = 0
@@ -2652,6 +2661,8 @@ def _diag_actionable_fail(
         d.rr_current_fail += 1; t.rr_current_fail += 1
     elif reason == "signal_gate_fail":
         d.signal_gate_fail += 1; t.signal_gate_fail += 1
+    elif reason == "entry_retest_too_old":
+        d.entry_retest_too_old += 1; t.entry_retest_too_old += 1
     elif reason == "liquidity_sweep_too_old":
         d.liquidity_sweep_too_old += 1; t.liquidity_sweep_too_old += 1
     else:
@@ -2754,6 +2765,106 @@ def liquidity_sweep_age_h(result: SetupResult) -> int:
     if result.setup_ts <= 0:
         return -1
     return int((now_ms() - result.setup_ts) / 3_600_000)
+
+
+# ── Phase 8K: Fresh Entry Retest gate ─────────────────────────────────────────
+
+def bar_touches_entry_zone(bar: Bar, entry_low: float, entry_high: float) -> bool:
+    """
+    True when a bar's high-low range overlaps the entry zone.
+
+    Used by the Phase 8K fresh-entry-retouch gate.  We intentionally use the
+    full bar range, not just close, because a return into the zone may happen
+    intrabar while the final close is outside.
+    """
+    return bar[B_LOW] <= entry_high and bar[B_HIGH] >= entry_low
+
+
+def _bars_for_entry_retest_scan(state: SymbolState) -> List[Bar]:
+    """
+    Return the best available bar series for entry-zone retest timing.
+
+    1H is preferred for precision.  4H and 1D are fallbacks for defensive
+    completeness, although normal readiness means 1H should be available.
+    """
+    if state.bars_1h:
+        return state.bars_1h
+    if state.bars_4h:
+        return state.bars_4h
+    return state.bars_1d
+
+
+def latest_entry_zone_return_ts(result: SetupResult, state: SymbolState) -> Optional[int]:
+    """
+    Return the timestamp of the latest transition back into the entry zone
+    after setup_ts, or None if the zone was never touched.
+
+    A "return" is counted when a bar touches the entry zone and the previous
+    scanned bar did not.  If the first scanned bar is already inside the zone,
+    its timestamp is used.  This is conservative: a setup that has been sitting
+    in the entry zone for days will have an old return timestamp and can be
+    rejected by the freshness gate.
+    """
+    if result.setup_ts <= 0:
+        return None
+
+    bars = [b for b in _bars_for_entry_retest_scan(state) if b[B_TS] >= result.setup_ts]
+    if not bars:
+        return None
+
+    last_return_ts: Optional[int] = None
+    prev_in_zone = False
+
+    for bar in bars:
+        in_zone = bar_touches_entry_zone(bar, result.entry_low, result.entry_high)
+        if in_zone and not prev_in_zone:
+            last_return_ts = bar[B_TS]
+        prev_in_zone = in_zone
+
+    return last_return_ts
+
+
+def validate_fresh_entry_retest(
+    result: SetupResult,
+    state: SymbolState,
+    current_price: float,
+) -> Tuple[bool, str]:
+    """
+    Phase 8K safety gate for older Liquidity Sweep candidates.
+
+    Purpose:
+      Allow LS candidates up to LIQUIDITY_SWEEP_MAX_AGE_HOURS, but if the LS
+      is older than LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS, require a fresh return
+      into the entry zone within ENTRY_RETEST_MAX_AGE_HOURS.
+
+    This prevents signals from firing on old LS structures where price has been
+    drifting around the entry zone for too long.  TP/SL touch checks still run
+    earlier in validate_actionable_setup().
+    """
+    if result.setup_type != "LIQUIDITY_SWEEP":
+        return True, "ok"
+    if result.setup_ts <= 0:
+        return False, "entry_retest_too_old"
+    if not ENTRY_ZONE_REQUIRED:
+        return True, "ok"
+
+    setup_age_h = liquidity_sweep_age_h(result)
+    if setup_age_h <= LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS:
+        return True, "ok"
+
+    if not is_price_in_entry_zone(current_price, result.entry_low, result.entry_high):
+        return True, "ok"  # outside_entry_zone is handled by validate_actionable_setup()
+
+    retest_ts = latest_entry_zone_return_ts(result, state)
+    if retest_ts is None:
+        return False, "entry_retest_too_old"
+
+    retest_age_h = int((now_ms() - retest_ts) / 3_600_000)
+    if retest_age_h > ENTRY_RETEST_MAX_AGE_HOURS:
+        return False, "entry_retest_too_old"
+
+    return True, "ok"
+
 
 def candidate_debug_key(item: CandidateDebug) -> Tuple[str, str, str, int, str]:
     """
@@ -2928,6 +3039,11 @@ def evaluate_candidate(
                 pending_ok=True, candidate_source=source
             )
         return CandidateEval(result, "DEAD", reason, candidate_source=source)
+
+    # 3b. Phase 8K: older Liquidity Sweep candidates need a fresh entry-zone retest.
+    retest_ok, retest_reason = validate_fresh_entry_retest(result, state, px)
+    if not retest_ok:
+        return CandidateEval(result, "DEAD", retest_reason, candidate_source=source)
 
     # 4. Update RR from current price
     if RR_FROM_CURRENT_PRICE and px > 0.0:
@@ -3498,6 +3614,35 @@ def _selftest_pct_format_helpers() -> None:
     assert format_pct_from_entry_zone("SHORT", 100.0, 102.0, 105.0) == "-2.94%–-5.00%"
 
 
+
+def _selftest_entry_retest_helpers() -> None:
+    """Tiny deterministic self-test for Phase 8K entry-zone return timing."""
+    now = now_ms()
+    hour = 3_600_000
+    result = SetupResult(
+        setup_type="LIQUIDITY_SWEEP",
+        side="LONG",
+        score=80,
+        entry_low=100.0,
+        entry_high=102.0,
+        stop_loss=95.0,
+        tp1=106.0,
+        tp2=110.0,
+        rr_tp1=1.2,
+        rr_tp2=2.0,
+        invalidation="test",
+        setup_ts=now - 120 * hour,
+    )
+    state = SymbolState(
+        bars_1h=[
+            (now - 60 * hour, 0, 99.0, 98.0, 98.5, 1.0),
+            (now - 40 * hour, 0, 103.0, 101.0, 101.5, 1.0),
+            (now - 1 * hour, 0, 102.5, 100.5, 101.0, 1.0),
+        ]
+    )
+    assert latest_entry_zone_return_ts(result, state) == now - 40 * hour
+
+
 def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     """
     Render a new-idea Telegram message in HTML.
@@ -3741,7 +3886,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest"
     ))
 
 
@@ -3886,6 +4031,7 @@ _REASON_ABBREV = {
     "price_missing":            "price_miss",
     "invalidated_since_setup":  "invalidated",
     "liquidity_sweep_too_old":  "ls_old",
+    "entry_retest_too_old":     "entry_old",
 }
 
 
@@ -4038,6 +4184,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Entry zone required:</b> {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"<b>RR from current price:</b> {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"<b>Liquidity Sweep max age:</b> {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h\n"
+        f"<b>LS entry retest gate:</b> after {LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS}h, "
+        f"return ≤ {ENTRY_RETEST_MAX_AGE_HOURS}h\n"
         f"<b>Watchlist:</b> enabled\n"
         f"<b>Candidate selection:</b> enabled\n"
         f"<b>Dead candidate diagnostics:</b> enabled\n"
@@ -4139,6 +4287,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  tpsl_fail={d.tpsl_fail}  "
         f"rr_curr={d.rr_current_fail}  "
         f"ls_old={d.liquidity_sweep_too_old}  "
+        f"entry_old={d.entry_retest_too_old}  "
         f"debug_dedup={d.candidate_debug_dedup}  "
         f"gate_fail={d.signal_gate_fail}\n"
         f"  actionable_ok={d.actionable_ok}  "
@@ -4154,15 +4303,18 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"hit_sl={t.already_hit_sl}\n"
         f"  rr_curr={t.rr_current_fail}  "
         f"ls_old={t.liquidity_sweep_too_old}  "
+        f"entry_old={t.entry_retest_too_old}  "
         f"debug_dedup={t.candidate_debug_dedup}  "
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D/8E/8H):</b>\n"
+        f"<b>Current gates (Phase 8D/8E/8H/8K):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"  LS max age: {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h  "
         f"(BR/TP not restricted)\n"
+        f"  LS fresh entry retest: after {LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS}h, "
+        f"return ≤ {ENTRY_RETEST_MAX_AGE_HOURS}h\n"
         f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
@@ -4227,6 +4379,7 @@ async def keepalive_loop(app: web.Application) -> None:
             f"hit_tp={d.already_hit_tp} hit_sl={d.already_hit_sl} "
             f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
             f"ls_old={d.liquidity_sweep_too_old} "
+            f"entry_old={d.entry_retest_too_old} "
             f"debug_dedup={d.candidate_debug_dedup} "
             f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
             f"new={d.new_idea} errors={d.errors}"
@@ -4265,7 +4418,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8C gate diagnostics · Phase 8D actionable swing validation · "
         "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
         "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate · "
-        "Phase 8I candidate debug dedup)"
+        "Phase 8I candidate debug dedup · Phase 8J TP/SL percentage ranges · "
+        "Phase 8K fresh entry retest gate)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4348,7 +4502,9 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8F</b> actionable candidate selection: active ✅\n"
                 f"<b>Phase 8G</b> dead candidate diagnostics: active ✅\n"
                 f"<b>Phase 8H</b> Liquidity Sweep recency gate: active ✅\n"
-                f"<b>Phase 8I</b> candidate debug dedup: active ✅\n\n"
+                f"<b>Phase 8I</b> candidate debug dedup: active ✅\n"
+                f"<b>Phase 8J</b> TP/SL percentage ranges: active ✅\n"
+                f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
@@ -4380,4 +4536,5 @@ def make_app() -> web.Application:
 
 if __name__ == "__main__":
     _selftest_pct_format_helpers()
+    _selftest_entry_retest_helpers()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
