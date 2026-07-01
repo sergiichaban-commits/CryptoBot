@@ -22,6 +22,7 @@ Phase 8H implemented: LIQUIDITY_SWEEP_MAX_AGE_HOURS · is_liquidity_sweep_recent
 Phase 8I implemented: candidate_debug_key dedup · add_candidate_debug returns bool · candidate_debug_dedup counter · report_error runtime_state fix
 Phase 8J implemented: TP/SL percentage ranges in signal and command outputs
 Phase 8K implemented: Fresh Entry Retest gate for older Liquidity Sweep candidates
+Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR + signal gate
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -1024,8 +1025,13 @@ class ScanDiagnostics:
 @dataclass
 class PendingSetup:
     """
-    A valid structural setup whose current price is outside the entry zone.
-    Does NOT generate a trade signal — informational/watchlist only (Phase 8E).
+    A signal-eligible setup whose current price is outside the entry zone.
+    Does NOT generate a trade signal — informational/watchlist only.
+
+    Phase 8L: pending setups must already pass RR + score/regime/BTC signal
+    gates when evaluated from the worst acceptable entry-zone price.  In other
+    words, /watchlist should show candidates that are waiting only for price to
+    return into the entry zone, not candidates that would be blocked anyway.
 
     Stored in Market.pending_setups[sym] (one per symbol, newest replaces old).
     Cleared when the detector returns None, TP/SL was already touched, setup
@@ -2945,6 +2951,61 @@ def make_candidate_debug(
         notes         = getattr(result, 'notes', '') or "",
     )
 
+# ── Phase 8L: Signal-Eligible Watchlist gate ─────────────────────────────────
+
+def worst_entry_zone_price_for_rr(side: str, entry_low: float, entry_high: float) -> float:
+    """
+    Return the worst acceptable entry-zone reference price for RR validation.
+
+    LONG worst case:  entry_high (highest buy price → smaller reward, larger risk)
+    SHORT worst case: entry_low  (lowest sell price → smaller reward, larger risk)
+
+    Used only for pending setup eligibility.  It avoids listing a /watchlist
+    candidate whose RR would fail as soon as price actually returns into the
+    entry zone.
+    """
+    return entry_high if side == "LONG" else entry_low
+
+
+def validate_signal_eligible_pending(
+    sym: str,
+    state: SymbolState,
+    mkt: Market,
+    result: SetupResult,
+) -> Tuple[bool, SetupResult, str]:
+    """
+    Phase 8L gate for /watchlist quality.
+
+    A PENDING setup is allowed into the watchlist only if it would pass RR and
+    signal gates after price returns into the entry zone.  Because the current
+    price is outside the zone at this point, RR is recalculated from the worst
+    valid entry-zone price instead of the current outside-zone price.
+
+    Returns:
+      (True,  possibly_rr_adjusted_result, "outside_entry_zone") when eligible.
+      (False, possibly_rr_adjusted_result, failure_reason) when it should be
+      treated as DEAD (rr_current_fail or signal_gate_fail).
+    """
+    eligible_result = result
+
+    if RR_FROM_CURRENT_PRICE:
+        ref_price = worst_entry_zone_price_for_rr(
+            result.side, result.entry_low, result.entry_high
+        )
+        rr1_zone, rr2_zone = calc_rr_from_current(
+            result.side, ref_price, result.stop_loss, result.tp1, result.tp2
+        )
+        eligible_result = _dc_replace(result, rr_tp1=rr1_zone, rr_tp2=rr2_zone)
+
+    if not passes_rr_gate(eligible_result, sym):
+        return False, eligible_result, "rr_current_fail"
+
+    if not can_signal(sym, state, mkt, eligible_result):
+        return False, eligible_result, "signal_gate_fail"
+
+    return True, eligible_result, "outside_entry_zone"
+
+
 # ── Phase 8F helpers ─────────────────────────────────────────────────────────
 
 def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
@@ -3034,9 +3095,21 @@ def evaluate_candidate(
     valid, reason = validate_actionable_setup(result, state, px)
     if not valid:
         if reason == "outside_entry_zone":
+            # Phase 8L: do not put candidates into /watchlist if they would
+            # be blocked by RR, score, symbol regime, or BTC regime after price
+            # returns into the entry zone.
+            pending_ok, pending_result, pending_reason = validate_signal_eligible_pending(
+                sym, state, mkt, result
+            )
+            if not pending_ok:
+                return CandidateEval(
+                    pending_result, "DEAD", pending_reason,
+                    rr_ok=(pending_reason != "rr_current_fail"),
+                    signal_ok=False, candidate_source=source
+                )
             return CandidateEval(
-                result, "PENDING", "outside_entry_zone",
-                pending_ok=True, candidate_source=source
+                pending_result, "PENDING", "outside_entry_zone",
+                rr_ok=True, signal_ok=True, pending_ok=True, candidate_source=source
             )
         return CandidateEval(result, "DEAD", reason, candidate_source=source)
 
@@ -3084,6 +3157,11 @@ async def scan_symbol(
 
     This prevents a dead high-priority setup (e.g. BR already hit TP) from
     blocking a live lower-priority setup (e.g. LS still in zone).
+
+    Phase 8L: PENDING candidates are kept in /watchlist only when they already
+    pass RR + score/regime/BTC signal gates from the worst acceptable entry-zone
+    price.  The watchlist should therefore represent setups waiting only for
+    price to return to entry.
 
     Diagnostics note: reason counters (hit_tp, hit_sl, …) are candidate-level,
     so they may exceed symbols_checked when multiple candidates are evaluated.
@@ -3195,7 +3273,7 @@ async def scan_symbol(
                 await report_error(app, f"send_signal/{sym}", e)
             return
 
-        # ── No actionable — check for pending (alive but outside zone) ────────
+        # ── No actionable — check for signal-eligible pending (Phase 8L) ──────
         pending = [ev.result for ev in evals if ev.status == "PENDING" and ev.result]
         if pending:
             best_pending = choose_best_candidate(pending)
@@ -3643,6 +3721,40 @@ def _selftest_entry_retest_helpers() -> None:
     assert latest_entry_zone_return_ts(result, state) == now - 40 * hour
 
 
+
+def _selftest_pending_signal_eligible_watchlist() -> None:
+    """Tiny deterministic self-test for Phase 8L pending watchlist gating."""
+    state = SymbolState()
+    state.ready = True
+    state.regime = "BEARISH"
+    mkt = Market(symbols=["SOLUSDT"], state={"SOLUSDT": state})
+    mkt.btc_regime = "BEARISH"
+
+    long_bad = SetupResult(
+        setup_type="BREAKOUT_RETEST", side="LONG", score=65,
+        entry_low=100.0, entry_high=102.0, stop_loss=95.0,
+        tp1=112.0, tp2=120.0, rr_tp1=0.0, rr_tp2=0.0,
+        invalidation="test", setup_ts=now_ms(),
+    )
+    ok, checked, reason = validate_signal_eligible_pending(
+        "SOLUSDT", state, mkt, long_bad
+    )
+    assert not ok and reason == "signal_gate_fail"
+    assert checked.rr_tp2 >= RR_MIN_TIER2
+
+    short_ok = SetupResult(
+        setup_type="LIQUIDITY_SWEEP", side="SHORT", score=65,
+        entry_low=100.0, entry_high=102.0, stop_loss=105.0,
+        tp1=94.0, tp2=90.0, rr_tp1=0.0, rr_tp2=0.0,
+        invalidation="test", setup_ts=now_ms(),
+    )
+    ok, checked, reason = validate_signal_eligible_pending(
+        "SOLUSDT", state, mkt, short_ok
+    )
+    assert ok and reason == "outside_entry_zone"
+    assert checked.rr_tp2 >= RR_MIN_TIER2
+
+
 def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     """
     Render a new-idea Telegram message in HTML.
@@ -3886,7 +3998,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist"
     ))
 
 
@@ -4120,7 +4232,8 @@ async def _cmd_watchlist(app: web.Application, cid: int) -> None:
     total  = len(setups)
     shown  = setups[:10]
 
-    lines = [f"📌 <b>Pending Setups / Watchlist</b>  ({total} total)\n"]
+    lines = [f"📌 <b>Pending Setups / Watchlist</b>  ({total} total)\n"
+             f"<i>Signal-eligible; waiting only for entry-zone return.</i>\n"]
     for i, p in enumerate(shown, 1):
         side_e      = "🟢" if p.side == "LONG" else "🔴"
         sym_pretty  = p.symbol.replace("USDT", "/USDT")
@@ -4187,6 +4300,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>LS entry retest gate:</b> after {LS_ENTRY_RETEST_REQUIRED_AFTER_HOURS}h, "
         f"return ≤ {ENTRY_RETEST_MAX_AGE_HOURS}h\n"
         f"<b>Watchlist:</b> enabled\n"
+        f"<b>Signal-eligible watchlist:</b> enabled\n"
         f"<b>Candidate selection:</b> enabled\n"
         f"<b>Dead candidate diagnostics:</b> enabled\n"
         f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}\n"
@@ -4308,7 +4422,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D/8E/8H/8K):</b>\n"
+        f"<b>Current gates (Phase 8D/8E/8H/8K/8L):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"  LS max age: {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h  "
@@ -4319,7 +4433,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
         f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
         f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
-        f"  Watchlist: enabled"
+        f"  Watchlist: signal-eligible only"
     ))
 
 
@@ -4419,7 +4533,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
         "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate · "
         "Phase 8I candidate debug dedup · Phase 8J TP/SL percentage ranges · "
-        "Phase 8K fresh entry retest gate)"
+        "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4504,7 +4618,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8H</b> Liquidity Sweep recency gate: active ✅\n"
                 f"<b>Phase 8I</b> candidate debug dedup: active ✅\n"
                 f"<b>Phase 8J</b> TP/SL percentage ranges: active ✅\n"
-                f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n\n"
+                f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n"
+                f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
@@ -4537,4 +4652,5 @@ def make_app() -> web.Application:
 if __name__ == "__main__":
     _selftest_pct_format_helpers()
     _selftest_entry_retest_helpers()
+    _selftest_pending_signal_eligible_watchlist()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
