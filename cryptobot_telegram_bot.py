@@ -3420,6 +3420,84 @@ _SETUP_LABELS: Dict[str, str] = {
 }
 
 
+def calc_pct_from_entry(side: str, entry_price: float, target_price: float) -> float:
+    """
+    Percentage move from one entry price to a target price.
+
+    Positive value = profit direction for the idea.
+    Negative value = adverse direction / risk.
+
+    LONG:  (target - entry) / entry × 100
+    SHORT: (entry - target) / entry × 100
+    """
+    if entry_price <= 0.0:
+        return 0.0
+    if side == "SHORT":
+        return (entry_price - target_price) / entry_price * 100.0
+    return (target_price - entry_price) / entry_price * 100.0
+
+
+def format_pct_from_entry_zone(
+    side: str,
+    entry_low: float,
+    entry_high: float,
+    target_price: float,
+) -> str:
+    """
+    Format the percentage move from the whole entry zone to a target price.
+
+    For entry ranges the output is also a range, sorted by absolute distance:
+      +2.10%–+2.75%
+      -1.20%–-1.60%
+
+    If the rounded values are equal, returns a single value: +2.10%.
+    """
+    entries = [p for p in (entry_low, entry_high) if p > 0.0]
+    if not entries:
+        return "+0.00%"
+
+    values = [calc_pct_from_entry(side, p, target_price) for p in entries]
+    values = sorted(values, key=lambda x: (abs(x), x))
+    rendered = [f"{v:+.2f}%" for v in values]
+
+    if len(rendered) == 1 or rendered[0] == rendered[-1]:
+        return rendered[0]
+    return f"{rendered[0]}–{rendered[-1]}"
+
+
+def format_level_pct(
+    side: str,
+    entry_low: float,
+    entry_high: float,
+    target_price: float,
+) -> str:
+    """Return parenthesised percentage text for TP/SL display."""
+    return f"({format_pct_from_entry_zone(side, entry_low, entry_high, target_price)})"
+
+
+def format_tp_with_rr(
+    side: str,
+    entry_low: float,
+    entry_high: float,
+    tp: float,
+    rr: float,
+) -> str:
+    """Return combined percentage + RR text for take-profit display."""
+    pct = format_pct_from_entry_zone(side, entry_low, entry_high, tp)
+    return f"({pct} | RR {rr:.2f})"
+
+
+def _selftest_pct_format_helpers() -> None:
+    """Tiny deterministic self-test for TP/SL percentage formatting."""
+    # LONG: entry 100–102, TP 110, SL 95
+    assert format_pct_from_entry_zone("LONG", 100.0, 102.0, 110.0) == "+7.84%–+10.00%"
+    assert format_pct_from_entry_zone("LONG", 100.0, 102.0, 95.0) == "-5.00%–-6.86%"
+
+    # SHORT: entry 100–102, TP 90, SL 105
+    assert format_pct_from_entry_zone("SHORT", 100.0, 102.0, 90.0) == "+10.00%–+11.76%"
+    assert format_pct_from_entry_zone("SHORT", 100.0, 102.0, 105.0) == "-2.94%–-5.00%"
+
+
 def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     """
     Render a new-idea Telegram message in HTML.
@@ -3466,11 +3544,12 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
         f"📍 <b>Entry zone:</b>  "
         f"<code>{idea.entry_low:.5f} – {idea.entry_high:.5f}</code>\n"
         f"{status_line}"
-        f"🛡 <b>Stop Loss:</b>   <code>{idea.stop_loss:.5f}</code>\n\n"
+        f"🛡 <b>Stop Loss:</b>   <code>{idea.stop_loss:.5f}</code>  "
+        f"<i>{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}</i>\n\n"
         f"🎯 <b>TP1:</b>  <code>{idea.tp1:.5f}</code>  "
-        f"<i>(RR {idea.rr_tp1:.2f})</i>\n"
+        f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n"
         f"🎯 <b>TP2:</b>  <code>{idea.tp2:.5f}</code>  "
-        f"<i>(RR {idea.rr_tp2:.2f})</i>\n\n"
+        f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}</i>\n\n"
         f"{age_line}"
         f"🛑 <b>Idea invalid if:</b> {html.escape(idea.invalidation)}\n\n"
         f"<i>{disclaimer}</i>"
@@ -3493,19 +3572,20 @@ def format_idea_update(idea: ActiveIdea, event: str) -> str:
         return (
             f"{dry_prefix}🟡 <b>TP1 HIT</b> — {header}\n\n"
             f"<b>TP1:</b> <code>{idea.tp1:.5f}</code>  "
-            f"<i>(RR {idea.rr_tp1:.2f})</i>\n\n"
+            f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n\n"
             f"Idea remains active toward TP2."
         )
     if event == "TP2_HIT":
         return (
             f"{dry_prefix}✅ <b>TP2 HIT — Idea completed!</b>\n{header}\n\n"
             f"<b>TP2:</b> <code>{idea.tp2:.5f}</code>  "
-            f"<i>(RR {idea.rr_tp2:.2f})</i>"
+            f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}</i>"
         )
     if event == "SL_HIT":
         return (
             f"{dry_prefix}❌ <b>STOP LOSS HIT</b>\n{header}\n\n"
-            f"<b>SL:</b> <code>{idea.stop_loss:.5f}</code>"
+            f"<b>SL:</b> <code>{idea.stop_loss:.5f}</code>  "
+            f"<i>{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}</i>"
         )
     if event == "EXPIRED":
         return (
@@ -3713,9 +3793,12 @@ async def _cmd_ideas(app: web.Application, cid: int) -> None:
             f"{e} <b>{sym.replace('USDT','')}</b> {idea.side} | "
             f"{idea.setup_type.replace('_',' ')} | score {idea.setup_score}\n"
             f"   Entry {idea.entry_low:.4f}–{idea.entry_high:.4f} | "
-            f"SL {idea.stop_loss:.4f}\n"
-            f"   TP1 {idea.tp1:.4f} (RR {idea.rr_tp1:.2f}) | "
-            f"TP2 {idea.tp2:.4f} (RR {idea.rr_tp2:.2f})\n"
+            f"SL {idea.stop_loss:.4f} "
+            f"{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}\n"
+            f"   TP1 {idea.tp1:.4f} "
+            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)} | "
+            f"TP2 {idea.tp2:.4f} "
+            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n"
             f"   Status: {idea.status} | Age: {age_h}h\n"
         )
     await tg.send(cid, "\n".join(lines))
@@ -3742,9 +3825,12 @@ async def _cmd_idea_detail(app: web.Application, cid: int, sym: str) -> None:
         f"<b>Setup:</b>  {idea.setup_type.replace('_',' ')} (score {idea.setup_score})\n"
         f"<b>Status:</b> {idea.status}\n\n"
         f"<b>Entry zone:</b> {idea.entry_low:.5f} – {idea.entry_high:.5f}\n"
-        f"<b>Stop Loss:</b>  {idea.stop_loss:.5f}\n"
-        f"<b>TP1:</b>        {idea.tp1:.5f}  (RR {idea.rr_tp1:.2f})\n"
-        f"<b>TP2:</b>        {idea.tp2:.5f}  (RR {idea.rr_tp2:.2f})\n\n"
+        f"<b>Stop Loss:</b>  {idea.stop_loss:.5f}  "
+        f"{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}\n"
+        f"<b>TP1:</b>        {idea.tp1:.5f}  "
+        f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}\n"
+        f"<b>TP2:</b>        {idea.tp2:.5f}  "
+        f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n\n"
         f"<b>Invalidation:</b> {html.escape(idea.invalidation)}\n\n"
         f"<b>Age:</b> {age_h}h  |  <b>Expires in:</b> {exp_h}h"
     ))
@@ -3850,9 +3936,12 @@ async def _cmd_candidates(app: web.Application, cid: int) -> None:
             f"Regime: {regime_e} {rec.regime}\n"
             f"Current: <code>{rec.current_price:.5f}</code>\n"
             f"Entry: <code>{rec.entry_low:.5f} – {rec.entry_high:.5f}</code>\n"
-            f"SL: <code>{rec.stop_loss:.5f}</code>\n"
-            f"TP1: <code>{rec.tp1:.5f}</code> (RR {rec.rr_tp1:.2f})  "
-            f"TP2: <code>{rec.tp2:.5f}</code> (RR {rec.rr_tp2:.2f})\n"
+            f"SL: <code>{rec.stop_loss:.5f}</code> "
+            f"{format_level_pct(rec.side, rec.entry_low, rec.entry_high, rec.stop_loss)}\n"
+            f"TP1: <code>{rec.tp1:.5f}</code> "
+            f"{format_tp_with_rr(rec.side, rec.entry_low, rec.entry_high, rec.tp1, rec.rr_tp1)}  "
+            f"TP2: <code>{rec.tp2:.5f}</code> "
+            f"{format_tp_with_rr(rec.side, rec.entry_low, rec.entry_high, rec.tp2, rec.rr_tp2)}\n"
             f"Setup age: {rec.setup_age_h}h | Updated: {age_ago}s ago"
         )
 
@@ -3907,9 +3996,12 @@ async def _cmd_watchlist(app: web.Application, cid: int) -> None:
             f"   Current: <code>{p.current_price:.5f}</code>  "
             f"Distance: {dist_str}\n"
             f"   Entry: <code>{p.entry_low:.5f} – {p.entry_high:.5f}</code>\n"
-            f"   SL: <code>{p.stop_loss:.5f}</code>  "
-            f"TP1: <code>{p.tp1:.5f}</code> (RR {p.rr_tp1:.2f})  "
-            f"TP2: <code>{p.tp2:.5f}</code> (RR {p.rr_tp2:.2f})\n"
+            f"   SL: <code>{p.stop_loss:.5f}</code> "
+            f"{format_level_pct(p.side, p.entry_low, p.entry_high, p.stop_loss)}  "
+            f"TP1: <code>{p.tp1:.5f}</code> "
+            f"{format_tp_with_rr(p.side, p.entry_low, p.entry_high, p.tp1, p.rr_tp1)}  "
+            f"TP2: <code>{p.tp2:.5f}</code> "
+            f"{format_tp_with_rr(p.side, p.entry_low, p.entry_high, p.tp2, p.rr_tp2)}\n"
             f"   Setup age: {p.setup_age_h}h  "
             f"Updated: {int(now_s()-p.updated_at)}s ago\n"
             f"   <i>Waiting for price to return to entry zone</i>"
@@ -4287,4 +4379,5 @@ def make_app() -> web.Application:
 
 
 if __name__ == "__main__":
+    _selftest_pct_format_helpers()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
