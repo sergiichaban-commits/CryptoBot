@@ -23,6 +23,7 @@ Phase 8I implemented: candidate_debug_key dedup · add_candidate_debug returns b
 Phase 8J implemented: TP/SL percentage ranges in signal and command outputs
 Phase 8K implemented: Fresh Entry Retest gate for older Liquidity Sweep candidates
 Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR + signal gate
+Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · quality gates
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -166,17 +167,29 @@ SWING_PROMINENCE_4H    = int(os.getenv("SWING_PROMINENCE_4H",    "2"))
 SWING_LOOKBACK_1D      = int(os.getenv("SWING_LOOKBACK_1D",      "20"))
 SWING_LOOKBACK_1D_LONG = int(os.getenv("SWING_LOOKBACK_1D_LONG", "60"))
 
-# ── RR minimums (applied to TP2) ──────────────────────────────────────────────
-RR_MIN_TIER1 = float(os.getenv("RR_MIN_TIER1", "1.8"))   # BTC, ETH
-RR_MIN_TIER2 = float(os.getenv("RR_MIN_TIER2", "2.0"))   # all others
+# ── RR minimums ───────────────────────────────────────────────────────────────
+# TP2 remains the main swing target, but TP1 must now also justify the initial risk.
+RR_MIN_TIER1     = float(os.getenv("RR_MIN_TIER1",     "1.8"))  # BTC, ETH TP2
+RR_MIN_TIER2     = float(os.getenv("RR_MIN_TIER2",     "2.0"))  # other symbols TP2
+RR_MIN_TP1_TIER1 = float(os.getenv("RR_MIN_TP1_TIER1", "1.0"))  # BTC, ETH TP1
+RR_MIN_TP1_TIER2 = float(os.getenv("RR_MIN_TP1_TIER2", "1.2"))  # other symbols TP1
 
-# ── Idea lifecycle ─────────────────────────────────────────────────────────────
+# ── Idea lifecycle / post-stop protection ─────────────────────────────────────
 MAX_IDEA_DURATION_DAYS = int(os.getenv("MAX_IDEA_DURATION_DAYS", "10"))
+POST_SL_COOLDOWN_HOURS = int(os.getenv("POST_SL_COOLDOWN_HOURS", "72"))
+REPEATED_SL_LOCK_HOURS = int(os.getenv("REPEATED_SL_LOCK_HOURS", "168"))
+MAX_CONSECUTIVE_SL_SAME_SIDE = int(os.getenv("MAX_CONSECUTIVE_SL_SAME_SIDE", "2"))
 
-# ── Setup scoring thresholds ───────────────────────────────────────────────────
-MIN_SCORE_NORMAL               = int(os.getenv("MIN_SCORE_NORMAL",               "55"))
+# ── Setup scoring / quality gates ──────────────────────────────────────────────
+MIN_SCORE_NORMAL               = int(os.getenv("MIN_SCORE_NORMAL",               "65"))
 MIN_SCORE_CHOP                 = int(os.getenv("MIN_SCORE_CHOP",                 "85"))
 LIQUIDITY_SWEEP_PRIORITY_SCORE = int(os.getenv("LIQUIDITY_SWEEP_PRIORITY_SCORE", "85"))
+SECONDARY_CANDIDATE_MIN_SCORE  = int(os.getenv("SECONDARY_CANDIDATE_MIN_SCORE",  "75"))
+REQUIRE_4H_TREND_ALIGNMENT     = _bool_env("REQUIRE_4H_TREND_ALIGNMENT", True)
+REQUIRE_TP_REVERSAL_CONFIRM    = _bool_env("REQUIRE_TP_REVERSAL_CONFIRM", True)
+REQUIRE_TP_REVERSAL_VOLUME     = _bool_env("REQUIRE_TP_REVERSAL_VOLUME", True)
+REQUIRE_LS_REVERSAL_CONFIRM    = _bool_env("REQUIRE_LS_REVERSAL_CONFIRM", True)
+REQUIRE_LS_SWEEP_VOLUME        = _bool_env("REQUIRE_LS_SWEEP_VOLUME", True)
 
 # ── Volume multipliers (per setup type) ───────────────────────────────────────
 BREAKOUT_VOL_MIN             = float(os.getenv("BREAKOUT_VOL_MIN",             "1.2"))
@@ -848,7 +861,7 @@ class ActiveIdea:
     rr_tp2:       float
 
     status:       str        # "ACTIVE" | "TP1_HIT" | "TP2_HIT" | "SL_HIT"
-                             #           | "EXPIRED" | "INVALIDATED"
+                             #           | "EXPIRED" | "INVALIDATED" | "AMBIGUOUS"
     emitted_at:   int        # unix seconds
     expires_at:   int        # = emitted_at + MAX_IDEA_DURATION_DAYS * 86400
     invalidation: str        # plain-text thesis invalidation note sent in signal
@@ -923,6 +936,16 @@ class SymbolState:
     last_scanned_ts: int  = 0
     ready:           bool = False
 
+    # Phase 8L.1: post-stop memory.  Exact stopped setup keys are never reused;
+    # same-direction retries also require a new confirmation after the stop and
+    # must wait through the configured cooldown.
+    last_exit_ts:             int = 0
+    last_exit_event:          str = ""
+    last_stopped_side:        str = ""
+    consecutive_sl_same_side: int = 0
+    post_sl_lock_until:       int = 0
+    stopped_setup_keys: Set[Tuple[str, int]] = field(default_factory=set)
+
 
 @dataclass
 class Market:
@@ -936,6 +959,7 @@ class Market:
     signal_stats: Dict[str, int] = field(default_factory=lambda: {
         "total": 0, "long": 0, "short": 0,
         "tp1_hit": 0, "tp2_hit": 0, "sl_hit": 0, "expired": 0,
+        "ambiguous": 0,
     })
     last_poll_ts: int = 0
     poll_count:   int = 0
@@ -1013,6 +1037,10 @@ class ScanDiagnostics:
     rr_current_fail:        int = 0
     signal_gate_fail:       int = 0
     entry_retest_too_old:   int = 0
+    fast_4h_conflict:       int = 0
+    post_sl_cooldown:       int = 0
+    reused_stopped_setup:   int = 0
+    secondary_score_fail:   int = 0
     actionable_ok:          int = 0
     new_idea:               int = 0
     errors:                 int = 0
@@ -1746,6 +1774,27 @@ def _scan_pullback_side(
     if side == "SHORT" and last_4h[B_CLOSE] >= state.ema20_4h:
         return None    # 4H hasn't closed back below EMA20_4H yet
 
+    # Phase 8L.1: "4H confirmation" must be an actual reversal candle, not
+    # merely a close on the correct side of EMA20.
+    prev_4h = _prev_bar(closed_4h, last_4h[B_TS])
+    if REQUIRE_TP_REVERSAL_CONFIRM:
+        reversal_ok = (
+            is_bullish_retest_candle(last_4h, prev_4h)
+            if side == "LONG"
+            else is_bearish_retest_candle(last_4h, prev_4h)
+        )
+        if not reversal_ok:
+            return None
+
+    # The reversal must also carry at least normal 4H volume when enabled.
+    if REQUIRE_TP_REVERSAL_VOLUME:
+        vol_sma_4h = (
+            calc_vol_sma(closed_4h, VOL_SMA_PERIOD)
+            if len(closed_4h) >= VOL_SMA_PERIOD else 0.0
+        )
+        if vol_sma_4h <= 0.0 or last_4h[B_VOLUME] < vol_sma_4h * PULLBACK_REVERSAL_VOL_MIN:
+            return None
+
     # ── SL: beyond the pullback extreme ─────────────────────────────────────
     if side == "LONG":
         sl_extreme = min(b[B_LOW]  for b in pullback_bars)
@@ -1906,28 +1955,27 @@ def _is_clear_sweep(bar: Bar, level: float, side: str, atr: float) -> bool:
 def _find_sweep_confirmation(
     side: str,
     sweep_bar_ts: int,
+    sweep_tf: str,
     swept_level: float,
     closed_4h: List[Bar],
     closed_1h: List[Bar],
-    exclude_ts: Optional[int] = None,
 ) -> Optional[Tuple[Bar, str]]:
     """
-    Find the first 4H (preferred) or 1H bar that confirms the sweep reversal.
+    Find the first temporally valid 4H/1H reversal confirmation after a sweep.
 
-    Timing window: [sweep_bar_ts, sweep_bar_ts + 3 days).
-    Condition:
-      LONG  — bar close > swept_level
-      SHORT — bar close < swept_level
-    Returns (confirm_bar, tf_key) or None.
-    Bars must be in chronological order (oldest first).
+    Critical ordering rule (Phase 8L.1): lower-timeframe bars that belong to
+    the sweep candle itself cannot confirm it because OHLC data does not reveal
+    whether those bars occurred before or after the sweep extreme.
 
-    exclude_ts: when set, skip the bar whose B_TS equals this value.
-    Used when sweep_tf == "4h" to prevent the sweep candle from confirming
-    itself (sweep candle already closes back inside level — that is the
-    hard condition, not independent confirmation).
+      1D sweep → confirmation starts after the daily candle has closed.
+      4H sweep → confirmation starts after the four-hour candle has closed.
+
+    The search window is three days after that close.  When enabled, the
+    confirming bar must also be a pin/engulfing reversal candle.
     """
-    start_ts = sweep_bar_ts
-    end_ts   = sweep_bar_ts + 3 * 86_400_000
+    duration_ms = 86_400_000 if sweep_tf == "1d" else 4 * 3_600_000
+    start_ts = sweep_bar_ts + duration_ms
+    end_ts   = start_ts + 3 * 86_400_000
 
     for tf_key, bars in (("4h", closed_4h), ("1h", closed_1h)):
         for bar in bars:
@@ -1936,12 +1984,26 @@ def _find_sweep_confirmation(
                 continue
             if ts >= end_ts:
                 break
-            if exclude_ts is not None and ts == exclude_ts:
+
+            level_ok = (
+                bar[B_CLOSE] > swept_level
+                if side == "LONG"
+                else bar[B_CLOSE] < swept_level
+            )
+            if not level_ok:
                 continue
-            if side == "LONG"  and bar[B_CLOSE] > swept_level:
-                return (bar, tf_key)
-            if side == "SHORT" and bar[B_CLOSE] < swept_level:
-                return (bar, tf_key)
+
+            if REQUIRE_LS_REVERSAL_CONFIRM:
+                prev = _prev_bar(bars, ts)
+                reversal_ok = (
+                    is_bullish_retest_candle(bar, prev)
+                    if side == "LONG"
+                    else is_bearish_retest_candle(bar, prev)
+                )
+                if not reversal_ok:
+                    continue
+
+            return (bar, tf_key)
     return None
 
 
@@ -1955,6 +2017,7 @@ def _score_sweep(
     confirm_bar: Optional[Bar],
     confirm_tf: str,
     closed_4h: List[Bar],
+    closed_1h: List[Bar],
     level_in_short_lookback: bool,
 ) -> int:
     """
@@ -1986,8 +2049,8 @@ def _score_sweep(
 
     # +15: confirmation candle character (hammer/engulfing)
     if confirm_bar is not None:
-        prev = (_prev_bar(closed_4h, confirm_bar[B_TS])
-                if confirm_tf == "4h" else None)
+        confirm_bars = closed_4h if confirm_tf == "4h" else closed_1h
+        prev = _prev_bar(confirm_bars, confirm_bar[B_TS])
         if side == "LONG"  and is_bullish_retest_candle(confirm_bar, prev):
             score += 15
         elif side == "SHORT" and is_bearish_retest_candle(confirm_bar, prev):
@@ -2094,13 +2157,16 @@ def _scan_sweep_side(
 
     level_in_short_lookback = swept_level in short_levels
 
+    # Phase 8L.1: a sweep without at least normal relative volume is too easy
+    # to generate in noise and is rejected before confirmation/scoring.
+    if REQUIRE_LS_SWEEP_VOLUME:
+        if vol_sma <= 0.0 or sweep_bar[B_VOLUME] < vol_sma * SWEEP_VOL_MIN:
+            return None
+
     # ── 4H / 1H confirmation ──────────────────────────────────────────────────
-    # When the sweep was found on a 4H bar, pass exclude_ts so the sweep candle
-    # cannot confirm itself: its close-back-above/below the level satisfies the
-    # hard condition for the sweep, but we require a *separate* bar to confirm.
+    # Confirmation starts only after the sweep candle has fully closed.
     confirm = _find_sweep_confirmation(
-        side, sweep_bar[B_TS], swept_level, closed_4h, closed_1h,
-        exclude_ts=sweep_bar[B_TS] if sweep_tf == "4h" else None,
+        side, sweep_bar[B_TS], sweep_tf, swept_level, closed_4h, closed_1h
     )
     if confirm is None:
         return None
@@ -2147,7 +2213,7 @@ def _scan_sweep_side(
     # ── Score ─────────────────────────────────────────────────────────────────
     score = _score_sweep(
         side, sweep_bar, swept_level, atr, vol_sma,
-        state, confirm_bar, confirm_tf, closed_4h,
+        state, confirm_bar, confirm_tf, closed_4h, closed_1h,
         level_in_short_lookback,
     )
 
@@ -2411,17 +2477,47 @@ def calc_swing_tpsl(result: SetupResult, state: SymbolState) -> SetupResult:
 
 def passes_rr_gate(result: SetupResult, symbol: str) -> bool:
     """
-    True when rr_tp2 meets the tier-specific minimum.
+    Require both a viable first target and the tier-specific swing target.
 
-      TIER 1 (BTCUSDT, ETHUSDT) : rr_tp2 >= RR_MIN_TIER1  (1.8)
-      TIER 2 (all others)        : rr_tp2 >= RR_MIN_TIER2  (2.0)
-
-    Returns False for None result, zero or negative rr_tp2.
+      Tier 1 (BTC/ETH): TP1 >= RR_MIN_TP1_TIER1 and TP2 >= RR_MIN_TIER1
+      Tier 2 (others):  TP1 >= RR_MIN_TP1_TIER2 and TP2 >= RR_MIN_TIER2
     """
-    if result is None or result.rr_tp2 <= 0.0:
+    if result is None or result.rr_tp1 <= 0.0 or result.rr_tp2 <= 0.0:
         return False
-    threshold = RR_MIN_TIER1 if symbol in TIER1_SYMBOLS else RR_MIN_TIER2
-    return result.rr_tp2 >= threshold
+    if symbol in TIER1_SYMBOLS:
+        return result.rr_tp1 >= RR_MIN_TP1_TIER1 and result.rr_tp2 >= RR_MIN_TIER1
+    return result.rr_tp1 >= RR_MIN_TP1_TIER2 and result.rr_tp2 >= RR_MIN_TIER2
+
+
+def validate_fast_4h_alignment(state: SymbolState, result: SetupResult) -> Tuple[bool, str]:
+    """Block entries against the fast closed-4H trend state."""
+    if not REQUIRE_4H_TREND_ALIGNMENT:
+        return True, "ok"
+    if len(state.bars_4h) < 2 or state.ema20_4h <= 0.0 or state.ema50_4h <= 0.0:
+        return False, "fast_4h_conflict"
+    close_4h = state.bars_4h[-2][B_CLOSE]
+    if result.side == "LONG":
+        ok = close_4h > state.ema20_4h > state.ema50_4h
+    else:
+        ok = close_4h < state.ema20_4h < state.ema50_4h
+    return (True, "ok") if ok else (False, "fast_4h_conflict")
+
+
+def validate_post_sl_reentry(state: SymbolState, result: SetupResult) -> Tuple[bool, str]:
+    """Prevent recycling a stopped thesis and immediate same-direction revenge entries."""
+    key = (result.setup_type, result.setup_ts)
+    if key in state.stopped_setup_keys:
+        return False, "reused_stopped_setup"
+
+    if state.last_exit_event != "SL_HIT" or result.side != state.last_stopped_side:
+        return True, "ok"
+
+    # A candidate confirmed before (or during) the stopped trade is not a new thesis.
+    if result.setup_ts <= state.last_exit_ts * 1000:
+        return False, "post_sl_cooldown"
+    if now_s() < state.post_sl_lock_until:
+        return False, "post_sl_cooldown"
+    return True, "ok"
 
 
 def can_signal(
@@ -2485,6 +2581,12 @@ def can_signal(
             return False
         if btc == "NEUTRAL" and score < MIN_SCORE_CHOP:
             return False
+
+    # Fast 4H alignment and post-stop protection (defence in depth).
+    if not validate_fast_4h_alignment(state, result)[0]:
+        return False
+    if not validate_post_sl_reentry(state, result)[0]:
+        return False
 
     # RR gate
     return passes_rr_gate(result, sym)
@@ -2671,6 +2773,14 @@ def _diag_actionable_fail(
         d.entry_retest_too_old += 1; t.entry_retest_too_old += 1
     elif reason == "liquidity_sweep_too_old":
         d.liquidity_sweep_too_old += 1; t.liquidity_sweep_too_old += 1
+    elif reason == "fast_4h_conflict":
+        d.fast_4h_conflict += 1; t.fast_4h_conflict += 1
+    elif reason == "post_sl_cooldown":
+        d.post_sl_cooldown += 1; t.post_sl_cooldown += 1
+    elif reason == "reused_stopped_setup":
+        d.reused_stopped_setup += 1; t.reused_stopped_setup += 1
+    elif reason == "secondary_score_fail":
+        d.secondary_score_fail += 1; t.secondary_score_fail += 1
     else:
         logger.debug(f"_diag_actionable_fail: unhandled reason '{reason}'")
 
@@ -3000,6 +3110,13 @@ def validate_signal_eligible_pending(
     if not passes_rr_gate(eligible_result, sym):
         return False, eligible_result, "rr_current_fail"
 
+    fast_ok, fast_reason = validate_fast_4h_alignment(state, eligible_result)
+    if not fast_ok:
+        return False, eligible_result, fast_reason
+    retry_ok, retry_reason = validate_post_sl_reentry(state, eligible_result)
+    if not retry_ok:
+        return False, eligible_result, retry_reason
+
     if not can_signal(sym, state, mkt, eligible_result):
         return False, eligible_result, "signal_gate_fail"
 
@@ -3118,6 +3235,14 @@ def evaluate_candidate(
     if not retest_ok:
         return CandidateEval(result, "DEAD", retest_reason, candidate_source=source)
 
+    # 3c. Fast 4H direction and post-stop re-entry protection.
+    fast_ok, fast_reason = validate_fast_4h_alignment(state, result)
+    if not fast_ok:
+        return CandidateEval(result, "DEAD", fast_reason, candidate_source=source)
+    retry_ok, retry_reason = validate_post_sl_reentry(state, result)
+    if not retry_ok:
+        return CandidateEval(result, "DEAD", retry_reason, candidate_source=source)
+
     # 4. Update RR from current price
     if RR_FROM_CURRENT_PRICE and px > 0.0:
         rr1_px, rr2_px = calc_rr_from_current(
@@ -3194,6 +3319,10 @@ async def scan_symbol(
             clear_pending_setup(mkt, sym, "detector_none")
             return
 
+        # Preserve the original detector-priority winner.  If it dies, a
+        # secondary candidate may replace it only at a higher quality floor.
+        primary_candidate = choose_best_candidate(candidates)
+
         # ── Evaluate each candidate independently ─────────────────────────────
         evals: List[CandidateEval] = [
             evaluate_candidate(sym, state, mkt, c) for c in candidates
@@ -3222,10 +3351,24 @@ async def scan_symbol(
         # ── Prefer ACTIONABLE candidate ───────────────────────────────────────
         actionable = [ev.result for ev in evals if ev.status == "ACTIONABLE" and ev.result]
         if actionable:
-            result = choose_best_candidate(actionable)
-            if result is None:
-                clear_pending_setup(mkt, sym, "no_actionable_winner")
-                return
+            def _same_candidate(a: SetupResult, b: SetupResult) -> bool:
+                return (a.setup_type, a.side, a.setup_ts) == (b.setup_type, b.side, b.setup_ts)
+
+            primary_actionable = (
+                next((r for r in actionable if primary_candidate and _same_candidate(r, primary_candidate)), None)
+            )
+            if primary_actionable is not None:
+                result = primary_actionable
+            else:
+                strong_secondary = [
+                    r for r in actionable if r.score >= SECONDARY_CANDIDATE_MIN_SCORE
+                ]
+                result = choose_best_candidate(strong_secondary)
+                if result is None:
+                    d.secondary_score_fail += 1
+                    t.secondary_score_fail += 1
+                    clear_pending_setup(mkt, sym, "secondary_score_fail")
+                    return
 
             clear_pending_setup(mkt, sym, "signal_firing")
             px   = get_current_price(state)
@@ -3481,121 +3624,162 @@ async def poll_loop(app: web.Application) -> None:
 # === 14. IDEA LIFECYCLE  (Phase 5) ===
 # =============================================================================
 
+def _lifecycle_bars_after_emission(state: SymbolState, idea: ActiveIdea) -> List[Bar]:
+    """
+    Return chronological monitoring bars that started strictly after emission.
+
+    Ignoring the candle containing the signal prevents a pre-signal high/low
+    from being counted as a later TP or SL.  1H is preferred to reduce OHLC
+    ordering ambiguity; 4H/1D are defensive fallbacks.
+    """
+    bars = state.bars_1h or state.bars_4h or state.bars_1d
+    emitted_ms = idea.emitted_at * 1000
+    return [bar for bar in bars if bar[B_TS] > emitted_ms]
+
+
+def _idea_bar_hits(idea: ActiveIdea, bar: Bar) -> Tuple[bool, bool, bool]:
+    """Return (sl_hit, tp1_hit, tp2_hit) for one bar."""
+    if idea.side == "LONG":
+        return (
+            bar[B_LOW] <= idea.stop_loss,
+            bar[B_HIGH] >= idea.tp1,
+            bar[B_HIGH] >= idea.tp2,
+        )
+    return (
+        bar[B_HIGH] >= idea.stop_loss,
+        bar[B_LOW] <= idea.tp1,
+        bar[B_LOW] <= idea.tp2,
+    )
+
+
+def _record_sl_memory(state: SymbolState, idea: ActiveIdea, exit_ts: int) -> None:
+    """Update cooldown/streak state after an actual stop-loss event."""
+    if state.last_stopped_side == idea.side:
+        state.consecutive_sl_same_side += 1
+    else:
+        state.consecutive_sl_same_side = 1
+
+    state.last_exit_ts = exit_ts
+    state.last_exit_event = "SL_HIT"
+    state.last_stopped_side = idea.side
+    state.stopped_setup_keys.add((idea.setup_type, idea.setup_ts))
+    if len(state.stopped_setup_keys) > 200:
+        state.stopped_setup_keys = {(idea.setup_type, idea.setup_ts)}
+
+    lock_h = (
+        REPEATED_SL_LOCK_HOURS
+        if state.consecutive_sl_same_side >= MAX_CONSECUTIVE_SL_SAME_SIDE
+        else POST_SL_COOLDOWN_HOURS
+    )
+    state.post_sl_lock_until = exit_ts + lock_h * 3600
+
+
+def _reset_sl_streak_after_success(state: SymbolState) -> None:
+    state.consecutive_sl_same_side = 0
+    state.last_stopped_side = ""
+    state.post_sl_lock_until = 0
+
+
 async def check_idea_lifecycle(
     sym: str,
     state: SymbolState,
     app: web.Application,
 ) -> None:
     """
-    Phase 5: Check an active idea for TP1/TP2 hits, SL hit, and expiry.
+    Temporal-safe TP/SL lifecycle.
 
-    Bar source (uses potentially-forming candle — intentional, for live monitoring):
-      bars_4h[-1] preferred; falls back to bars_1d[-1]; returns early if neither.
-
-    Hit conditions:
-      LONG:  TP1/TP2 hit if bar_high >= target;  SL hit if bar_low  <= stop_loss
-      SHORT: TP1/TP2 hit if bar_low  <= target;  SL hit if bar_high >= stop_loss
-
-    Priority on the same bar: SL > TP2 > TP1
-
-    Status transitions:
-      ACTIVE     → TP1_HIT  (idea stays open; tp1_hit stat incremented once)
-      ACTIVE     → TP2_HIT  (idea closed; tp2_hit stat incremented)
-      ACTIVE     → SL_HIT   (idea closed; sl_hit stat incremented)
-      ACTIVE     → EXPIRED  (now >= expires_at; expired stat incremented)
-      TP1_HIT    → TP2_HIT  (idea closed)
-      TP1_HIT    → SL_HIT   (idea closed)
-      TP1_HIT    → EXPIRED
-
-    Phase 6 send_idea_update is active; lifecycle events are logged and
-    dispatched to Telegram recipients.
+    Only bars that begin after the idea was emitted are eligible.  Bars are
+    processed chronologically on 1H where possible.  If an unobserved bar hits
+    both profit and stop levels, OHLC cannot reveal the order, so the idea is
+    closed as AMBIGUOUS and is excluded from TP/SL performance counts.
     """
-    idea: Optional[ActiveIdea] = state.active_idea
+    idea = state.active_idea
     if idea is None:
         return
 
-    # ── Bar selection ─────────────────────────────────────────────────────────
-    if state.bars_4h:
-        bar = state.bars_4h[-1]
-    elif state.bars_1d:
-        bar = state.bars_1d[-1]
-    else:
-        return
-
-    bar_high = bar[B_HIGH]
-    bar_low  = bar[B_LOW]
-    now      = now_s()
+    now = now_s()
     mkt: Market = app["mkt"]
+    bars = _lifecycle_bars_after_emission(state, idea)
 
-    # ── Hit detection ─────────────────────────────────────────────────────────
-    if idea.side == "LONG":
-        sl_hit  = bar_low  <= idea.stop_loss
-        tp2_hit = bar_high >= idea.tp2
-        tp1_hit = bar_high >= idea.tp1
-    else:  # SHORT
-        sl_hit  = bar_high >= idea.stop_loss
-        tp2_hit = bar_low  <= idea.tp2
-        tp1_hit = bar_low  <= idea.tp1
+    for bar in bars:
+        sl_hit, tp1_hit, tp2_hit = _idea_bar_hits(idea, bar)
 
-    expired = now >= idea.expires_at
+        # If both sides of the trade were first observed inside one OHLC bar,
+        # order is unknowable.  Do not force the result into the SL bucket.
+        ambiguous = sl_hit and (tp2_hit or (idea.status == "ACTIVE" and tp1_hit))
+        if ambiguous:
+            idea.status = "AMBIGUOUS"
+            state.active_idea = None
+            state.last_exit_ts = now
+            state.last_exit_event = "AMBIGUOUS"
+            mkt.signal_stats["ambiguous"] += 1
+            logger.info(
+                f"IDEA AMBIGUOUS {sym} {idea.side} {idea.setup_type} "
+                f"bar_ts={bar[B_TS]} (TP/SL order unknown)"
+            )
+            try:
+                await send_idea_update(app, idea, "AMBIGUOUS")
+            except Exception as e:
+                logger.warning(f"send_idea_update AMBIGUOUS failed {sym}: {e}")
+                await report_error(app, f"send_idea_update/{sym}/AMBIGUOUS", e)
+            return
 
-    # ── Apply in priority order ───────────────────────────────────────────────
-    # SL first
-    if sl_hit and idea.status in ("ACTIVE", "TP1_HIT"):
-        idea.status       = "SL_HIT"
+        if sl_hit and idea.status in ("ACTIVE", "TP1_HIT"):
+            idea.status = "SL_HIT"
+            state.active_idea = None
+            mkt.signal_stats["sl_hit"] += 1
+            _record_sl_memory(state, idea, now)
+            logger.info(
+                f"IDEA SL_HIT {sym} {idea.side} {idea.setup_type} "
+                f"sl={idea.stop_loss:.4f}"
+            )
+            try:
+                await send_idea_update(app, idea, "SL_HIT")
+            except Exception as e:
+                logger.warning(f"send_idea_update SL_HIT failed {sym}: {e}")
+                await report_error(app, f"send_idea_update/{sym}/SL_HIT", e)
+            return
+
+        if tp2_hit and idea.status in ("ACTIVE", "TP1_HIT"):
+            idea.status = "TP2_HIT"
+            state.active_idea = None
+            state.last_exit_ts = now
+            state.last_exit_event = "TP2_HIT"
+            _reset_sl_streak_after_success(state)
+            mkt.signal_stats["tp2_hit"] += 1
+            logger.info(
+                f"IDEA TP2_HIT {sym} {idea.side} {idea.setup_type} "
+                f"tp2={idea.tp2:.4f}"
+            )
+            try:
+                await send_idea_update(app, idea, "TP2_HIT")
+            except Exception as e:
+                logger.warning(f"send_idea_update TP2_HIT failed {sym}: {e}")
+                await report_error(app, f"send_idea_update/{sym}/TP2_HIT", e)
+            return
+
+        if tp1_hit and idea.status == "ACTIVE":
+            idea.status = "TP1_HIT"
+            idea.tp1_hit_at = now
+            mkt.signal_stats["tp1_hit"] += 1
+            logger.info(
+                f"IDEA TP1_HIT {sym} {idea.side} {idea.setup_type} "
+                f"tp1={idea.tp1:.4f}"
+            )
+            try:
+                await send_idea_update(app, idea, "TP1_HIT")
+            except Exception as e:
+                logger.warning(f"send_idea_update TP1_HIT failed {sym}: {e}")
+                await report_error(app, f"send_idea_update/{sym}/TP1_HIT", e)
+            # Continue: later chronological bars in this same poll may hit TP2/SL.
+
+    if now >= idea.expires_at and idea.status in ("ACTIVE", "TP1_HIT"):
+        idea.status = "EXPIRED"
         state.active_idea = None
-        mkt.signal_stats["sl_hit"] += 1
-        logger.info(
-            f"IDEA SL_HIT  {sym} {idea.side} {idea.setup_type} "
-            f"sl={idea.stop_loss:.4f}"
-        )
-        try:
-            await send_idea_update(app, idea, "SL_HIT")
-        except Exception as e:
-            logger.warning(f"send_idea_update SL_HIT failed {sym}: {e}")
-            await report_error(app, f"send_idea_update/{sym}/SL_HIT", e)
-        return
-
-    # TP2 next
-    if tp2_hit and idea.status in ("ACTIVE", "TP1_HIT"):
-        idea.status       = "TP2_HIT"
-        state.active_idea = None
-        mkt.signal_stats["tp2_hit"] += 1
-        logger.info(
-            f"IDEA TP2_HIT {sym} {idea.side} {idea.setup_type} "
-            f"tp2={idea.tp2:.4f}"
-        )
-        try:
-            await send_idea_update(app, idea, "TP2_HIT")
-        except Exception as e:
-            logger.warning(f"send_idea_update TP2_HIT failed {sym}: {e}")
-            await report_error(app, f"send_idea_update/{sym}/TP2_HIT", e)
-        return
-
-    # TP1 (only when still ACTIVE — not re-triggered if already TP1_HIT)
-    if tp1_hit and idea.status == "ACTIVE":
-        idea.status     = "TP1_HIT"
-        idea.tp1_hit_at = now
-        mkt.signal_stats["tp1_hit"] += 1
-        logger.info(
-            f"IDEA TP1_HIT {sym} {idea.side} {idea.setup_type} "
-            f"tp1={idea.tp1:.4f}"
-        )
-        try:
-            await send_idea_update(app, idea, "TP1_HIT")
-        except Exception as e:
-            logger.warning(f"send_idea_update TP1_HIT failed {sym}: {e}")
-            await report_error(app, f"send_idea_update/{sym}/TP1_HIT", e)
-        return   # idea stays open
-
-    # Expiry (covers both ACTIVE and TP1_HIT)
-    if expired and idea.status in ("ACTIVE", "TP1_HIT"):
-        idea.status       = "EXPIRED"
-        state.active_idea = None
+        state.last_exit_ts = now
+        state.last_exit_event = "EXPIRED"
         mkt.signal_stats["expired"] += 1
-        logger.info(
-            f"IDEA EXPIRED {sym} {idea.side} {idea.setup_type}"
-        )
+        logger.info(f"IDEA EXPIRED {sym} {idea.side} {idea.setup_type}")
         try:
             await send_idea_update(app, idea, "EXPIRED")
         except Exception as e:
@@ -3724,7 +3908,15 @@ def _selftest_entry_retest_helpers() -> None:
 
 def _selftest_pending_signal_eligible_watchlist() -> None:
     """Tiny deterministic self-test for Phase 8L pending watchlist gating."""
-    state = SymbolState()
+    state = SymbolState(
+        bars_4h=[
+            (now_ms() - 8 * 3_600_000, 100.0, 101.0, 97.0, 98.0, 1.0),
+            (now_ms() - 4 * 3_600_000, 98.0, 99.0, 95.0, 96.0, 1.0),
+            (now_ms(), 96.0, 97.0, 94.0, 95.0, 1.0),
+        ],
+        ema20_4h=97.0,
+        ema50_4h=99.0,
+    )
     state.ready = True
     state.regime = "BEARISH"
     mkt = Market(symbols=["SOLUSDT"], state={"SOLUSDT": state})
@@ -3739,7 +3931,7 @@ def _selftest_pending_signal_eligible_watchlist() -> None:
     ok, checked, reason = validate_signal_eligible_pending(
         "SOLUSDT", state, mkt, long_bad
     )
-    assert not ok and reason == "signal_gate_fail"
+    assert not ok and reason in ("fast_4h_conflict", "signal_gate_fail")
     assert checked.rr_tp2 >= RR_MIN_TIER2
 
     short_ok = SetupResult(
@@ -3851,6 +4043,12 @@ def format_idea_update(idea: ActiveIdea, event: str) -> str:
         )
     if event == "INVALIDATED":
         return f"{dry_prefix}🚫 <b>IDEA CLOSED / INVALIDATED</b>\n{header}"
+    if event == "AMBIGUOUS":
+        return (
+            f"{dry_prefix}⚖️ <b>AMBIGUOUS TP/SL ORDER</b>\n{header}\n\n"
+            f"Both sides were touched inside one OHLC bar. "
+            f"The result is excluded from TP/SL statistics."
+        )
     # Fallback for unexpected events
     return f"{dry_prefix}ℹ️ Idea update: {html.escape(event)}\n{header}"
 
@@ -3886,7 +4084,7 @@ async def send_signal(
 async def send_idea_update(
     app: web.Application,
     idea: ActiveIdea,
-    event: str,   # "TP1_HIT" | "TP2_HIT" | "SL_HIT" | "EXPIRED" | "INVALIDATED"
+    event: str,   # TP1_HIT | TP2_HIT | SL_HIT | EXPIRED | INVALIDATED | AMBIGUOUS
 ) -> None:
     """
     Send a lifecycle-event message via get_broadcast_targets().
@@ -3994,11 +4192,12 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Ideas:</b> {stats['total']} total  "
         f"(L:{stats['long']} / S:{stats['short']})\n"
         f"TP1:{stats['tp1_hit']}  TP2:{stats['tp2_hit']}  "
-        f"SL:{stats['sl_hit']}  Exp:{stats['expired']}\n\n"
+        f"SL:{stats['sl_hit']}  Exp:{stats['expired']}  "
+        f"Amb:{stats['ambiguous']}\n\n"
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.1 quality hotfix"
     ))
 
 
@@ -4144,6 +4343,10 @@ _REASON_ABBREV = {
     "invalidated_since_setup":  "invalidated",
     "liquidity_sweep_too_old":  "ls_old",
     "entry_retest_too_old":     "entry_old",
+    "fast_4h_conflict":           "4h_conflict",
+    "post_sl_cooldown":           "sl_cooldown",
+    "reused_stopped_setup":       "reused_stop",
+    "secondary_score_fail":       "secondary_low",
 }
 
 
@@ -4289,8 +4492,19 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Poll intervals:</b>\n"
         f"  1H={POLL_1H_SEC}s · 4H={POLL_4H_SEC}s · "
         f"1D={POLL_1D_SEC}s · 1W={POLL_1W_SEC}s · 1M={POLL_1M_SEC}s\n\n"
-        f"<b>RR minimum:</b> Tier1 ≥ {RR_MIN_TIER1}  |  Tier2 ≥ {RR_MIN_TIER2}\n"
+        f"<b>RR minimum TP2:</b> Tier1 ≥ {RR_MIN_TIER1}  |  Tier2 ≥ {RR_MIN_TIER2}\n"
+        f"<b>RR minimum TP1:</b> Tier1 ≥ {RR_MIN_TP1_TIER1}  |  Tier2 ≥ {RR_MIN_TP1_TIER2}\n"
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
+        f"<b>Secondary candidate floor:</b> ≥ {SECONDARY_CANDIDATE_MIN_SCORE}\n"
+        f"<b>4H trend alignment:</b> {'required' if REQUIRE_4H_TREND_ALIGNMENT else 'off'}\n"
+        f"<b>TP reversal candle/volume:</b> "
+        f"{'required' if REQUIRE_TP_REVERSAL_CONFIRM else 'optional'} / "
+        f"{'required' if REQUIRE_TP_REVERSAL_VOLUME else 'optional'}\n"
+        f"<b>LS reversal/volume:</b> "
+        f"{'required' if REQUIRE_LS_REVERSAL_CONFIRM else 'optional'} / "
+        f"{'required' if REQUIRE_LS_SWEEP_VOLUME else 'optional'}\n"
+        f"<b>Post-SL lock:</b> {POST_SL_COOLDOWN_HOURS}h; repeated same-side "
+        f"{REPEATED_SL_LOCK_HOURS}h after {MAX_CONSECUTIVE_SL_SAME_SIDE} stops\n"
         f"<b>Max idea duration:</b> {MAX_IDEA_DURATION_DAYS} days\n"
         f"<b>Setup context max:</b> {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
@@ -4402,6 +4616,10 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"rr_curr={d.rr_current_fail}  "
         f"ls_old={d.liquidity_sweep_too_old}  "
         f"entry_old={d.entry_retest_too_old}  "
+        f"4h_conflict={d.fast_4h_conflict}  "
+        f"sl_cooldown={d.post_sl_cooldown}  "
+        f"reused_stop={d.reused_stopped_setup}  "
+        f"secondary_low={d.secondary_score_fail}  "
         f"debug_dedup={d.candidate_debug_dedup}  "
         f"gate_fail={d.signal_gate_fail}\n"
         f"  actionable_ok={d.actionable_ok}  "
@@ -4418,6 +4636,10 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  rr_curr={t.rr_current_fail}  "
         f"ls_old={t.liquidity_sweep_too_old}  "
         f"entry_old={t.entry_retest_too_old}  "
+        f"4h_conflict={t.fast_4h_conflict}  "
+        f"sl_cooldown={t.post_sl_cooldown}  "
+        f"reused_stop={t.reused_stopped_setup}  "
+        f"secondary_low={t.secondary_score_fail}  "
         f"debug_dedup={t.candidate_debug_dedup}  "
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
@@ -4431,8 +4653,11 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"return ≤ {ENTRY_RETEST_MAX_AGE_HOURS}h\n"
         f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
-        f"  RR min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
+        f"  RR TP1 min: Tier1 {RR_MIN_TP1_TIER1} / Tier2 {RR_MIN_TP1_TIER2}\n"
+        f"  RR TP2 min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
         f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
+        f"  4H alignment: {'required' if REQUIRE_4H_TREND_ALIGNMENT else 'off'}\n"
+        f"  Post-SL lock: {POST_SL_COOLDOWN_HOURS}h / repeated {REPEATED_SL_LOCK_HOURS}h\n"
         f"  Watchlist: signal-eligible only"
     ))
 
@@ -4480,7 +4705,8 @@ async def keepalive_loop(app: web.Application) -> None:
             f"Polls: {mkt.poll_count} | "
             f"Last poll: {poll_ago}s ago | "
             f"Ideas: {mkt.signal_stats['total']} "
-            f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']}) | "
+            f"(TP2:{mkt.signal_stats['tp2_hit']} SL:{mkt.signal_stats['sl_hit']} "
+            f"Amb:{mkt.signal_stats['ambiguous']}) | "
             f"Scan diag: checked={d.symbols_checked} "
             f"not_ready={d.symbols_not_ready} lock={d.active_idea_lock} "
             f"detector_none={d.detector_none} "
@@ -4494,6 +4720,10 @@ async def keepalive_loop(app: web.Application) -> None:
             f"tpsl_fail={d.tpsl_fail} rr_curr={d.rr_current_fail} "
             f"ls_old={d.liquidity_sweep_too_old} "
             f"entry_old={d.entry_retest_too_old} "
+            f"4h_conflict={d.fast_4h_conflict} "
+            f"sl_cooldown={d.post_sl_cooldown} "
+            f"reused_stop={d.reused_stopped_setup} "
+            f"secondary_low={d.secondary_score_fail} "
             f"debug_dedup={d.candidate_debug_dedup} "
             f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
             f"new={d.new_idea} errors={d.errors}"
@@ -4533,7 +4763,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8E pending setup watchlist · Phase 8F actionable candidate selection · "
         "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate · "
         "Phase 8I candidate debug dedup · Phase 8J TP/SL percentage ranges · "
-        "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist)"
+        "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist · "
+        "Phase 8L.1 temporal/lifecycle/quality hotfix)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4619,7 +4850,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8I</b> candidate debug dedup: active ✅\n"
                 f"<b>Phase 8J</b> TP/SL percentage ranges: active ✅\n"
                 f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n"
-                f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n\n"
+                f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n"
+                f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
@@ -4640,6 +4872,54 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="OK", status=200)
 
 
+def _selftest_phase_8l1_quality_hotfix() -> None:
+    """Deterministic checks for the critical Phase 8L.1 safety helpers."""
+    base_ts = 1_000_000_000_000
+    idea = ActiveIdea(
+        symbol="TESTUSDT", side="LONG", setup_type="LIQUIDITY_SWEEP", setup_score=80,
+        entry_low=100.0, entry_high=101.0, stop_loss=95.0,
+        tp1=105.0, tp2=110.0, rr_tp1=1.0, rr_tp2=2.0,
+        status="ACTIVE", emitted_at=base_ts // 1000, expires_at=base_ts // 1000 + 86400,
+        invalidation="test", setup_ts=base_ts - 3600000,
+    )
+    state = SymbolState(bars_1h=[
+        (base_ts - 1800000, 100, 120, 90, 100, 1),  # contains emission: ignored
+        (base_ts + 3600000, 100, 104, 99, 103, 1),
+    ])
+    assert len(_lifecycle_bars_after_emission(state, idea)) == 1
+
+    ambiguous_bar: Bar = (base_ts + 3600000, 100, 111, 94, 100, 1)
+    assert _idea_bar_hits(idea, ambiguous_bar) == (True, True, True)
+
+    rr = SetupResult(
+        setup_type="BREAKOUT_RETEST", side="LONG", score=80,
+        entry_low=100, entry_high=101, stop_loss=95, tp1=105, tp2=110,
+        rr_tp1=1.1, rr_tp2=2.1, invalidation="test", setup_ts=base_ts,
+    )
+    assert passes_rr_gate(rr, "BTCUSDT")
+    assert not passes_rr_gate(rr, "SOLUSDT")
+
+    stopped = SymbolState(
+        last_exit_ts=base_ts // 1000, last_exit_event="SL_HIT",
+        last_stopped_side="LONG", post_sl_lock_until=base_ts // 1000 + 3600,
+        stopped_setup_keys={(rr.setup_type, rr.setup_ts)},
+    )
+    assert validate_post_sl_reentry(stopped, rr)[1] == "reused_stopped_setup"
+
+    # A 1D sweep cannot be confirmed by an intraday bar from the same day.
+    old_flag = globals()["REQUIRE_LS_REVERSAL_CONFIRM"]
+    globals()["REQUIRE_LS_REVERSAL_CONFIRM"] = False
+    try:
+        same_day = (base_ts + 4 * 3600000, 100, 103, 99, 102, 1)
+        next_day = (base_ts + 86400000, 100, 103, 99, 102, 1)
+        found = _find_sweep_confirmation(
+            "LONG", base_ts, "1d", 101.0, [same_day, next_day], []
+        )
+        assert found is not None and found[0][B_TS] == next_day[B_TS]
+    finally:
+        globals()["REQUIRE_LS_REVERSAL_CONFIRM"] = old_flag
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -4653,4 +4933,5 @@ if __name__ == "__main__":
     _selftest_pct_format_helpers()
     _selftest_entry_retest_helpers()
     _selftest_pending_signal_eligible_watchlist()
+    _selftest_phase_8l1_quality_hotfix()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
