@@ -24,6 +24,7 @@ Phase 8J implemented: TP/SL percentage ranges in signal and command outputs
 Phase 8K implemented: Fresh Entry Retest gate for older Liquidity Sweep candidates
 Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR + signal gate
 Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · quality gates
+Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -305,6 +306,21 @@ B_HIGH   = 2
 B_LOW    = 3
 B_CLOSE  = 4
 B_VOLUME = 5
+
+# Confirmation timestamps stored by detectors are bar OPEN times.  A setup only
+# becomes knowable/actionable after that confirmation candle has CLOSED.
+TF_BAR_DURATION_MS: Dict[str, int] = {
+    "1h": 3_600_000,
+    "4h": 4 * 3_600_000,
+    "1d": 86_400_000,
+}
+
+
+def confirmation_available_ts_ms(setup_ts: int, setup_tf: str) -> int:
+    """Return the first millisecond at which a confirmation candle is fully known."""
+    if setup_ts <= 0:
+        return 0
+    return setup_ts + TF_BAR_DURATION_MS.get(setup_tf, 0)
 
 
 def ema_series(values: List[float], period: int) -> List[float]:
@@ -695,6 +711,16 @@ class Tg:
         self.token    = token
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.session  = http
+        # Avoid silent command-channel failures while also preventing log spam
+        # when Telegram is persistently unavailable or the token is invalid.
+        self._last_get_updates_warn_ts = 0
+        self._get_updates_warn_cooldown_sec = 60
+
+    def _warn_get_updates(self, message: str) -> None:
+        t = now_s()
+        if t - self._last_get_updates_warn_ts >= self._get_updates_warn_cooldown_sec:
+            self._last_get_updates_warn_ts = t
+            logger.warning(message)
 
     async def delete_webhook(self, drop_pending_updates: bool = False) -> Any:
         url = f"{self.base_url}/deleteWebhook"
@@ -716,10 +742,21 @@ class Tg:
                 json=data,
                 timeout=aiohttp.ClientTimeout(total=timeout + 5),
             ) as r:
-                if r.status == 200:
-                    return (await r.json()).get("result", [])
-        except Exception:
-            pass
+                try:
+                    body = await r.json()
+                except Exception:
+                    body = await r.text()
+
+                if r.status == 200 and isinstance(body, dict) and body.get("ok", True):
+                    return body.get("result", [])
+
+                self._warn_get_updates(
+                    f"getUpdates failed status={r.status} response={body}"
+                )
+        except Exception as exc:
+            self._warn_get_updates(
+                f"getUpdates exception {type(exc).__name__}: {exc}"
+            )
         return []
 
     async def send(
@@ -876,6 +913,9 @@ class ActiveIdea:
     # SetupResult.setup_ts).  Used to display "Setup age" in the signal.
     # 0 = not recorded.
     setup_ts: int = 0
+    # Timeframe of the confirmation candle whose OPEN timestamp is setup_ts.
+    # Used to derive the true confirmation-available time (bar close).
+    setup_tf: str = ""
 
     @property
     def entry_mid(self) -> float:
@@ -1122,6 +1162,9 @@ class SetupResult:
     # 0 = unknown (detectors built before Phase 8A, or test fixtures without a bar).
     # is_setup_fresh() returns False when setup_ts == 0.
     setup_ts:     int = 0
+    # Confirmation timeframe ("1h" | "4h" | "1d").  setup_ts is the candle
+    # OPEN time; setup_tf lets Phase 8L.2 calculate when that candle closed.
+    setup_tf:     str = ""
 
 
 @dataclass
@@ -1500,6 +1543,7 @@ def _scan_breakout_side(
                 f"retest_tf={retest_tf} retest_ts={retest_bar[B_TS]}"
             ),
             setup_ts     = retest_bar[B_TS],
+            setup_tf     = retest_tf,
         )
 
     return None
@@ -1847,6 +1891,7 @@ def _scan_pullback_side(
             f"sl_extreme={sl_extreme:.4f}"
         ),
         setup_ts     = last_4h[B_TS],
+        setup_tf     = "4h",
     )
 
 
@@ -2235,6 +2280,7 @@ def _scan_sweep_side(
             f"confirm_tf={confirm_tf}"
         ),
         setup_ts     = confirm_bar[B_TS],
+        setup_tf     = confirm_tf,
     )
 
 
@@ -2311,7 +2357,7 @@ def run_setup_pipeline(state: SymbolState) -> Optional[SetupResult]:
 
     Score floor (enforced here before returning):
       - NEUTRAL regime:  winner must have score >= MIN_SCORE_CHOP  (85)
-      - Normal regime:   winner must have score >= MIN_SCORE_NORMAL (55)
+      - Normal regime:   winner must have score >= MIN_SCORE_NORMAL (65)
     A candidate that fails its floor is discarded (returns None).
     """
     br = detect_breakout_retest(state)
@@ -2512,8 +2558,9 @@ def validate_post_sl_reentry(state: SymbolState, result: SetupResult) -> Tuple[b
     if state.last_exit_event != "SL_HIT" or result.side != state.last_stopped_side:
         return True, "ok"
 
-    # A candidate confirmed before (or during) the stopped trade is not a new thesis.
-    if result.setup_ts <= state.last_exit_ts * 1000:
+    # A candidate whose confirmation had not fully closed after the stopped
+    # trade is not a new thesis.
+    if setup_available_ts_ms(result) <= state.last_exit_ts * 1000:
         return False, "post_sl_cooldown"
     if now_s() < state.post_sl_lock_until:
         return False, "post_sl_cooldown"
@@ -2535,7 +2582,7 @@ def can_signal(
       3. state.ready is True         — all indicators computed.
       4. Score floor:
            NEUTRAL regime → score >= MIN_SCORE_CHOP  (85)
-           otherwise      → score >= MIN_SCORE_NORMAL (55)
+           otherwise      → score >= MIN_SCORE_NORMAL (65)
       5. Direction / symbol-regime compatibility:
            LONG  allowed when regime == BULLISH
            SHORT allowed when regime == BEARISH
@@ -2627,9 +2674,10 @@ def is_setup_fresh(result: SetupResult) -> bool:
     This is intentionally strict: a zero setup_ts is treated as stale so
     that old / test-only results do not accidentally trigger real emissions.
     """
-    if result.setup_ts <= 0:
+    available_ts = confirmation_available_ts_ms(result.setup_ts, result.setup_tf)
+    if available_ts <= 0:
         return False
-    return (now_ms() - result.setup_ts) <= SETUP_MAX_AGE_HOURS * 3_600_000
+    return (now_ms() - available_ts) <= SETUP_MAX_AGE_HOURS * 3_600_000
 
 
 # ── Phase 8D helpers ──────────────────────────────────────────────────────────
@@ -2671,6 +2719,37 @@ def calc_rr_from_current(
     return round(rr1, 2), round(rr2, 2)
 
 
+def setup_available_ts_ms(result: SetupResult) -> int:
+    """Return the real confirmation-available time for a SetupResult."""
+    return confirmation_available_ts_ms(result.setup_ts, result.setup_tf)
+
+
+def _post_setup_monitor_bars(result: SetupResult, state: SymbolState) -> List[Bar]:
+    """
+    Return the highest-resolution bar series that fully covers the period after
+    the confirmation candle CLOSED.
+
+    1H is preferred when its retained history reaches back to confirmation;
+    otherwise 4H is used (200×4H ≈ 33 days, matching the 30-day context cap).
+    1D is a defensive fallback.  Bars that belong to the confirmation candle
+    itself are excluded, so pre-confirmation highs/lows cannot kill a setup.
+    """
+    start_ts = setup_available_ts_ms(result)
+    if start_ts <= 0:
+        return []
+
+    for bars in (state.bars_1h, state.bars_4h, state.bars_1d):
+        if not bars:
+            continue
+        # Do not use a high-resolution series if its retained history starts
+        # after confirmation; that would leave an unverified history gap.
+        if bars[0][B_TS] > start_ts:
+            continue
+        return [bar for bar in bars if bar[B_TS] >= start_ts]
+
+    return []
+
+
 def validate_actionable_setup(
     result: SetupResult,
     state: SymbolState,
@@ -2687,7 +2766,8 @@ def validate_actionable_setup(
     Checks (in order):
       1. context_too_old       — setup_ts = 0 or age > SETUP_CONTEXT_MAX_DAYS
       2. price_missing         — current_price ≤ 0.0
-      3. already_hit_tp / sl  — any 4H/1D bar since setup_ts touched target/stop
+      3. already_hit_tp / sl  — any bar after the confirmation candle CLOSED
+                                  touched target/stop
       4. bad geometry          — current_price on the wrong side of stop_loss
       5. outside_entry_zone    — price outside [entry_low, entry_high]
                                  (only when ENTRY_ZONE_REQUIRED is True)
@@ -2698,10 +2778,11 @@ def validate_actionable_setup(
     """
     side = result.side
 
-    # 1. Context age
-    if result.setup_ts <= 0:
+    # 1. Context age — measured from the close of the confirmation candle.
+    available_ts = setup_available_ts_ms(result)
+    if available_ts <= 0:
         return False, "context_too_old"
-    age_ms = now_ms() - result.setup_ts
+    age_ms = now_ms() - available_ts
     if age_ms > SETUP_CONTEXT_MAX_DAYS * 86_400_000:
         return False, "context_too_old"
 
@@ -2709,26 +2790,25 @@ def validate_actionable_setup(
     if current_price <= 0.0:
         return False, "price_missing"
 
-    # 3. Scan bars since setup_ts for TP/SL touches (Phase 8E: before zone check)
+    # 3. Phase 8L.2 temporal boundary: scan only bars that START after the
+    #    confirmation candle has CLOSED.  setup_ts itself is the confirmation
+    #    candle OPEN time and must never be scanned for later TP/SL touches.
     #    Priority: TP2 hit > SL hit > TP1 hit (worst case surfaces first).
-    for bars in (state.bars_4h, state.bars_1d):
-        for bar in bars:
-            if bar[B_TS] < result.setup_ts:
-                continue
-            if side == "LONG":
-                if bar[B_HIGH] >= result.tp2:
-                    return False, "already_hit_tp"
-                if bar[B_LOW] <= result.stop_loss:
-                    return False, "already_hit_sl"
-                if bar[B_HIGH] >= result.tp1:
-                    return False, "already_hit_tp"
-            else:  # SHORT
-                if bar[B_LOW] <= result.tp2:
-                    return False, "already_hit_tp"
-                if bar[B_HIGH] >= result.stop_loss:
-                    return False, "already_hit_sl"
-                if bar[B_LOW] <= result.tp1:
-                    return False, "already_hit_tp"
+    for bar in _post_setup_monitor_bars(result, state):
+        if side == "LONG":
+            if bar[B_HIGH] >= result.tp2:
+                return False, "already_hit_tp"
+            if bar[B_LOW] <= result.stop_loss:
+                return False, "already_hit_sl"
+            if bar[B_HIGH] >= result.tp1:
+                return False, "already_hit_tp"
+        else:  # SHORT
+            if bar[B_LOW] <= result.tp2:
+                return False, "already_hit_tp"
+            if bar[B_HIGH] >= result.stop_loss:
+                return False, "already_hit_sl"
+            if bar[B_LOW] <= result.tp1:
+                return False, "already_hit_tp"
 
     # 4. Geometry: current price must still be on the correct side of SL
     if side == "LONG" and current_price <= result.stop_loss:
@@ -2822,7 +2902,8 @@ def make_pending_setup(
     dist_pct, dist_side = calc_distance_to_entry_zone(
         current_price, result.entry_low, result.entry_high
     )
-    age_h = int((now_ms() - result.setup_ts) / 3_600_000) if result.setup_ts > 0 else -1
+    available_ts = setup_available_ts_ms(result)
+    age_h = int((now_ms() - available_ts) / 3_600_000) if available_ts > 0 else -1
     return PendingSetup(
         symbol        = sym,
         side          = result.side,
@@ -2871,16 +2952,18 @@ def is_liquidity_sweep_recent(result: SetupResult) -> bool:
     """
     if result.setup_type != "LIQUIDITY_SWEEP":
         return True
-    if result.setup_ts <= 0:
+    available_ts = setup_available_ts_ms(result)
+    if available_ts <= 0:
         return False
-    return (now_ms() - result.setup_ts) <= LIQUIDITY_SWEEP_MAX_AGE_HOURS * 3_600_000
+    return (now_ms() - available_ts) <= LIQUIDITY_SWEEP_MAX_AGE_HOURS * 3_600_000
 
 
 def liquidity_sweep_age_h(result: SetupResult) -> int:
-    """Return hours since the LS confirmation bar, or -1 when setup_ts is unknown."""
-    if result.setup_ts <= 0:
+    """Return hours since LS confirmation became knowable, or -1 if unknown."""
+    available_ts = setup_available_ts_ms(result)
+    if available_ts <= 0:
         return -1
-    return int((now_ms() - result.setup_ts) / 3_600_000)
+    return int((now_ms() - available_ts) / 3_600_000)
 
 
 # ── Phase 8K: Fresh Entry Retest gate ─────────────────────────────────────────
@@ -2921,10 +3004,11 @@ def latest_entry_zone_return_ts(result: SetupResult, state: SymbolState) -> Opti
     in the entry zone for days will have an old return timestamp and can be
     rejected by the freshness gate.
     """
-    if result.setup_ts <= 0:
+    start_ts = setup_available_ts_ms(result)
+    if start_ts <= 0:
         return None
 
-    bars = [b for b in _bars_for_entry_retest_scan(state) if b[B_TS] >= result.setup_ts]
+    bars = [b for b in _bars_for_entry_retest_scan(state) if b[B_TS] >= start_ts]
     if not bars:
         return None
 
@@ -2982,6 +3066,39 @@ def validate_fresh_entry_retest(
     return True, "ok"
 
 
+def candidate_age_bucket(age_h: int) -> str:
+    """Compact age buckets for dead-candidate diagnostics."""
+    if age_h < 0:
+        return "unknown"
+    if age_h < 24:
+        return "<24h"
+    if age_h < 48:
+        return "24-48h"
+    if age_h < 96:
+        return "48-96h"
+    if age_h < 168:
+        return "96-168h"
+    if age_h < 336:
+        return "168-336h"
+    return ">=336h"
+
+
+def dead_candidate_matrix(records: List[CandidateDebug], limit: int = 8) -> List[Tuple[str, str, str, int]]:
+    """Aggregate unique debug records by detector × reason × setup-age bucket."""
+    from collections import Counter
+
+    ctr = Counter(
+        (
+            _SETUP_ABBREV.get(r.setup_type, r.setup_type),
+            _REASON_ABBREV.get(r.reason, r.reason),
+            candidate_age_bucket(r.setup_age_h),
+        )
+        for r in records
+        if r.status == "DEAD"
+    )
+    return [(*key, count) for key, count in ctr.most_common(limit)]
+
+
 def candidate_debug_key(item: CandidateDebug) -> Tuple[str, str, str, int, str]:
     """
     Dedup key for a CandidateDebug record.
@@ -3034,9 +3151,10 @@ def make_candidate_debug(
         return None
     result = ev.result
     px = get_current_price(state)
+    available_ts = setup_available_ts_ms(result)
     age_h = (
-        int((now_ms() - result.setup_ts) / 3_600_000)
-        if result.setup_ts > 0 else -1
+        int((now_ms() - available_ts) / 3_600_000)
+        if available_ts > 0 else -1
     )
     return CandidateDebug(
         symbol        = sym,
@@ -3132,7 +3250,7 @@ def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
 
     Score floor (per regime, same rule as run_setup_pipeline):
       NEUTRAL regime → score >= MIN_SCORE_CHOP  (85)
-      Other regimes  → score >= MIN_SCORE_NORMAL (55)
+      Other regimes  → score >= MIN_SCORE_NORMAL (65)
 
     Returns at most 3 SetupResult objects (one per detector type).
     Order: [BREAKOUT_RETEST, TREND_PULLBACK, LIQUIDITY_SWEEP] (skipping None).
@@ -3392,6 +3510,7 @@ async def scan_symbol(
                 invalidation            = result.invalidation,
                 current_price_at_signal = px,
                 setup_ts                = result.setup_ts,
+                setup_tf                = result.setup_tf,
             )
             state.active_idea    = idea
             state.last_signal_ts = now
@@ -3979,7 +4098,8 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
 
     # Setup age
     if idea.setup_ts > 0:
-        age_h       = (now_ms() - idea.setup_ts) // 3_600_000
+        available_ts = confirmation_available_ts_ms(idea.setup_ts, idea.setup_tf)
+        age_h       = max(0, (now_ms() - available_ts) // 3_600_000)
         age_line    = f"⏱ Setup age: {age_h}h  |  Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
     else:
         age_line    = f"⏱ Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
@@ -4164,7 +4284,9 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_watchlist(app, cid)
                 elif text in ("/candidates", "/dead"):
                     await _cmd_candidates(app, cid)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"tg_loop exception {type(exc).__name__}: {exc}")
+            await report_error(app, "tg_loop", exc)
             await asyncio.sleep(5)
 
 
@@ -4197,7 +4319,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.1 quality hotfix"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.1 quality hotfix · 8L.2 temporal diag hotfix"
     ))
 
 
@@ -4518,7 +4640,8 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Candidate selection:</b> enabled\n"
         f"<b>Dead candidate diagnostics:</b> enabled\n"
         f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}\n"
-        f"<b>Candidate debug dedup:</b> enabled"
+        f"<b>Candidate debug dedup:</b> enabled\n"
+        f"<b>Post-confirmation TP/SL boundary:</b> enabled (Phase 8L.2)"
     ))
 
 
@@ -4577,10 +4700,16 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
             f"score={r.score} age={r.setup_age_h}h"
             for i, r in enumerate(recent3, 1)
         )
+        matrix = dead_candidate_matrix(mkt.candidate_debug, limit=6)
+        matrix_lines = "\n".join(
+            f"  {det} × {reason} × {age}: {count}"
+            for det, reason, age, count in matrix
+        ) or "  —"
         dead_block = (
             f"<b>Recent dead candidates: {dead_n} unique stored</b>\n"
             f"Dead reasons: {r_str}\n"
             f"Dead detectors: {det_str}\n"
+            f"<b>Dead matrix (detector × reason × age):</b>\n{matrix_lines}\n"
             f"Recent dead:\n{top3}\n\n"
         )
     else:
@@ -4644,7 +4773,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D/8E/8H/8K/8L):</b>\n"
+        f"<b>Current gates (Phase 8D/8E/8H/8K/8L/8L.2):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"  LS max age: {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h  "
@@ -4658,6 +4787,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
         f"  4H alignment: {'required' if REQUIRE_4H_TREND_ALIGNMENT else 'off'}\n"
         f"  Post-SL lock: {POST_SL_COOLDOWN_HOURS}h / repeated {REPEATED_SL_LOCK_HOURS}h\n"
+        f"  Post-confirmation TP/SL boundary: enabled\n"
         f"  Watchlist: signal-eligible only"
     ))
 
@@ -4695,6 +4825,11 @@ async def keepalive_loop(app: web.Application) -> None:
         active   = sum(1 for s in mkt.symbols if mkt.state[s].active_idea is not None)
         poll_ago = now_s() - mkt.last_poll_ts if mkt.last_poll_ts else -1
         d = mkt.diag_last
+        matrix = dead_candidate_matrix(mkt.candidate_debug, limit=3)
+        matrix_log = ";".join(
+            f"{det}x{reason}x{age}={count}"
+            for det, reason, age, count in matrix
+        ) or "none"
         logger.info(
             f"Keepalive | Mode: {'DRY RUN' if DRY_RUN_MODE else 'LIVE'} | "
             f"BTC: {mkt.btc_regime} | "
@@ -4726,7 +4861,8 @@ async def keepalive_loop(app: web.Application) -> None:
             f"secondary_low={d.secondary_score_fail} "
             f"debug_dedup={d.candidate_debug_dedup} "
             f"gate_fail={d.signal_gate_fail} actionable_ok={d.actionable_ok} "
-            f"new={d.new_idea} errors={d.errors}"
+            f"new={d.new_idea} errors={d.errors} | "
+            f"Dead matrix(unique): {matrix_log}"
         )
         # Reset last-cycle counters for the next keepalive window
         mkt.diag_last = ScanDiagnostics()
@@ -4764,7 +4900,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8G dead candidate diagnostics · Phase 8H Liquidity Sweep recency gate · "
         "Phase 8I candidate debug dedup · Phase 8J TP/SL percentage ranges · "
         "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist · "
-        "Phase 8L.1 temporal/lifecycle/quality hotfix)"
+        "Phase 8L.1 temporal/lifecycle/quality hotfix · "
+        "Phase 8L.2 post-confirmation timing/diagnostics hotfix)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4851,7 +4988,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8J</b> TP/SL percentage ranges: active ✅\n"
                 f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n"
                 f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n"
-                f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n\n"
+                f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
+                f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
@@ -4920,6 +5058,50 @@ def _selftest_phase_8l1_quality_hotfix() -> None:
         globals()["REQUIRE_LS_REVERSAL_CONFIRM"] = old_flag
 
 
+def _selftest_phase_8l2_post_confirmation_boundary() -> None:
+    """Regression test: confirmation candle/pre-close movement must not kill a setup."""
+    now = now_ms()
+    hour = 3_600_000
+    setup_open = now - 8 * hour
+    result = SetupResult(
+        setup_type="TREND_PULLBACK", side="LONG", score=80,
+        entry_low=100.0, entry_high=102.0, stop_loss=95.0,
+        tp1=106.0, tp2=110.0, rr_tp1=1.2, rr_tp2=2.0,
+        invalidation="test", setup_ts=setup_open, setup_tf="4h",
+    )
+
+    state = SymbolState(bars_1h=[
+        # These bars belong to the 4H confirmation candle.  Their extremes
+        # happened before the setup was knowable and MUST be ignored.
+        (setup_open + 1 * hour, 101.0, 120.0, 90.0, 101.0, 1.0),
+        (setup_open + 3 * hour, 101.0, 108.0, 96.0, 101.0, 1.0),
+        # First eligible bar starts exactly when the 4H confirmation closes.
+        (setup_open + 4 * hour, 101.0, 103.0, 99.0, 101.0, 1.0),
+        (setup_open + 5 * hour, 101.0, 104.0, 100.0, 101.0, 1.0),
+    ])
+    ok, reason = validate_actionable_setup(result, state, 101.0)
+    assert ok and reason == "ok"
+
+    # A genuine post-confirmation TP touch must still kill the candidate.
+    state.bars_1h.append(
+        (setup_open + 6 * hour, 101.0, 107.0, 100.0, 106.5, 1.0)
+    )
+    ok, reason = validate_actionable_setup(result, state, 101.0)
+    assert not ok and reason == "already_hit_tp"
+
+    # Diagnostic matrix should expose detector × reason × age.
+    dbg = CandidateDebug(
+        symbol="TESTUSDT", side="LONG", setup_type="TREND_PULLBACK",
+        score=80, status="DEAD", reason="already_hit_tp",
+        current_price=101.0, entry_low=100.0, entry_high=102.0,
+        stop_loss=95.0, tp1=106.0, tp2=110.0, rr_tp1=1.2, rr_tp2=2.0,
+        setup_ts=setup_open, setup_age_h=4, updated_at=now_s(),
+        regime="BULLISH", btc_regime="BULLISH",
+    )
+    matrix = dead_candidate_matrix([dbg])
+    assert matrix == [("TP", "hit_tp", "<24h", 1)]
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -4934,4 +5116,5 @@ if __name__ == "__main__":
     _selftest_entry_retest_helpers()
     _selftest_pending_signal_eligible_watchlist()
     _selftest_phase_8l1_quality_hotfix()
+    _selftest_phase_8l2_post_confirmation_boundary()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
