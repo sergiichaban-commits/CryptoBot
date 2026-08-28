@@ -25,6 +25,7 @@ Phase 8K implemented: Fresh Entry Retest gate for older Liquidity Sweep candidat
 Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR + signal gate
 Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · quality gates
 Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
+Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -182,15 +183,17 @@ REPEATED_SL_LOCK_HOURS = int(os.getenv("REPEATED_SL_LOCK_HOURS", "168"))
 MAX_CONSECUTIVE_SL_SAME_SIDE = int(os.getenv("MAX_CONSECUTIVE_SL_SAME_SIDE", "2"))
 
 # ── Setup scoring / quality gates ──────────────────────────────────────────────
-MIN_SCORE_NORMAL               = int(os.getenv("MIN_SCORE_NORMAL",               "65"))
+# Phase 8L.3 defaults restore pre-8L.1 signal flow. Temporal/lifecycle safety
+# fixes remain active; these quality gates can still be re-enabled via ENV.
+MIN_SCORE_NORMAL               = int(os.getenv("MIN_SCORE_NORMAL",               "55"))
 MIN_SCORE_CHOP                 = int(os.getenv("MIN_SCORE_CHOP",                 "85"))
 LIQUIDITY_SWEEP_PRIORITY_SCORE = int(os.getenv("LIQUIDITY_SWEEP_PRIORITY_SCORE", "85"))
-SECONDARY_CANDIDATE_MIN_SCORE  = int(os.getenv("SECONDARY_CANDIDATE_MIN_SCORE",  "75"))
-REQUIRE_4H_TREND_ALIGNMENT     = _bool_env("REQUIRE_4H_TREND_ALIGNMENT", True)
-REQUIRE_TP_REVERSAL_CONFIRM    = _bool_env("REQUIRE_TP_REVERSAL_CONFIRM", True)
-REQUIRE_TP_REVERSAL_VOLUME     = _bool_env("REQUIRE_TP_REVERSAL_VOLUME", True)
-REQUIRE_LS_REVERSAL_CONFIRM    = _bool_env("REQUIRE_LS_REVERSAL_CONFIRM", True)
-REQUIRE_LS_SWEEP_VOLUME        = _bool_env("REQUIRE_LS_SWEEP_VOLUME", True)
+SECONDARY_CANDIDATE_MIN_SCORE  = int(os.getenv("SECONDARY_CANDIDATE_MIN_SCORE",  "0"))
+REQUIRE_4H_TREND_ALIGNMENT     = _bool_env("REQUIRE_4H_TREND_ALIGNMENT", False)
+REQUIRE_TP_REVERSAL_CONFIRM    = _bool_env("REQUIRE_TP_REVERSAL_CONFIRM", False)
+REQUIRE_TP_REVERSAL_VOLUME     = _bool_env("REQUIRE_TP_REVERSAL_VOLUME", False)
+REQUIRE_LS_REVERSAL_CONFIRM    = _bool_env("REQUIRE_LS_REVERSAL_CONFIRM", False)
+REQUIRE_LS_SWEEP_VOLUME        = _bool_env("REQUIRE_LS_SWEEP_VOLUME", False)
 
 # ── Volume multipliers (per setup type) ───────────────────────────────────────
 BREAKOUT_VOL_MIN             = float(os.getenv("BREAKOUT_VOL_MIN",             "1.2"))
@@ -2523,16 +2526,20 @@ def calc_swing_tpsl(result: SetupResult, state: SymbolState) -> SetupResult:
 
 def passes_rr_gate(result: SetupResult, symbol: str) -> bool:
     """
-    Require both a viable first target and the tier-specific swing target.
+    Phase 8L.3 controlled rollback: use the original Phase 8L RR gate.
 
-      Tier 1 (BTC/ETH): TP1 >= RR_MIN_TP1_TIER1 and TP2 >= RR_MIN_TIER1
-      Tier 2 (others):  TP1 >= RR_MIN_TP1_TIER2 and TP2 >= RR_MIN_TIER2
+    Only TP2 must meet the tier-specific swing RR minimum:
+      Tier 1 (BTC/ETH): TP2 >= RR_MIN_TIER1
+      Tier 2 (others):  TP2 >= RR_MIN_TIER2
+
+    TP1 RR is still calculated and displayed, but it is no longer a hard
+    signal blocker.  This restores the pre-8L.1 behavior without reverting
+    the temporal/lifecycle correctness fixes added later.
     """
-    if result is None or result.rr_tp1 <= 0.0 or result.rr_tp2 <= 0.0:
+    if result is None or result.rr_tp2 <= 0.0:
         return False
-    if symbol in TIER1_SYMBOLS:
-        return result.rr_tp1 >= RR_MIN_TP1_TIER1 and result.rr_tp2 >= RR_MIN_TIER1
-    return result.rr_tp1 >= RR_MIN_TP1_TIER2 and result.rr_tp2 >= RR_MIN_TIER2
+    threshold = RR_MIN_TIER1 if symbol in TIER1_SYMBOLS else RR_MIN_TIER2
+    return result.rr_tp2 >= threshold
 
 
 def validate_fast_4h_alignment(state: SymbolState, result: SetupResult) -> Tuple[bool, str]:
@@ -3437,10 +3444,9 @@ async def scan_symbol(
             clear_pending_setup(mkt, sym, "detector_none")
             return
 
-        # Preserve the original detector-priority winner.  If it dies, a
-        # secondary candidate may replace it only at a higher quality floor.
-        primary_candidate = choose_best_candidate(candidates)
-
+        # Phase 8L.3 rollback: every candidate that survives the normal
+        # detector score floor may compete.  Do not impose the extra 8L.1
+        # secondary-candidate score floor.
         # ── Evaluate each candidate independently ─────────────────────────────
         evals: List[CandidateEval] = [
             evaluate_candidate(sym, state, mkt, c) for c in candidates
@@ -3469,24 +3475,12 @@ async def scan_symbol(
         # ── Prefer ACTIONABLE candidate ───────────────────────────────────────
         actionable = [ev.result for ev in evals if ev.status == "ACTIONABLE" and ev.result]
         if actionable:
-            def _same_candidate(a: SetupResult, b: SetupResult) -> bool:
-                return (a.setup_type, a.side, a.setup_ts) == (b.setup_type, b.side, b.setup_ts)
-
-            primary_actionable = (
-                next((r for r in actionable if primary_candidate and _same_candidate(r, primary_candidate)), None)
-            )
-            if primary_actionable is not None:
-                result = primary_actionable
-            else:
-                strong_secondary = [
-                    r for r in actionable if r.score >= SECONDARY_CANDIDATE_MIN_SCORE
-                ]
-                result = choose_best_candidate(strong_secondary)
-                if result is None:
-                    d.secondary_score_fail += 1
-                    t.secondary_score_fail += 1
-                    clear_pending_setup(mkt, sym, "secondary_score_fail")
-                    return
+            # Phase 8L behavior: choose the best surviving actionable candidate.
+            # No extra secondary score floor.
+            result = choose_best_candidate(actionable)
+            if result is None:
+                clear_pending_setup(mkt, sym, "no_actionable_winner")
+                return
 
             clear_pending_setup(mkt, sym, "signal_firing")
             px   = get_current_price(state)
@@ -4319,7 +4313,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.1 quality hotfix · 8L.2 temporal diag hotfix"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback"
     ))
 
 
@@ -4615,7 +4609,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"  1H={POLL_1H_SEC}s · 4H={POLL_4H_SEC}s · "
         f"1D={POLL_1D_SEC}s · 1W={POLL_1W_SEC}s · 1M={POLL_1M_SEC}s\n\n"
         f"<b>RR minimum TP2:</b> Tier1 ≥ {RR_MIN_TIER1}  |  Tier2 ≥ {RR_MIN_TIER2}\n"
-        f"<b>RR minimum TP1:</b> Tier1 ≥ {RR_MIN_TP1_TIER1}  |  Tier2 ≥ {RR_MIN_TP1_TIER2}\n"
+        f"<b>TP1 RR hard gate:</b> off (TP1 RR still displayed)\n"
         f"<b>Score floor:</b> Normal ≥ {MIN_SCORE_NORMAL}  |  Chop ≥ {MIN_SCORE_CHOP}\n"
         f"<b>Secondary candidate floor:</b> ≥ {SECONDARY_CANDIDATE_MIN_SCORE}\n"
         f"<b>4H trend alignment:</b> {'required' if REQUIRE_4H_TREND_ALIGNMENT else 'off'}\n"
@@ -4782,7 +4776,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"return ≤ {ENTRY_RETEST_MAX_AGE_HOURS}h\n"
         f"  Entry zone required: {'yes' if ENTRY_ZONE_REQUIRED else 'no'}\n"
         f"  RR from current price: {'yes' if RR_FROM_CURRENT_PRICE else 'no'}\n"
-        f"  RR TP1 min: Tier1 {RR_MIN_TP1_TIER1} / Tier2 {RR_MIN_TP1_TIER2}\n"
+        f"  TP1 RR hard gate: off\n"
         f"  RR TP2 min: Tier1 {RR_MIN_TIER1} / Tier2 {RR_MIN_TIER2}\n"
         f"  Score floor: normal {MIN_SCORE_NORMAL} / chop {MIN_SCORE_CHOP}\n"
         f"  4H alignment: {'required' if REQUIRE_4H_TREND_ALIGNMENT else 'off'}\n"
@@ -4901,7 +4895,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8I candidate debug dedup · Phase 8J TP/SL percentage ranges · "
         "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist · "
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
-        "Phase 8L.2 post-confirmation timing/diagnostics hotfix)"
+        "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
+        "Phase 8L.3 signal-flow rollback)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4989,7 +4984,8 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8K</b> fresh entry retest gate: active ✅\n"
                 f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n"
                 f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
-                f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n\n"
+                f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
+                f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /watchlist /candidates"
     ))
@@ -5035,7 +5031,7 @@ def _selftest_phase_8l1_quality_hotfix() -> None:
         rr_tp1=1.1, rr_tp2=2.1, invalidation="test", setup_ts=base_ts,
     )
     assert passes_rr_gate(rr, "BTCUSDT")
-    assert not passes_rr_gate(rr, "SOLUSDT")
+    assert passes_rr_gate(rr, "SOLUSDT")
 
     stopped = SymbolState(
         last_exit_ts=base_ts // 1000, last_exit_event="SL_HIT",
