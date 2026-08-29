@@ -26,6 +26,7 @@ Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR +
 Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · quality gates
 Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
 Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
+Phase 8L.4 Diagnostic: persistent SQLite raw-setup/score/outcome statistics (no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -47,6 +48,7 @@ import html
 import json
 import logging
 import os
+import sqlite3
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -181,6 +183,14 @@ MAX_IDEA_DURATION_DAYS = int(os.getenv("MAX_IDEA_DURATION_DAYS", "10"))
 POST_SL_COOLDOWN_HOURS = int(os.getenv("POST_SL_COOLDOWN_HOURS", "72"))
 REPEATED_SL_LOCK_HOURS = int(os.getenv("REPEATED_SL_LOCK_HOURS", "168"))
 MAX_CONSECUTIVE_SL_SAME_SIDE = int(os.getenv("MAX_CONSECUTIVE_SL_SAME_SIDE", "2"))
+
+# ── Phase 8L.4 persistent diagnostic database ────────────────────────────────
+# Observability only: these settings MUST NOT change signal eligibility.
+DIAGNOSTICS_DB_ENABLED = _bool_env("DIAGNOSTICS_DB_ENABLED", False)
+DIAGNOSTICS_DB_PATH = os.getenv(
+    "DIAGNOSTICS_DB_PATH", "/data/cryptobot_diagnostics.sqlite3"
+).strip()
+DIAGNOSTICS_OUTCOME_DAYS = int(os.getenv("DIAGNOSTICS_OUTCOME_DAYS", "10"))
 
 # ── Setup scoring / quality gates ──────────────────────────────────────────────
 # Phase 8L.3 defaults restore pre-8L.1 signal flow. Temporal/lifecycle safety
@@ -1168,6 +1178,9 @@ class SetupResult:
     # Confirmation timeframe ("1h" | "4h" | "1d").  setup_ts is the candle
     # OPEN time; setup_tf lets Phase 8L.2 calculate when that candle closed.
     setup_tf:     str = ""
+    # Phase 8L.4: exact points awarded by the detector before any score floor.
+    # Diagnostics only; does not participate in trading decisions.
+    score_components: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1229,6 +1242,545 @@ class CandidateDebug:
     btc_regime:    str
     notes:         str = ""
 
+
+
+# =============================================================================
+# === 5B. PHASE 8L.4 PERSISTENT DIAGNOSTICS (SQLite) ===
+# =============================================================================
+
+_DIAG_SCHEMA_VERSION = "1"
+_DIAG_DETECTOR_ABBR = {
+    "BREAKOUT_RETEST": "BR",
+    "TREND_PULLBACK": "TP",
+    "LIQUIDITY_SWEEP": "LS",
+}
+
+
+def diagnostic_setup_key(symbol: str, result: SetupResult) -> str:
+    """Stable dedup key: one row per detector/side/confirmation timestamp."""
+    return f"{symbol}|{result.setup_type}|{result.side}|{int(result.setup_ts)}"
+
+
+class DiagnosticStore:
+    """
+    Persistent Phase 8L.4 observability store.
+
+    The database is deliberately isolated from signal eligibility: DB failures
+    are handled by callers as diagnostics-only warnings and must never block a
+    scan or a Telegram signal.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        if path != ":memory:":
+            parent = os.path.dirname(path) or "."
+            os.makedirs(parent, exist_ok=True)
+        self.conn = sqlite3.connect(path, timeout=5.0)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        if path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS diag_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS diag_counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS raw_setups (
+                setup_key TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                setup_type TEXT NOT NULL,
+                side TEXT NOT NULL,
+                setup_ts_ms INTEGER NOT NULL,
+                setup_tf TEXT NOT NULL DEFAULT '',
+                setup_available_ts_ms INTEGER NOT NULL DEFAULT 0,
+
+                first_seen_ts INTEGER NOT NULL,
+                last_seen_ts INTEGER NOT NULL,
+                raw_score_first INTEGER NOT NULL,
+                raw_score_latest INTEGER NOT NULL,
+                score_components_first TEXT NOT NULL DEFAULT '{}',
+                score_components_latest TEXT NOT NULL DEFAULT '{}',
+                regime_first TEXT NOT NULL DEFAULT '',
+                regime_latest TEXT NOT NULL DEFAULT '',
+                btc_regime_first TEXT NOT NULL DEFAULT '',
+                btc_regime_latest TEXT NOT NULL DEFAULT '',
+                score_floor_first INTEGER NOT NULL DEFAULT 0,
+                score_floor_latest INTEGER NOT NULL DEFAULT 0,
+                score_passed_first INTEGER NOT NULL DEFAULT 0,
+                score_passed_latest INTEGER NOT NULL DEFAULT 0,
+
+                gate_status_first TEXT,
+                gate_reason_first TEXT,
+                gate_status_latest TEXT,
+                gate_reason_latest TEXT,
+                signal_emitted INTEGER NOT NULL DEFAULT 0,
+                signal_emitted_ts INTEGER,
+
+                entry_low REAL NOT NULL,
+                entry_high REAL NOT NULL,
+                entry_mid REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                rr_tp1 REAL NOT NULL,
+                rr_tp2 REAL NOT NULL,
+                current_price_first REAL NOT NULL DEFAULT 0,
+                current_price_latest REAL NOT NULL DEFAULT 0,
+                in_entry_zone_first INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+
+                observation_status TEXT NOT NULL DEFAULT 'WAITING_ENTRY',
+                entry_activated_ts INTEGER,
+                tp1_hit_ts INTEGER,
+                tp2_hit_ts INTEGER,
+                sl_hit_ts INTEGER,
+                final_outcome TEXT,
+                final_outcome_ts INTEGER,
+                expires_at_ts INTEGER NOT NULL,
+                mfe_pct REAL NOT NULL DEFAULT 0,
+                mae_pct REAL NOT NULL DEFAULT 0,
+                mfe_r REAL NOT NULL DEFAULT 0,
+                mae_r REAL NOT NULL DEFAULT 0,
+                last_eval_bar_ts_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS setup_score_components (
+                setup_key TEXT NOT NULL,
+                component TEXT NOT NULL,
+                points INTEGER NOT NULL,
+                PRIMARY KEY (setup_key, component),
+                FOREIGN KEY (setup_key) REFERENCES raw_setups(setup_key)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_raw_setups_detector_score
+                ON raw_setups(setup_type, raw_score_first);
+            CREATE INDEX IF NOT EXISTS idx_raw_setups_outcome
+                ON raw_setups(final_outcome);
+            CREATE INDEX IF NOT EXISTS idx_raw_setups_gate_reason
+                ON raw_setups(gate_reason_first);
+            CREATE INDEX IF NOT EXISTS idx_raw_setups_symbol_status
+                ON raw_setups(symbol, observation_status);
+            """
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('schema_version',?)",
+            (_DIAG_SCHEMA_VERSION,),
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4')"
+        )
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.commit()
+        self.conn.close()
+
+    def _bump(self, name: str, amount: int = 1) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO diag_counters(name,value) VALUES(?,?)
+            ON CONFLICT(name) DO UPDATE SET value=value+excluded.value
+            """,
+            (name, amount),
+        )
+
+    def record_detector_scan(
+        self,
+        raw_results: List[SetupResult],
+        floor: int,
+    ) -> None:
+        by_type = {r.setup_type: r for r in raw_results}
+        for setup_type, abbr in _DIAG_DETECTOR_ABBR.items():
+            self._bump(f"detector_runs_{abbr}")
+            r = by_type.get(setup_type)
+            if r is None:
+                self._bump(f"detector_none_{abbr}")
+            else:
+                self._bump(f"detector_raw_{abbr}")
+                if r.score >= floor:
+                    self._bump(f"score_pass_{abbr}")
+                else:
+                    self._bump(f"score_fail_{abbr}")
+        self.conn.commit()
+
+    def upsert_raw_setup(
+        self,
+        symbol: str,
+        state: SymbolState,
+        btc_regime: str,
+        raw_result: SetupResult,
+        final_result: SetupResult,
+        floor: int,
+    ) -> str:
+        """Insert a unique raw setup or refresh its latest diagnostic snapshot."""
+        key = diagnostic_setup_key(symbol, raw_result)
+        now = now_s()
+        px = get_current_price(state)
+        entry_mid = (final_result.entry_low + final_result.entry_high) / 2.0
+        in_zone = int(
+            px > 0.0 and final_result.entry_low <= px <= final_result.entry_high
+        )
+        components_json = json.dumps(
+            raw_result.score_components or {}, sort_keys=True, separators=(",", ":")
+        )
+        score_passed = int(raw_result.score >= floor)
+        available_ts = confirmation_available_ts_ms(
+            raw_result.setup_ts, raw_result.setup_tf
+        )
+        closed_1h = state.bars_1h[:-1] if len(state.bars_1h) > 1 else []
+        baseline_bar_ts = closed_1h[-1][B_TS] if closed_1h else 0
+        initial_status = "ACTIVE" if in_zone else "WAITING_ENTRY"
+        initial_entry_ts = now if in_zone else None
+        expiry_base = initial_entry_ts if initial_entry_ts is not None else now
+        expires_at = expiry_base + DIAGNOSTICS_OUTCOME_DAYS * 86400
+
+        self.conn.execute(
+            """
+            INSERT INTO raw_setups (
+                setup_key,symbol,setup_type,side,setup_ts_ms,setup_tf,
+                setup_available_ts_ms,first_seen_ts,last_seen_ts,
+                raw_score_first,raw_score_latest,
+                score_components_first,score_components_latest,
+                regime_first,regime_latest,btc_regime_first,btc_regime_latest,
+                score_floor_first,score_floor_latest,
+                score_passed_first,score_passed_latest,
+                entry_low,entry_high,entry_mid,stop_loss,tp1,tp2,rr_tp1,rr_tp2,
+                current_price_first,current_price_latest,in_entry_zone_first,notes,
+                observation_status,entry_activated_ts,expires_at_ts,
+                last_eval_bar_ts_ms,updated_at_ts
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+            ON CONFLICT(setup_key) DO UPDATE SET
+                last_seen_ts=excluded.last_seen_ts,
+                raw_score_latest=excluded.raw_score_latest,
+                score_components_latest=excluded.score_components_latest,
+                regime_latest=excluded.regime_latest,
+                btc_regime_latest=excluded.btc_regime_latest,
+                score_floor_latest=excluded.score_floor_latest,
+                score_passed_latest=excluded.score_passed_latest,
+                current_price_latest=excluded.current_price_latest,
+                updated_at_ts=excluded.updated_at_ts
+            """,
+            (
+                key, symbol, raw_result.setup_type, raw_result.side,
+                int(raw_result.setup_ts), raw_result.setup_tf or "",
+                int(available_ts), now, now,
+                int(raw_result.score), int(raw_result.score),
+                components_json, components_json,
+                state.regime, state.regime, btc_regime, btc_regime,
+                int(floor), int(floor), score_passed, score_passed,
+                float(final_result.entry_low), float(final_result.entry_high),
+                float(entry_mid), float(final_result.stop_loss),
+                float(final_result.tp1), float(final_result.tp2),
+                float(final_result.rr_tp1), float(final_result.rr_tp2),
+                float(px), float(px), in_zone, raw_result.notes or "",
+                initial_status, initial_entry_ts, int(expires_at),
+                int(baseline_bar_ts), now,
+            ),
+        )
+
+        for component, points in (raw_result.score_components or {}).items():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO setup_score_components(setup_key,component,points)
+                VALUES(?,?,?)
+                """,
+                (key, component, int(points)),
+            )
+        self.conn.commit()
+        return key
+
+    def update_gate(
+        self,
+        setup_key: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        now = now_s()
+        self.conn.execute(
+            """
+            UPDATE raw_setups SET
+                gate_status_first=COALESCE(gate_status_first, ?),
+                gate_reason_first=COALESCE(gate_reason_first, ?),
+                gate_status_latest=?,
+                gate_reason_latest=?,
+                updated_at_ts=?
+            WHERE setup_key=?
+            """,
+            (status, reason, status, reason, now, setup_key),
+        )
+        self.conn.commit()
+
+    def mark_signal_emitted(self, setup_key: str) -> None:
+        now = now_s()
+        self.conn.execute(
+            """
+            UPDATE raw_setups SET signal_emitted=1, signal_emitted_ts=?, updated_at_ts=?
+            WHERE setup_key=?
+            """,
+            (now, now, setup_key),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _bar_touches_entry(row: sqlite3.Row, bar: Bar) -> bool:
+        return bar[B_HIGH] >= row["entry_low"] and bar[B_LOW] <= row["entry_high"]
+
+    @staticmethod
+    def _bar_hits(row: sqlite3.Row, bar: Bar) -> Tuple[bool, bool, bool]:
+        if row["side"] == "LONG":
+            return (
+                bar[B_LOW] <= row["stop_loss"],
+                bar[B_HIGH] >= row["tp1"],
+                bar[B_HIGH] >= row["tp2"],
+            )
+        return (
+            bar[B_HIGH] >= row["stop_loss"],
+            bar[B_LOW] <= row["tp1"],
+            bar[B_LOW] <= row["tp2"],
+        )
+
+    @staticmethod
+    def _excursions(row: sqlite3.Row, bar: Bar) -> Tuple[float, float, float, float]:
+        entry = float(row["entry_mid"])
+        risk = abs(entry - float(row["stop_loss"]))
+        if entry <= 0.0:
+            return 0.0, 0.0, 0.0, 0.0
+        if row["side"] == "LONG":
+            fav_abs = max(0.0, bar[B_HIGH] - entry)
+            adv_abs = max(0.0, entry - bar[B_LOW])
+        else:
+            fav_abs = max(0.0, entry - bar[B_LOW])
+            adv_abs = max(0.0, bar[B_HIGH] - entry)
+        mfe_pct = fav_abs / entry * 100.0
+        mae_pct = adv_abs / entry * 100.0
+        mfe_r = fav_abs / risk if risk > 0.0 else 0.0
+        mae_r = adv_abs / risk if risk > 0.0 else 0.0
+        return mfe_pct, mae_pct, mfe_r, mae_r
+
+    def update_outcomes_for_symbol(self, symbol: str, state: SymbolState) -> None:
+        """
+        Advance hypothetical outcomes for raw setups using newly closed 1H bars.
+
+        Entry is activated only after a closed 1H bar touches the recorded entry
+        zone. If that same bar also spans TP/SL, the sample is recorded as
+        ENTRY_BAR_AMBIGUOUS because OHLC cannot establish event ordering.
+        """
+        closed = state.bars_1h[:-1] if len(state.bars_1h) > 1 else []
+        now = now_s()
+        rows = self.conn.execute(
+            """
+            SELECT * FROM raw_setups
+            WHERE symbol=? AND final_outcome IS NULL
+              AND observation_status IN ('WAITING_ENTRY','ACTIVE')
+            ORDER BY first_seen_ts ASC
+            """,
+            (symbol,),
+        ).fetchall()
+
+        for row in rows:
+            status = row["observation_status"]
+            last_eval = int(row["last_eval_bar_ts_ms"] or 0)
+            bars = [b for b in closed if b[B_TS] > last_eval]
+            tp1_ts = row["tp1_hit_ts"]
+            mfe_pct = float(row["mfe_pct"] or 0.0)
+            mae_pct = float(row["mae_pct"] or 0.0)
+            mfe_r = float(row["mfe_r"] or 0.0)
+            mae_r = float(row["mae_r"] or 0.0)
+            final_outcome = None
+            final_ts = None
+            sl_ts = row["sl_hit_ts"]
+            tp2_ts = row["tp2_hit_ts"]
+            entry_ts = row["entry_activated_ts"]
+            expires_at = int(row["expires_at_ts"])
+
+            for bar in bars:
+                bar_ts_s = int(bar[B_TS] // 1000)
+
+                if status == "WAITING_ENTRY":
+                    # first_seen + outcome window is the maximum wait for entry
+                    if bar_ts_s > expires_at:
+                        break
+                    if self._bar_touches_entry(row, bar):
+                        # If the same OHLC bar also spans a target or stop, the
+                        # order relative to the entry touch is unknowable. Keep
+                        # it as an explicit ambiguous sample instead of forcing
+                        # a win/loss or silently skipping the bar.
+                        sl_hit, tp1_hit, tp2_hit = self._bar_hits(row, bar)
+                        entry_ts = bar_ts_s
+                        last_eval = bar[B_TS]
+                        if sl_hit or tp1_hit or tp2_hit:
+                            final_outcome = "ENTRY_BAR_AMBIGUOUS"
+                            final_ts = bar_ts_s
+                            sl_ts = bar_ts_s if sl_hit else sl_ts
+                            tp1_ts = bar_ts_s if tp1_hit else tp1_ts
+                            tp2_ts = bar_ts_s if tp2_hit else tp2_ts
+                            status = "DONE"
+                            break
+                        status = "ACTIVE"
+                        expires_at = entry_ts + DIAGNOSTICS_OUTCOME_DAYS * 86400
+                        continue
+                    last_eval = bar[B_TS]
+                    continue
+
+                if status == "ACTIVE":
+                    if bar_ts_s > expires_at:
+                        break
+                    b_mfe_pct, b_mae_pct, b_mfe_r, b_mae_r = self._excursions(row, bar)
+                    mfe_pct = max(mfe_pct, b_mfe_pct)
+                    mae_pct = max(mae_pct, b_mae_pct)
+                    mfe_r = max(mfe_r, b_mfe_r)
+                    mae_r = max(mae_r, b_mae_r)
+                    sl_hit, tp1_hit, tp2_hit = self._bar_hits(row, bar)
+
+                    ambiguous = sl_hit and (tp2_hit or (tp1_ts is None and tp1_hit))
+                    if ambiguous:
+                        final_outcome = "AMBIGUOUS"
+                        final_ts = bar_ts_s
+                        sl_ts = bar_ts_s
+                        if tp1_hit and tp1_ts is None:
+                            tp1_ts = bar_ts_s
+                        if tp2_hit:
+                            tp2_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if sl_hit:
+                        sl_ts = bar_ts_s
+                        final_outcome = "TP1_THEN_SL" if tp1_ts is not None else "SL"
+                        final_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if tp2_hit:
+                        if tp1_ts is None:
+                            tp1_ts = bar_ts_s
+                        tp2_ts = bar_ts_s
+                        final_outcome = "TP2"
+                        final_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if tp1_hit and tp1_ts is None:
+                        tp1_ts = bar_ts_s
+
+                    last_eval = bar[B_TS]
+
+            if final_outcome is None:
+                if status == "WAITING_ENTRY" and now >= expires_at:
+                    final_outcome = "NO_ENTRY"
+                    final_ts = expires_at
+                    status = "DONE"
+                elif status == "ACTIVE" and now >= expires_at:
+                    final_outcome = "TP1_ONLY_EXPIRED" if tp1_ts is not None else "EXPIRED"
+                    final_ts = expires_at
+                    status = "DONE"
+
+            self.conn.execute(
+                """
+                UPDATE raw_setups SET
+                    observation_status=?, entry_activated_ts=?, expires_at_ts=?,
+                    tp1_hit_ts=?, tp2_hit_ts=?, sl_hit_ts=?,
+                    final_outcome=COALESCE(final_outcome, ?),
+                    final_outcome_ts=COALESCE(final_outcome_ts, ?),
+                    mfe_pct=?, mae_pct=?, mfe_r=?, mae_r=?,
+                    last_eval_bar_ts_ms=?, updated_at_ts=?
+                WHERE setup_key=?
+                """,
+                (
+                    status, entry_ts, expires_at, tp1_ts, tp2_ts, sl_ts,
+                    final_outcome, final_ts,
+                    mfe_pct, mae_pct, mfe_r, mae_r,
+                    last_eval, now, row["setup_key"],
+                ),
+            )
+        self.conn.commit()
+
+    def summary(self) -> Dict[str, Any]:
+        total = int(self.conn.execute("SELECT COUNT(*) FROM raw_setups").fetchone()[0])
+        detector_rows = self.conn.execute(
+            """
+            SELECT setup_type, COUNT(*) n, ROUND(AVG(raw_score_first),1) avg_score
+            FROM raw_setups GROUP BY setup_type
+            """
+        ).fetchall()
+        detectors = {
+            _DIAG_DETECTOR_ABBR.get(r["setup_type"], r["setup_type"]): {
+                "n": int(r["n"]), "avg_score": float(r["avg_score"] or 0.0)
+            }
+            for r in detector_rows
+        }
+        score_fail = int(self.conn.execute(
+            "SELECT COUNT(*) FROM raw_setups WHERE score_passed_first=0"
+        ).fetchone()[0])
+        signal_emitted = int(self.conn.execute(
+            "SELECT COUNT(*) FROM raw_setups WHERE signal_emitted=1"
+        ).fetchone()[0])
+        status_rows = self.conn.execute(
+            "SELECT observation_status,COUNT(*) n FROM raw_setups GROUP BY observation_status"
+        ).fetchall()
+        statuses = {r["observation_status"]: int(r["n"]) for r in status_rows}
+        outcome_rows = self.conn.execute(
+            """
+            SELECT final_outcome,COUNT(*) n FROM raw_setups
+            WHERE final_outcome IS NOT NULL GROUP BY final_outcome
+            """
+        ).fetchall()
+        outcomes = {r["final_outcome"]: int(r["n"]) for r in outcome_rows}
+        counters = {
+            r["name"]: int(r["value"])
+            for r in self.conn.execute("SELECT name,value FROM diag_counters").fetchall()
+        }
+        size_bytes = 0
+        if self.path != ":memory:":
+            for suffix in ("", "-wal", "-shm"):
+                fp = self.path + suffix
+                if os.path.exists(fp):
+                    size_bytes += os.path.getsize(fp)
+        return {
+            "total": total,
+            "detectors": detectors,
+            "score_fail": score_fail,
+            "signal_emitted": signal_emitted,
+            "statuses": statuses,
+            "outcomes": outcomes,
+            "counters": counters,
+            "size_bytes": size_bytes,
+        }
+
+
+_DIAG_LAST_WARN_TS = 0
+
+
+def _diag_warn(message: str) -> None:
+    global _DIAG_LAST_WARN_TS
+    t = now_s()
+    if t - _DIAG_LAST_WARN_TS >= 60:
+        _DIAG_LAST_WARN_TS = t
+        logger.warning(f"Phase 8L.4 diagnostics: {message}")
+
+
+def _diag_store(app: web.Application) -> Optional[DiagnosticStore]:
+    store = app.get("diag_store")
+    return store if isinstance(store, DiagnosticStore) else None
 
 # =============================================================================
 # === 6. REGIME ===
@@ -1356,70 +1908,61 @@ def _score_breakout(
     vol_sma_4h: float,
     vol_sma_1h: float,
     prev_retest: Optional[Bar],
-) -> int:
-    """
-    Score the Breakout + Retest setup on a 0–90 scale.
-    (BTC regime +10 is deferred: detector receives SymbolState, not Market.)
+) -> Tuple[int, Dict[str, int]]:
+    """Return Breakout+Retest score and exact awarded-point decomposition."""
+    components: Dict[str, int] = {}
 
-    Factors:
-      +20  breakout volume > vol_sma × BREAKOUT_VOL_STRONG (1.5×)
-      +15  retest candle is pin bar or engulfing in setup direction
-      +15  1D EMA alignment (EMA20 > EMA50 for LONG, EMA20 < EMA50 for SHORT)
-      +10  4H EMA20 > EMA50 for LONG (< EMA50 for SHORT)
-      +10  retest occurred within 3 daily bars of the breakout
-      +10  breakout close not overextended: distance from key_level <= 1%
-      +10  retest bar volume < tf_vol_sma × 0.9 (healthy low-volume pullback)
-            — compared to 4H vol SMA if retest on 4H, 1H vol SMA if retest on 1H
-    """
-    score = 0
+    def award(name: str, points: int, condition: bool) -> None:
+        if condition:
+            components[name] = points
 
-    # +20: strong breakout volume
-    if bo_bar[B_VOLUME] > vol_sma * BREAKOUT_VOL_STRONG:
-        score += 20
-
-    # +15: retest candle character
+    award(
+        "breakout_strong_volume", 20,
+        bo_bar[B_VOLUME] > vol_sma * BREAKOUT_VOL_STRONG,
+    )
     if side == "LONG":
-        if is_bullish_retest_candle(retest_bar, prev_retest):
-            score += 15
+        reversal = is_bullish_retest_candle(retest_bar, prev_retest)
     else:
-        if is_bearish_retest_candle(retest_bar, prev_retest):
-            score += 15
+        reversal = is_bearish_retest_candle(retest_bar, prev_retest)
+    award("retest_reversal_candle", 15, reversal)
 
-    # +15: 1D EMA alignment
+    ema1d_ok = False
     if state.ema20_1d > 0 and state.ema50_1d > 0:
-        if side == "LONG" and state.ema20_1d > state.ema50_1d:
-            score += 15
-        elif side == "SHORT" and state.ema20_1d < state.ema50_1d:
-            score += 15
+        ema1d_ok = (
+            state.ema20_1d > state.ema50_1d
+            if side == "LONG"
+            else state.ema20_1d < state.ema50_1d
+        )
+    award("ema_1d_alignment", 15, ema1d_ok)
 
-    # +10: 4H EMA alignment
+    ema4h_ok = False
     if state.ema20_4h > 0 and state.ema50_4h > 0:
-        if side == "LONG" and state.ema20_4h > state.ema50_4h:
-            score += 10
-        elif side == "SHORT" and state.ema20_4h < state.ema50_4h:
-            score += 10
+        ema4h_ok = (
+            state.ema20_4h > state.ema50_4h
+            if side == "LONG"
+            else state.ema20_4h < state.ema50_4h
+        )
+    award("ema_4h_alignment", 10, ema4h_ok)
 
-    # +10: retest within 3 daily bars
-    # Deadline: bo_bar_ts (open of breakout day) + 4 days = 3 retest days + the breakout day
-    if retest_bar[B_TS] < bo_bar_ts + 4 * 86_400_000:
-        score += 10
+    award("fast_retest", 10, retest_bar[B_TS] < bo_bar_ts + 4 * 86_400_000)
 
-    # +10: breakout close not overextended (within 1% of key_level)
+    not_overextended = False
     if key_level > 0:
-        dist_pct = ((bo_bar[B_CLOSE] - key_level) / key_level if side == "LONG"
-                    else (key_level - bo_bar[B_CLOSE]) / key_level)
-        if dist_pct <= 0.01:
-            score += 10
+        dist_pct = (
+            (bo_bar[B_CLOSE] - key_level) / key_level
+            if side == "LONG"
+            else (key_level - bo_bar[B_CLOSE]) / key_level
+        )
+        not_overextended = dist_pct <= 0.01
+    award("breakout_not_overextended", 10, not_overextended)
 
-    # +10: retest bar volume is low (healthy pullback)
-    # Method: compare retest bar volume to the vol SMA of the same TF.
-    # If vol SMA is unavailable (< VOL_SMA_PERIOD bars), this factor is skipped.
     tf_vsma = vol_sma_4h if retest_tf == "4h" else vol_sma_1h
-    if tf_vsma > 0 and retest_bar[B_VOLUME] < tf_vsma * 0.9:
-        score += 10
+    award(
+        "low_volume_retest", 10,
+        tf_vsma > 0 and retest_bar[B_VOLUME] < tf_vsma * 0.9,
+    )
 
-    return score
-
+    return sum(components.values()), components
 
 def _scan_breakout_side(
     side: str,
@@ -1490,7 +2033,7 @@ def _scan_breakout_side(
         )
 
         # ── Score ───────────────────────────────────────────────────────────────
-        score = _score_breakout(
+        score, score_components = _score_breakout(
             side, state, bo_bar, retest_bar, retest_tf,
             key_level, atr, vol_sma,
             bo_bar[B_TS], vol_sma_4h, vol_sma_1h, prev_retest,
@@ -1547,6 +2090,7 @@ def _scan_breakout_side(
             ),
             setup_ts     = retest_bar[B_TS],
             setup_tf     = retest_tf,
+            score_components = score_components,
         )
 
     return None
@@ -1684,79 +2228,66 @@ def _score_pullback(
     atr: float,
     vol_sma: float,
     closed_4h: List[Bar],
-) -> int:
-    """
-    Score the Trend Pullback setup on a 0–90 scale.
-    (BTC regime +10 deferred: detector receives SymbolState, not Market.)
+) -> Tuple[int, Dict[str, int]]:
+    """Return Trend Pullback score and exact awarded-point decomposition."""
+    components: Dict[str, int] = {}
 
-    Factors:
-      +20  full EMA stack aligned
-             LONG: EMA20 > EMA50 > EMA200 / SHORT: EMA20 < EMA50 < EMA200
-             Skipped when EMA200 is zero (insufficient history).
-      +15  pullback touches EMA20 precisely: closest bar's extreme within
-             0.2×ATR of EMA20  (LONG: low;  SHORT: high)
-      +15  4H confirmation candle is hammer or engulfing in the setup direction
-      +15  average pullback bar volume < vol_sma20_1d × 0.9
-             (weak, corrective move — healthy for a continuation setup)
-      +10  reversal 4H candle volume > 4H vol SMA × PULLBACK_REVERSAL_VOL_MIN
-      +10  1H EMA20 > EMA50 for LONG  /  EMA20 < EMA50 for SHORT
-      +5   pullback duration is 3–5 bars (optimal; too short or too long is noisier)
-    """
-    score = 0
+    def award(name: str, points: int, condition: bool) -> None:
+        if condition:
+            components[name] = points
 
-    # +20: full EMA stack
+    stack_ok = False
     if ema200 > 0:
-        if side == "LONG" and ema20 > ema50 > ema200:
-            score += 20
-        elif side == "SHORT" and ema20 < ema50 < ema200:
-            score += 20
+        stack_ok = (
+            ema20 > ema50 > ema200
+            if side == "LONG"
+            else ema20 < ema50 < ema200
+        )
+    award("ema_full_stack", 20, stack_ok)
 
-    # +15: precise EMA20 touch (closest bar extreme within 0.2×ATR)
     precise = 0.2 * atr
-    for bar in pullback_bars:
-        if side == "LONG" and bar[B_LOW] <= ema20 + precise:
-            score += 15
-            break
-        if side == "SHORT" and bar[B_HIGH] >= ema20 - precise:
-            score += 15
-            break
+    precise_touch = any(
+        (bar[B_LOW] <= ema20 + precise)
+        if side == "LONG"
+        else (bar[B_HIGH] >= ema20 - precise)
+        for bar in pullback_bars
+    )
+    award("ema20_touch", 15, precise_touch)
 
-    # +15: 4H confirmation candle character
     prev_4h = _prev_bar(closed_4h, last_4h[B_TS])
-    if side == "LONG":
-        if is_bullish_retest_candle(last_4h, prev_4h):
-            score += 15
-    else:
-        if is_bearish_retest_candle(last_4h, prev_4h):
-            score += 15
+    reversal = (
+        is_bullish_retest_candle(last_4h, prev_4h)
+        if side == "LONG"
+        else is_bearish_retest_candle(last_4h, prev_4h)
+    )
+    award("reversal_4h_candle", 15, reversal)
 
-    # +15: weak average pullback volume
+    weak_pb_volume = False
     if vol_sma > 0 and pullback_bars:
         pb_vol_avg = sum(b[B_VOLUME] for b in pullback_bars) / len(pullback_bars)
-        if pb_vol_avg < vol_sma * 0.9:
-            score += 15
+        weak_pb_volume = pb_vol_avg < vol_sma * 0.9
+    award("weak_pullback_volume", 15, weak_pb_volume)
 
-    # +10: strong reversal 4H candle volume
-    vol_sma_4h = (calc_vol_sma(closed_4h, VOL_SMA_PERIOD)
-                  if len(closed_4h) >= VOL_SMA_PERIOD else 0.0)
-    if vol_sma_4h > 0 and last_4h[B_VOLUME] > vol_sma_4h * PULLBACK_REVERSAL_VOL_MIN:
-        score += 10
+    vol_sma_4h = (
+        calc_vol_sma(closed_4h, VOL_SMA_PERIOD)
+        if len(closed_4h) >= VOL_SMA_PERIOD else 0.0
+    )
+    award(
+        "reversal_4h_volume", 10,
+        vol_sma_4h > 0 and last_4h[B_VOLUME] > vol_sma_4h * PULLBACK_REVERSAL_VOL_MIN,
+    )
 
-    # +10: 1H EMA alignment
+    ema1h_ok = False
     if state.ema20_1h > 0 and state.ema50_1h > 0:
-        if side == "LONG"  and state.ema20_1h > state.ema50_1h:
-            score += 10
-        elif side == "SHORT" and state.ema20_1h < state.ema50_1h:
-            score += 10
+        ema1h_ok = (
+            state.ema20_1h > state.ema50_1h
+            if side == "LONG"
+            else state.ema20_1h < state.ema50_1h
+        )
+    award("ema_1h_alignment", 10, ema1h_ok)
+    award("optimal_pullback_duration", 5, 3 <= len(pullback_bars) <= 5)
 
-    # +5: optimal pullback duration 3–5 bars
-    if 3 <= len(pullback_bars) <= 5:
-        score += 5
-
-    # BTC regime (+10): deferred to can_signal (Phase 4)
-
-    return score
-
+    return sum(components.values()), components
 
 def _scan_pullback_side(
     side: str,
@@ -1871,7 +2402,7 @@ def _scan_pullback_side(
         )
 
     # ── Score ────────────────────────────────────────────────────────────────
-    score = _score_pullback(
+    score, score_components = _score_pullback(
         side, state, pullback_bars, last_4h,
         pullback_type, ema20, ema50, ema200, atr, vol_sma,
         closed_4h,
@@ -1895,6 +2426,7 @@ def _scan_pullback_side(
         ),
         setup_ts     = last_4h[B_TS],
         setup_tf     = "4h",
+        score_components = score_components,
     )
 
 
@@ -2067,71 +2599,56 @@ def _score_sweep(
     closed_4h: List[Bar],
     closed_1h: List[Bar],
     level_in_short_lookback: bool,
-) -> int:
-    """
-    Score the Liquidity Sweep setup on a 0–100 scale.
-    (BTC regime +10 deferred to can_signal, Phase 4.)
+) -> Tuple[int, Dict[str, int]]:
+    """Return Liquidity Sweep score and exact awarded-point decomposition."""
+    components: Dict[str, int] = {"clear_sweep": 20}
 
-    Factors:
-      +20  clear sweep — always awarded; hard conditions already satisfied.
-      +15  wick quality: sweep wick >= 50% of candle range.
-      +15  confirmation candle is hammer/pin or engulfing in setup direction.
-      +10  swept level is in short-lookback swing structure (recent, high-quality).
-      +10  sweep distance <= 0.7 × ATR (tight, controlled).
-      +10  sweep candle volume > vol_sma × SWEEP_VOL_MIN.
-      +10  sweep candle volume > vol_sma × SWEEP_VOL_STRONG  (cumulative).
-      +10  1H EMA20 > EMA50 for LONG  /  EMA20 < EMA50 for SHORT.
-    """
-    score = 20  # clear sweep always awarded
+    def award(name: str, points: int, condition: bool) -> None:
+        if condition:
+            components[name] = points
 
     rng = sweep_bar[B_HIGH] - sweep_bar[B_LOW]
-
-    # +15: wick quality >= 50% of range
+    wick_quality = False
     if rng > 0:
         if side == "LONG":
             wick = min(sweep_bar[B_CLOSE], sweep_bar[B_OPEN]) - sweep_bar[B_LOW]
         else:
             wick = sweep_bar[B_HIGH] - max(sweep_bar[B_CLOSE], sweep_bar[B_OPEN])
-        if wick >= 0.5 * rng:
-            score += 15
+        wick_quality = wick >= 0.5 * rng
+    award("wick_quality", 15, wick_quality)
 
-    # +15: confirmation candle character (hammer/engulfing)
+    reversal = False
     if confirm_bar is not None:
         confirm_bars = closed_4h if confirm_tf == "4h" else closed_1h
         prev = _prev_bar(confirm_bars, confirm_bar[B_TS])
-        if side == "LONG"  and is_bullish_retest_candle(confirm_bar, prev):
-            score += 15
-        elif side == "SHORT" and is_bearish_retest_candle(confirm_bar, prev):
-            score += 15
+        reversal = (
+            is_bullish_retest_candle(confirm_bar, prev)
+            if side == "LONG"
+            else is_bearish_retest_candle(confirm_bar, prev)
+        )
+    award("reversal_confirmation", 15, reversal)
+    award("recent_swing_level", 10, level_in_short_lookback)
 
-    # +10: level in short-lookback swing structure (recent/relevant)
-    if level_in_short_lookback:
-        score += 10
-
-    # +10: controlled sweep distance <= 0.7 × ATR
     if side == "LONG":
         sweep_dist = abs(swept_level - sweep_bar[B_LOW])
     else:
         sweep_dist = abs(sweep_bar[B_HIGH] - swept_level)
-    if sweep_dist <= 0.7 * atr:
-        score += 10
+    award("controlled_sweep_distance", 10, sweep_dist <= 0.7 * atr)
 
-    # +10 / +10: volume (cumulative when strong)
     if vol_sma > 0:
-        if sweep_bar[B_VOLUME] > vol_sma * SWEEP_VOL_MIN:
-            score += 10
-        if sweep_bar[B_VOLUME] > vol_sma * SWEEP_VOL_STRONG:
-            score += 10
+        award("sweep_volume_normal", 10, sweep_bar[B_VOLUME] > vol_sma * SWEEP_VOL_MIN)
+        award("sweep_volume_strong", 10, sweep_bar[B_VOLUME] > vol_sma * SWEEP_VOL_STRONG)
 
-    # +10: 1H EMA alignment
+    ema1h_ok = False
     if state.ema20_1h > 0 and state.ema50_1h > 0:
-        if side == "LONG"  and state.ema20_1h > state.ema50_1h:
-            score += 10
-        elif side == "SHORT" and state.ema20_1h < state.ema50_1h:
-            score += 10
+        ema1h_ok = (
+            state.ema20_1h > state.ema50_1h
+            if side == "LONG"
+            else state.ema20_1h < state.ema50_1h
+        )
+    award("ema_1h_alignment", 10, ema1h_ok)
 
-    return score
-
+    return sum(components.values()), components
 
 def _scan_sweep_side(
     side: str,
@@ -2259,7 +2776,7 @@ def _scan_sweep_side(
         )
 
     # ── Score ─────────────────────────────────────────────────────────────────
-    score = _score_sweep(
+    score, score_components = _score_sweep(
         side, sweep_bar, swept_level, atr, vol_sma,
         state, confirm_bar, confirm_tf, closed_4h, closed_1h,
         level_in_short_lookback,
@@ -2284,6 +2801,7 @@ def _scan_sweep_side(
         ),
         setup_ts     = confirm_bar[B_TS],
         setup_tf     = confirm_tf,
+        score_components = score_components,
     )
 
 
@@ -2360,7 +2878,7 @@ def run_setup_pipeline(state: SymbolState) -> Optional[SetupResult]:
 
     Score floor (enforced here before returning):
       - NEUTRAL regime:  winner must have score >= MIN_SCORE_CHOP  (85)
-      - Normal regime:   winner must have score >= MIN_SCORE_NORMAL (65)
+      - Normal regime:   winner must have score >= MIN_SCORE_NORMAL (55)
     A candidate that fails its floor is discarded (returns None).
     """
     br = detect_breakout_retest(state)
@@ -2589,7 +3107,7 @@ def can_signal(
       3. state.ready is True         — all indicators computed.
       4. Score floor:
            NEUTRAL regime → score >= MIN_SCORE_CHOP  (85)
-           otherwise      → score >= MIN_SCORE_NORMAL (65)
+           otherwise      → score >= MIN_SCORE_NORMAL (55)
       5. Direction / symbol-regime compatibility:
            LONG  allowed when regime == BULLISH
            SHORT allowed when regime == BEARISH
@@ -3250,26 +3768,29 @@ def validate_signal_eligible_pending(
 
 # ── Phase 8F helpers ─────────────────────────────────────────────────────────
 
-def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
+def collect_raw_setup_candidates(state: SymbolState) -> List[SetupResult]:
     """
-    Run all three detectors and return every candidate whose score meets the
-    floor for the current regime.
+    Phase 8L.4: run all three detectors and return their raw SetupResult outputs
+    BEFORE any score-floor filtering.  This is the diagnostic observation point.
 
-    Score floor (per regime, same rule as run_setup_pipeline):
-      NEUTRAL regime → score >= MIN_SCORE_CHOP  (85)
-      Other regimes  → score >= MIN_SCORE_NORMAL (65)
-
-    Returns at most 3 SetupResult objects (one per detector type).
-    Order: [BREAKOUT_RETEST, TREND_PULLBACK, LIQUIDITY_SWEEP] (skipping None).
+    Trading behavior is unchanged: collect_setup_candidates() below applies the
+    same regime-specific floor as Phase 8L.3.
     """
-    floor = MIN_SCORE_CHOP if state.regime == "NEUTRAL" else MIN_SCORE_NORMAL
-    candidates: List[SetupResult] = []
+    raw: List[SetupResult] = []
     for detector in (detect_breakout_retest, detect_trend_pullback, detect_liquidity_sweep):
         r = detector(state)
-        if r is not None and r.score >= floor:
-            candidates.append(r)
-    return candidates
+        if r is not None:
+            raw.append(r)
+    return raw
 
+
+def collect_setup_candidates(state: SymbolState) -> List[SetupResult]:
+    """
+    Preserve Phase 8L.3 trading behavior: raw detector outputs must meet the
+    regime-specific score floor before entering the actionable pipeline.
+    """
+    floor = MIN_SCORE_CHOP if state.regime == "NEUTRAL" else MIN_SCORE_NORMAL
+    return [r for r in collect_raw_setup_candidates(state) if r.score >= floor]
 
 def choose_best_candidate(candidates: List[SetupResult]) -> Optional[SetupResult]:
     """
@@ -3429,16 +3950,52 @@ async def scan_symbol(
             t.symbols_not_ready += 1
             return
 
+        # ── Phase 8L.4: advance existing raw-setup outcomes first ─────────────
+        store = _diag_store(app)
+        if store is not None:
+            try:
+                store.update_outcomes_for_symbol(sym, state)
+            except Exception as exc:
+                _diag_warn(f"outcome update failed {sym}: {type(exc).__name__}: {exc}")
+
+        # ── Phase 8L.4: collect RAW detector outputs before score filtering ───
+        floor = MIN_SCORE_CHOP if state.regime == "NEUTRAL" else MIN_SCORE_NORMAL
+        raw_candidates = collect_raw_setup_candidates(state)
+        diag_keys: Dict[str, str] = {}
+        if store is not None:
+            try:
+                store.record_detector_scan(raw_candidates, floor)
+                for raw in raw_candidates:
+                    final_for_stats = calc_swing_tpsl(raw, state)
+                    key = store.upsert_raw_setup(
+                        sym, state, mkt.btc_regime, raw, final_for_stats, floor
+                    )
+                    diag_keys[diagnostic_setup_key(sym, raw)] = key
+                    if raw.score < floor:
+                        store.update_gate(key, "DEAD", "score_floor_fail")
+            except Exception as exc:
+                _diag_warn(f"raw setup write failed {sym}: {type(exc).__name__}: {exc}")
+
         # ── Pre-flight: symbol already has an active idea ─────────────────────
         if state.active_idea is not None:
             d.active_idea_lock += 1
             t.active_idea_lock += 1
+            if store is not None:
+                for raw in raw_candidates:
+                    key = diag_keys.get(diagnostic_setup_key(sym, raw))
+                    if key and raw.score >= floor:
+                        try:
+                            store.update_gate(key, "BLOCKED", "active_idea_lock")
+                        except Exception as exc:
+                            _diag_warn(f"gate write failed {sym}: {type(exc).__name__}: {exc}")
             clear_pending_setup(mkt, sym, "active_idea")
             return
 
-        # ── Phase 8F: collect all viable candidates ────────────────────────────
-        candidates = collect_setup_candidates(state)
+        # Preserve Phase 8L.3 signal flow: only score-passing raw setups proceed.
+        candidates = [r for r in raw_candidates if r.score >= floor]
         if not candidates:
+            # Historical counter name kept for compatibility.  In 8L.4 the DB
+            # separates true detector-none from raw setups that failed score.
             d.detector_none += 1
             t.detector_none += 1
             clear_pending_setup(mkt, sym, "detector_none")
@@ -3453,7 +4010,14 @@ async def scan_symbol(
         ]
 
         # Update diagnostics — candidate-level (may exceed symbols_checked)
-        for ev in evals:
+        for raw, ev in zip(candidates, evals):
+            if store is not None:
+                key = diag_keys.get(diagnostic_setup_key(sym, raw))
+                if key:
+                    try:
+                        store.update_gate(key, ev.status, ev.reason)
+                    except Exception as exc:
+                        _diag_warn(f"gate write failed {sym}: {type(exc).__name__}: {exc}")
             d.candidates_total += 1; t.candidates_total += 1
             if ev.status == "ACTIONABLE":
                 d.candidates_actionable += 1; t.candidates_actionable += 1
@@ -3515,6 +4079,13 @@ async def scan_symbol(
                 mkt.signal_stats["short"] += 1
             d.new_idea += 1
             t.new_idea += 1
+            if store is not None:
+                key = diag_keys.get(diagnostic_setup_key(sym, result))
+                if key:
+                    try:
+                        store.mark_signal_emitted(key)
+                    except Exception as exc:
+                        _diag_warn(f"signal marker failed {sym}: {type(exc).__name__}: {exc}")
             logger.info(
                 f"NEW IDEA {sym} {side} {result.setup_type} score={result.score} "
                 f"entry={result.entry_low:.4f}–{result.entry_high:.4f} "
@@ -4274,6 +4845,8 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_config(app, cid)
                 elif text == "/diag":
                     await _cmd_diag(app, cid)
+                elif text in ("/statsdb", "/rawstats"):
+                    await _cmd_statsdb(app, cid)
                 elif text in ("/watchlist", "/pending"):
                     await _cmd_watchlist(app, cid)
                 elif text in ("/candidates", "/dead"):
@@ -4313,7 +4886,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4 persistent raw diagnostics"
     ))
 
 
@@ -4591,6 +5164,76 @@ async def _cmd_watchlist(app: web.Application, cid: int) -> None:
     await tg.send(cid, "\n\n".join(lines))
 
 
+async def _cmd_statsdb(app: web.Application, cid: int) -> None:
+    """Phase 8L.4 persistent raw-setup statistics summary."""
+    tg: Tg = app["tg"]
+    store = _diag_store(app)
+    if not DIAGNOSTICS_DB_ENABLED:
+        await tg.send(cid, "📊 <b>Diagnostic DB is disabled in ENV.</b>")
+        return
+    if store is None:
+        await tg.send(
+            cid,
+            "⚠️ <b>Diagnostic DB is configured but unavailable.</b>\n"
+            "Check Northflank logs for the Phase 8L.4 DB open error.",
+        )
+        return
+
+    try:
+        st = store.summary()
+    except Exception as exc:
+        _diag_warn(f"/statsdb failed: {type(exc).__name__}: {exc}")
+        await tg.send(cid, "⚠️ <b>Could not read Diagnostic DB statistics.</b>")
+        return
+
+    det_parts = []
+    for abbr in ("BR", "TP", "LS"):
+        item = st["detectors"].get(abbr, {"n": 0, "avg_score": 0.0})
+        det_parts.append(f"{abbr}: {item['n']} (avg {item['avg_score']:.1f})")
+
+    c = st["counters"]
+    scan_lines = []
+    for abbr in ("BR", "TP", "LS"):
+        runs = c.get(f"detector_runs_{abbr}", 0)
+        raw = c.get(f"detector_raw_{abbr}", 0)
+        score_fail = c.get(f"score_fail_{abbr}", 0)
+        scan_lines.append(
+            f"  {abbr}: raw {raw}/{runs} · score_fail {score_fail}"
+        )
+
+    status_order = ("WAITING_ENTRY", "ACTIVE", "DONE")
+    status_str = " · ".join(
+        f"{k}={st['statuses'].get(k, 0)}" for k in status_order
+    )
+    outcome_order = (
+        "TP2", "SL", "TP1_THEN_SL", "TP1_ONLY_EXPIRED",
+        "EXPIRED", "NO_ENTRY", "AMBIGUOUS", "ENTRY_BAR_AMBIGUOUS",
+    )
+    outcome_items = [
+        f"{k}={st['outcomes'].get(k, 0)}"
+        for k in outcome_order if st["outcomes"].get(k, 0)
+    ]
+    outcome_str = " · ".join(outcome_items) if outcome_items else "—"
+    size_mb = st["size_bytes"] / (1024 * 1024)
+
+    await tg.send(cid, (
+        f"📊 <b>Phase 8L.4 — Persistent Diagnostic DB</b>\n\n"
+        f"<b>Status:</b> ✅ active\n"
+        f"<b>DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
+        f"<b>Size:</b> {size_mb:.2f} MB\n"
+        f"<b>Unique raw setups:</b> {st['total']}\n"
+        f"<b>By detector:</b> {' · '.join(det_parts)}\n"
+        f"<b>First-seen score failures:</b> {st['score_fail']}\n"
+        f"<b>Actual signals emitted:</b> {st['signal_emitted']}\n\n"
+        f"<b>Detector observations (persistent):</b>\n"
+        + "\n".join(scan_lines) + "\n\n"
+        f"<b>Outcome tracker:</b> {status_str}\n"
+        f"<b>Final outcomes:</b> {outcome_str}\n\n"
+        f"<i>Raw setups are recorded before the score floor. Outcomes are "
+        f"hypothetical and do not change signal generation.</i>"
+    ))
+
+
 async def _cmd_config(app: web.Application, cid: int) -> None:
     """Show sanitised bot configuration — no token or raw chat IDs exposed."""
     tg:  Tg     = app["tg"]
@@ -4635,7 +5278,10 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Dead candidate diagnostics:</b> enabled\n"
         f"<b>Candidate debug max:</b> {CANDIDATE_DEBUG_MAX}\n"
         f"<b>Candidate debug dedup:</b> enabled\n"
-        f"<b>Post-confirmation TP/SL boundary:</b> enabled (Phase 8L.2)"
+        f"<b>Post-confirmation TP/SL boundary:</b> enabled (Phase 8L.2)\n"
+        f"<b>Persistent raw diagnostics:</b> {'enabled' if DIAGNOSTICS_DB_ENABLED else 'off'}\n"
+        f"<b>Diagnostics DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
+        f"<b>Raw outcome window:</b> {DIAGNOSTICS_OUTCOME_DAYS} days after entry (Phase 8L.4)"
     ))
 
 
@@ -4709,6 +5355,24 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
     else:
         dead_block = ""
 
+    store = _diag_store(app)
+    if store is not None:
+        try:
+            dbs = store.summary()
+            db_block = (
+                f"<b>Raw DB:</b> {dbs['total']} unique · "
+                f"score_fail={dbs['score_fail']} · signals={dbs['signal_emitted']} · "
+                f"WAIT={dbs['statuses'].get('WAITING_ENTRY',0)} · "
+                f"ACTIVE={dbs['statuses'].get('ACTIVE',0)} · "
+                f"DONE={dbs['statuses'].get('DONE',0)}\n\n"
+            )
+        except Exception as exc:
+            _diag_warn(f"/diag DB summary failed: {type(exc).__name__}: {exc}")
+            db_block = "<b>Raw DB:</b> unavailable ⚠️\n\n"
+    else:
+        db_block = ("<b>Raw DB:</b> disabled\n\n" if not DIAGNOSTICS_DB_ENABLED
+                    else "<b>Raw DB:</b> unavailable ⚠️\n\n")
+
     await tg.send(cid, (
         f"🔬 <b>Diagnostics</b>\n\n"
         f"<b>Mode:</b> {mode}\n"
@@ -4721,6 +5385,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"<b>Not ready (≤10):</b> {nr_str}\n\n"
         f"{pending_block}"
         f"{dead_block}"
+        f"{db_block}"
         f"<b>Last-cycle scan (since keepalive reset):</b>\n"
         f"  checked={d.symbols_checked}  "
         f"not_ready={d.symbols_not_ready}  "
@@ -4767,7 +5432,7 @@ async def _cmd_diag(app: web.Application, cid: int) -> None:
         f"gate_fail={t.signal_gate_fail}  "
         f"actionable_ok={t.actionable_ok}  "
         f"new={t.new_idea}\n\n"
-        f"<b>Current gates (Phase 8D/8E/8H/8K/8L/8L.2):</b>\n"
+        f"<b>Current gates (Phase 8D/8E/8H/8K/8L/8L.2/8L.4):</b>\n"
         f"  Context max: {SETUP_CONTEXT_MAX_DAYS}d  "
         f"(legacy fresh: {SETUP_MAX_AGE_HOURS}h)\n"
         f"  LS max age: {LIQUIDITY_SWEEP_MAX_AGE_HOURS}h  "
@@ -4798,11 +5463,31 @@ async def _cmd_score(app: web.Application, cid: int, sym: str) -> None:
         return
 
     idea = state.active_idea
+    breakdown = ""
+    store = _diag_store(app)
+    if store is not None and idea.setup_ts > 0:
+        key = f"{sym}|{idea.setup_type}|{idea.side}|{int(idea.setup_ts)}"
+        try:
+            row = store.conn.execute(
+                "SELECT score_components_first FROM raw_setups WHERE setup_key=?",
+                (key,),
+            ).fetchone()
+            if row is not None:
+                comps = json.loads(row["score_components_first"] or "{}")
+                if comps:
+                    breakdown = "\n" + "\n".join(
+                        f"  +{int(points)} {html.escape(name.replace('_',' '))}"
+                        for name, points in sorted(
+                            comps.items(), key=lambda kv: (-int(kv[1]), kv[0])
+                        )
+                    )
+        except Exception as exc:
+            _diag_warn(f"/score breakdown failed {sym}: {type(exc).__name__}: {exc}")
     await tg.send(cid, (
         f"📐 <b>Score: {sym}</b>\n"
         f"Setup: {idea.setup_type.replace('_',' ')}\n"
-        f"Score: {idea.setup_score}/100\n"
-        f"<i>Detailed score breakdown is planned for a future diagnostics phase.</i>"
+        f"Score: {idea.setup_score}/100"
+        f"{breakdown}"
     ))
 
 
@@ -4858,6 +5543,25 @@ async def keepalive_loop(app: web.Application) -> None:
             f"new={d.new_idea} errors={d.errors} | "
             f"Dead matrix(unique): {matrix_log}"
         )
+        store = _diag_store(app)
+        if store is not None:
+            try:
+                st = store.summary()
+                det = st["detectors"]
+                logger.info(
+                    "DiagDB | "
+                    f"raw={st['total']} "
+                    f"BR={det.get('BR',{}).get('n',0)} "
+                    f"TP={det.get('TP',{}).get('n',0)} "
+                    f"LS={det.get('LS',{}).get('n',0)} | "
+                    f"score_fail={st['score_fail']} signals={st['signal_emitted']} | "
+                    f"waiting={st['statuses'].get('WAITING_ENTRY',0)} "
+                    f"active={st['statuses'].get('ACTIVE',0)} "
+                    f"done={st['statuses'].get('DONE',0)} | "
+                    f"outcomes={st['outcomes']}"
+                )
+            except Exception as exc:
+                _diag_warn(f"keepalive summary failed: {type(exc).__name__}: {exc}")
         # Reset last-cycle counters for the next keepalive window
         mkt.diag_last = ScanDiagnostics()
 
@@ -4896,7 +5600,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8K fresh entry retest gate · Phase 8L signal-eligible watchlist · "
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
-        "Phase 8L.3 signal-flow rollback)"
+        "Phase 8L.3 signal-flow rollback · "
+        "Phase 8L.4 persistent raw diagnostics)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -4911,6 +5616,22 @@ async def on_startup(app: web.Application) -> None:
     app["http"] = http
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
     app["rest"] = BybitRest(BYBIT_REST, http)
+
+    # Phase 8L.4 diagnostics are deliberately non-critical: failure to open
+    # the DB never prevents the trading bot from starting.
+    app["diag_store"] = None
+    if DIAGNOSTICS_DB_ENABLED:
+        try:
+            app["diag_store"] = DiagnosticStore(DIAGNOSTICS_DB_PATH)
+            logger.info(
+                f"Phase 8L.4 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
+                f"outcome_days={DIAGNOSTICS_OUTCOME_DAYS}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Phase 8L.4 Diagnostic DB disabled after open failure: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     if TELEGRAM_TOKEN:
         try:
@@ -4985,9 +5706,11 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L</b> signal-eligible watchlist: active ✅\n"
                 f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
                 f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
-                f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n\n"
+                f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n"
+                f"<b>Phase 8L.4</b> persistent raw setup/score/outcome diagnostics: "
+                f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /watchlist /candidates"
+                f"/close SYMBOL /config /diag /statsdb /watchlist /candidates"
     ))
 
 
@@ -4998,6 +5721,10 @@ async def on_cleanup(app: web.Application) -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+    store = _diag_store(app)
+    if store is not None:
+        with contextlib.suppress(Exception):
+            store.close()
     if "http" in app:
         await app["http"].close()
 
@@ -5098,6 +5825,57 @@ def _selftest_phase_8l2_post_confirmation_boundary() -> None:
     assert matrix == [("TP", "hit_tp", "<24h", 1)]
 
 
+def _selftest_phase_8l4_diagnostic_store() -> None:
+    """In-memory regression test for raw dedup, score components and outcomes."""
+    store = DiagnosticStore(":memory:")
+    try:
+        hour = 3_600_000
+        base = (now_ms() // hour) * hour - 4 * hour
+        state = SymbolState(
+            bars_1h=[
+                (base, 100.0, 101.0, 99.0, 100.0, 1.0),
+                (base + hour, 100.0, 101.0, 99.0, 100.0, 1.0),
+                # treated as forming at first observation; current px in zone
+                (base + 2 * hour, 100.0, 101.0, 99.0, 100.5, 1.0),
+            ]
+        )
+        state.regime = "BULLISH"
+        raw = SetupResult(
+            setup_type="BREAKOUT_RETEST", side="LONG", score=45,
+            entry_low=99.0, entry_high=101.0, stop_loss=95.0,
+            tp1=105.0, tp2=110.0, rr_tp1=1.0, rr_tp2=2.0,
+            invalidation="test", setup_ts=base, setup_tf="1h",
+            score_components={"factor_a": 20, "factor_b": 25},
+        )
+        store.record_detector_scan([raw], 55)
+        key = store.upsert_raw_setup("BTCUSDT", state, "BULLISH", raw, raw, 55)
+        # Same setup must update, not duplicate.
+        store.upsert_raw_setup("BTCUSDT", state, "BULLISH", raw, raw, 55)
+        store.update_gate(key, "DEAD", "score_floor_fail")
+        assert store.summary()["total"] == 1
+        assert store.summary()["score_fail"] == 1
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM setup_score_components WHERE setup_key=?", (key,)
+        ).fetchone()[0] == 2
+
+        # One newly closed post-observation bar reaches TP2 without touching SL.
+        state.bars_1h = [
+            (base, 100.0, 101.0, 99.0, 100.0, 1.0),
+            (base + hour, 100.0, 101.0, 99.0, 100.0, 1.0),
+            (base + 2 * hour, 100.0, 111.0, 99.0, 110.0, 1.0),
+            (base + 3 * hour, 110.0, 111.0, 109.0, 110.0, 1.0),
+        ]
+        store.update_outcomes_for_symbol("BTCUSDT", state)
+        row = store.conn.execute(
+            "SELECT final_outcome,observation_status FROM raw_setups WHERE setup_key=?",
+            (key,),
+        ).fetchone()
+        assert row["final_outcome"] == "TP2"
+        assert row["observation_status"] == "DONE"
+    finally:
+        store.close()
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -5113,4 +5891,5 @@ if __name__ == "__main__":
     _selftest_pending_signal_eligible_watchlist()
     _selftest_phase_8l1_quality_hotfix()
     _selftest_phase_8l2_post_confirmation_boundary()
+    _selftest_phase_8l4_diagnostic_store()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
