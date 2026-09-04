@@ -27,6 +27,7 @@ Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · qua
 Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
 Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
 Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + BR/TP internal-stage telemetry (no trading-rule changes)
+Phase 8L.4.2 Diagnostic: prospective BR geometry-fail shadow outcome tracker + reliable TP diagnostics (no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -1248,7 +1249,7 @@ class CandidateDebug:
 # === 5B. PHASE 8L.4 PERSISTENT DIAGNOSTICS (SQLite) ===
 # =============================================================================
 
-_DIAG_SCHEMA_VERSION = "2"
+_DIAG_SCHEMA_VERSION = "3"
 _DIAG_DETECTOR_ABBR = {
     "BREAKOUT_RETEST": "BR",
     "TREND_PULLBACK": "TP",
@@ -1259,6 +1260,29 @@ _DIAG_DETECTOR_ABBR = {
 def diagnostic_setup_key(symbol: str, result: SetupResult) -> str:
     """Stable dedup key: one row per detector/side/confirmation timestamp."""
     return f"{symbol}|{result.setup_type}|{result.side}|{int(result.setup_ts)}"
+
+
+@dataclass
+class BRShadowCandidate:
+    """
+    Diagnostics-only Breakout+Retest candidate captured immediately before the
+    production geometry guard rejects it.  It NEVER enters the trading pipeline.
+
+    The shadow model keeps the production entry zone and targets but places a
+    hypothetical stop just outside the entry zone by 0.05 ATR.  This lets us
+    prospectively measure whether shallow retests rejected by the geometry guard
+    would have produced useful outcomes without changing live/dry-run signals.
+    """
+    result: SetupResult
+    breakout_ts_ms: int
+    retest_ts_ms: int
+    retest_tf: str
+    key_level: float
+    original_stop_loss: float
+    shadow_stop_loss: float
+    geometry_gap_abs: float
+    geometry_gap_atr: float
+    stop_model: str = "ZONE_EDGE_0.05ATR"
 
 
 @dataclass
@@ -1275,6 +1299,7 @@ class DetectorStageTrace:
     counters: Dict[str, int] = field(default_factory=dict)
     terminal: Dict[str, str] = field(default_factory=dict)
     progress: Dict[str, int] = field(default_factory=dict)
+    br_shadow_candidates: List[BRShadowCandidate] = field(default_factory=list)
 
     def bump(self, side: str, stage: str, amount: int = 1) -> None:
         key = f"{side}|{stage}"
@@ -1389,6 +1414,66 @@ class DiagnosticStore:
                 updated_at_ts INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS br_shadow_setups (
+                shadow_key TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                breakout_ts_ms INTEGER NOT NULL,
+                retest_ts_ms INTEGER NOT NULL,
+                retest_tf TEXT NOT NULL DEFAULT '',
+                key_level REAL NOT NULL,
+
+                first_seen_ts INTEGER NOT NULL,
+                last_seen_ts INTEGER NOT NULL,
+                raw_score_first INTEGER NOT NULL,
+                raw_score_latest INTEGER NOT NULL,
+                score_components_first TEXT NOT NULL DEFAULT '{}',
+                score_components_latest TEXT NOT NULL DEFAULT '{}',
+                regime_first TEXT NOT NULL DEFAULT '',
+                regime_latest TEXT NOT NULL DEFAULT '',
+                btc_regime_first TEXT NOT NULL DEFAULT '',
+                btc_regime_latest TEXT NOT NULL DEFAULT '',
+
+                entry_low REAL NOT NULL,
+                entry_high REAL NOT NULL,
+                entry_mid REAL NOT NULL,
+                original_stop_loss REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                stop_model TEXT NOT NULL DEFAULT 'ZONE_EDGE_0.05ATR',
+                geometry_gap_abs REAL NOT NULL DEFAULT 0,
+                geometry_gap_atr REAL NOT NULL DEFAULT 0,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                rr_tp1 REAL NOT NULL,
+                rr_tp2 REAL NOT NULL,
+                current_price_first REAL NOT NULL DEFAULT 0,
+                current_price_latest REAL NOT NULL DEFAULT 0,
+                in_entry_zone_first INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+
+                observation_status TEXT NOT NULL DEFAULT 'WAITING_ENTRY',
+                entry_activated_ts INTEGER,
+                tp1_hit_ts INTEGER,
+                tp2_hit_ts INTEGER,
+                sl_hit_ts INTEGER,
+                final_outcome TEXT,
+                final_outcome_ts INTEGER,
+                expires_at_ts INTEGER NOT NULL,
+                mfe_pct REAL NOT NULL DEFAULT 0,
+                mae_pct REAL NOT NULL DEFAULT 0,
+                mfe_r REAL NOT NULL DEFAULT 0,
+                mae_r REAL NOT NULL DEFAULT 0,
+                last_eval_bar_ts_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_br_shadow_symbol_status
+                ON br_shadow_setups(symbol, observation_status);
+            CREATE INDEX IF NOT EXISTS idx_br_shadow_outcome
+                ON br_shadow_setups(final_outcome);
+            CREATE INDEX IF NOT EXISTS idx_br_shadow_side_score
+                ON br_shadow_setups(side, raw_score_first);
+
             CREATE TABLE IF NOT EXISTS setup_score_components (
                 setup_key TEXT NOT NULL,
                 component TEXT NOT NULL,
@@ -1425,7 +1510,7 @@ class DiagnosticStore:
             (_DIAG_SCHEMA_VERSION,),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4.1')"
+            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4.2')"
         )
         self.conn.commit()
 
@@ -1657,6 +1742,257 @@ class DiagnosticStore:
             )
         self.conn.commit()
         return key
+
+    @staticmethod
+    def _br_shadow_key(symbol: str, shadow: BRShadowCandidate) -> str:
+        # Include breakout + retest + key level so repeated polling dedups the
+        # same structural candidate without merging distinct breakouts.
+        return (
+            f"{symbol}|BR_SHADOW|{shadow.result.side}|"
+            f"{int(shadow.breakout_ts_ms)}|{int(shadow.retest_ts_ms)}|"
+            f"{shadow.key_level:.10g}"
+        )
+
+    def upsert_br_shadow(
+        self,
+        symbol: str,
+        state: SymbolState,
+        btc_regime: str,
+        shadow: BRShadowCandidate,
+    ) -> str:
+        """Persist one prospective BR geometry-fail shadow setup."""
+        result = shadow.result
+        final_result = calc_swing_tpsl(result, state)
+        key = self._br_shadow_key(symbol, shadow)
+        now = now_s()
+        px = get_current_price(state)
+        entry_mid = (final_result.entry_low + final_result.entry_high) / 2.0
+        in_zone = int(px > 0.0 and final_result.entry_low <= px <= final_result.entry_high)
+        components_json = json.dumps(
+            result.score_components or {}, sort_keys=True, separators=(",", ":")
+        )
+        closed_1h = state.bars_1h[:-1] if len(state.bars_1h) > 1 else []
+        baseline_bar_ts = closed_1h[-1][B_TS] if closed_1h else 0
+        initial_status = "ACTIVE" if in_zone else "WAITING_ENTRY"
+        initial_entry_ts = now if in_zone else None
+        expiry_base = initial_entry_ts if initial_entry_ts is not None else now
+        expires_at = expiry_base + DIAGNOSTICS_OUTCOME_DAYS * 86400
+
+        self.conn.execute(
+            """
+            INSERT INTO br_shadow_setups (
+                shadow_key,symbol,side,breakout_ts_ms,retest_ts_ms,retest_tf,key_level,
+                first_seen_ts,last_seen_ts,raw_score_first,raw_score_latest,
+                score_components_first,score_components_latest,
+                regime_first,regime_latest,btc_regime_first,btc_regime_latest,
+                entry_low,entry_high,entry_mid,original_stop_loss,stop_loss,stop_model,
+                geometry_gap_abs,geometry_gap_atr,tp1,tp2,rr_tp1,rr_tp2,
+                current_price_first,current_price_latest,in_entry_zone_first,notes,
+                observation_status,entry_activated_ts,expires_at_ts,
+                last_eval_bar_ts_ms,updated_at_ts
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+            ON CONFLICT(shadow_key) DO UPDATE SET
+                last_seen_ts=excluded.last_seen_ts,
+                raw_score_latest=excluded.raw_score_latest,
+                score_components_latest=excluded.score_components_latest,
+                regime_latest=excluded.regime_latest,
+                btc_regime_latest=excluded.btc_regime_latest,
+                current_price_latest=excluded.current_price_latest,
+                updated_at_ts=excluded.updated_at_ts
+            """,
+            (
+                key, symbol, result.side, int(shadow.breakout_ts_ms),
+                int(shadow.retest_ts_ms), shadow.retest_tf or "", float(shadow.key_level),
+                now, now, int(result.score), int(result.score),
+                components_json, components_json,
+                state.regime, state.regime, btc_regime, btc_regime,
+                float(final_result.entry_low), float(final_result.entry_high), float(entry_mid),
+                float(shadow.original_stop_loss), float(final_result.stop_loss), shadow.stop_model,
+                float(shadow.geometry_gap_abs), float(shadow.geometry_gap_atr),
+                float(final_result.tp1), float(final_result.tp2),
+                float(final_result.rr_tp1), float(final_result.rr_tp2),
+                float(px), float(px), in_zone, result.notes or "",
+                initial_status, initial_entry_ts, int(expires_at),
+                int(baseline_bar_ts), now,
+            ),
+        )
+        self.conn.commit()
+        return key
+
+    def update_br_shadow_outcomes_for_symbol(self, symbol: str, state: SymbolState) -> None:
+        """
+        Advance prospective BR-shadow outcomes using newly closed 1H bars.
+
+        This is diagnostics-only and mirrors raw-setup tracking.  No shadow row
+        can create, block, or modify a trading signal.
+        """
+        closed = state.bars_1h[:-1] if len(state.bars_1h) > 1 else []
+        now = now_s()
+        rows = self.conn.execute(
+            """
+            SELECT * FROM br_shadow_setups
+            WHERE symbol=? AND final_outcome IS NULL
+              AND observation_status IN ('WAITING_ENTRY','ACTIVE')
+            ORDER BY first_seen_ts ASC
+            """,
+            (symbol,),
+        ).fetchall()
+
+        for row in rows:
+            status = row["observation_status"]
+            last_eval = int(row["last_eval_bar_ts_ms"] or 0)
+            bars = [b for b in closed if b[B_TS] > last_eval]
+            tp1_ts = row["tp1_hit_ts"]
+            mfe_pct = float(row["mfe_pct"] or 0.0)
+            mae_pct = float(row["mae_pct"] or 0.0)
+            mfe_r = float(row["mfe_r"] or 0.0)
+            mae_r = float(row["mae_r"] or 0.0)
+            final_outcome = None
+            final_ts = None
+            sl_ts = row["sl_hit_ts"]
+            tp2_ts = row["tp2_hit_ts"]
+            entry_ts = row["entry_activated_ts"]
+            expires_at = int(row["expires_at_ts"])
+
+            for bar in bars:
+                bar_ts_s = int(bar[B_TS] // 1000)
+
+                if status == "WAITING_ENTRY":
+                    if bar_ts_s > expires_at:
+                        break
+                    if self._bar_touches_entry(row, bar):
+                        sl_hit, tp1_hit, tp2_hit = self._bar_hits(row, bar)
+                        entry_ts = bar_ts_s
+                        last_eval = bar[B_TS]
+                        if sl_hit or tp1_hit or tp2_hit:
+                            final_outcome = "ENTRY_BAR_AMBIGUOUS"
+                            final_ts = bar_ts_s
+                            sl_ts = bar_ts_s if sl_hit else sl_ts
+                            tp1_ts = bar_ts_s if tp1_hit else tp1_ts
+                            tp2_ts = bar_ts_s if tp2_hit else tp2_ts
+                            status = "DONE"
+                            break
+                        status = "ACTIVE"
+                        expires_at = entry_ts + DIAGNOSTICS_OUTCOME_DAYS * 86400
+                        continue
+                    last_eval = bar[B_TS]
+                    continue
+
+                if status == "ACTIVE":
+                    if bar_ts_s > expires_at:
+                        break
+                    b_mfe_pct, b_mae_pct, b_mfe_r, b_mae_r = self._excursions(row, bar)
+                    mfe_pct = max(mfe_pct, b_mfe_pct)
+                    mae_pct = max(mae_pct, b_mae_pct)
+                    mfe_r = max(mfe_r, b_mfe_r)
+                    mae_r = max(mae_r, b_mae_r)
+                    sl_hit, tp1_hit, tp2_hit = self._bar_hits(row, bar)
+
+                    ambiguous = sl_hit and (tp2_hit or (tp1_ts is None and tp1_hit))
+                    if ambiguous:
+                        final_outcome = "AMBIGUOUS"
+                        final_ts = bar_ts_s
+                        sl_ts = bar_ts_s
+                        if tp1_hit and tp1_ts is None:
+                            tp1_ts = bar_ts_s
+                        if tp2_hit:
+                            tp2_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if sl_hit:
+                        sl_ts = bar_ts_s
+                        final_outcome = "TP1_THEN_SL" if tp1_ts is not None else "SL"
+                        final_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if tp2_hit:
+                        if tp1_ts is None:
+                            tp1_ts = bar_ts_s
+                        tp2_ts = bar_ts_s
+                        final_outcome = "TP2"
+                        final_ts = bar_ts_s
+                        status = "DONE"
+                        last_eval = bar[B_TS]
+                        break
+
+                    if tp1_hit and tp1_ts is None:
+                        tp1_ts = bar_ts_s
+                    last_eval = bar[B_TS]
+
+            if final_outcome is None:
+                if status == "WAITING_ENTRY" and now >= expires_at:
+                    final_outcome = "NO_ENTRY"
+                    final_ts = expires_at
+                    status = "DONE"
+                elif status == "ACTIVE" and now >= expires_at:
+                    final_outcome = "TP1_ONLY_EXPIRED" if tp1_ts is not None else "EXPIRED"
+                    final_ts = expires_at
+                    status = "DONE"
+
+            self.conn.execute(
+                """
+                UPDATE br_shadow_setups SET
+                    observation_status=?, entry_activated_ts=?, expires_at_ts=?,
+                    tp1_hit_ts=?, tp2_hit_ts=?, sl_hit_ts=?,
+                    final_outcome=COALESCE(final_outcome, ?),
+                    final_outcome_ts=COALESCE(final_outcome_ts, ?),
+                    mfe_pct=?, mae_pct=?, mfe_r=?, mae_r=?,
+                    last_eval_bar_ts_ms=?, updated_at_ts=?
+                WHERE shadow_key=?
+                """,
+                (
+                    status, entry_ts, expires_at, tp1_ts, tp2_ts, sl_ts,
+                    final_outcome, final_ts,
+                    mfe_pct, mae_pct, mfe_r, mae_r,
+                    last_eval, now, row["shadow_key"],
+                ),
+            )
+        self.conn.commit()
+
+    def br_shadow_summary(self) -> Dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT side,raw_score_first,geometry_gap_atr,observation_status,
+                   final_outcome,mfe_r,mae_r
+            FROM br_shadow_setups
+            """
+        ).fetchall()
+        total = len(rows)
+        sides: Dict[str, int] = {}
+        statuses: Dict[str, int] = {}
+        outcomes: Dict[str, int] = {}
+        scores: List[int] = []
+        gaps: List[float] = []
+        mfe_r: List[float] = []
+        mae_r: List[float] = []
+        for r in rows:
+            side = r["side"] or "UNKNOWN"
+            sides[side] = sides.get(side, 0) + 1
+            status = r["observation_status"] or "UNKNOWN"
+            statuses[status] = statuses.get(status, 0) + 1
+            outcome = r["final_outcome"]
+            if outcome:
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            scores.append(int(r["raw_score_first"] or 0))
+            gaps.append(float(r["geometry_gap_atr"] or 0.0))
+            mfe_r.append(float(r["mfe_r"] or 0.0))
+            mae_r.append(float(r["mae_r"] or 0.0))
+        return {
+            "total": total,
+            "sides": sides,
+            "statuses": statuses,
+            "outcomes": outcomes,
+            "avg_score": (sum(scores) / total) if total else 0.0,
+            "avg_gap_atr": (sum(gaps) / total) if total else 0.0,
+            "avg_mfe_r": (sum(mfe_r) / total) if total else 0.0,
+            "avg_mae_r": (sum(mae_r) / total) if total else 0.0,
+        }
 
     def update_gate(
         self,
@@ -2235,6 +2571,37 @@ def _scan_breakout_side(
             if stop_loss >= entry_low:
                 if trace is not None:
                     trace.bump(side, "geometry_fail")
+                    shadow_stop = entry_low - 0.05 * atr
+                    shadow_tp1 = entry_mid + TP1_ATR_MULT_BREAKOUT * atr
+                    shadow_tp2 = entry_mid + TP2_ATR_MULT_BREAKOUT * atr
+                    gap_abs = max(0.0, stop_loss - entry_low)
+                    shadow_result = SetupResult(
+                        setup_type="BREAKOUT_RETEST", side=side, score=score,
+                        entry_low=round(entry_low, 6), entry_high=round(entry_high, 6),
+                        stop_loss=round(shadow_stop, 6),
+                        tp1=round(shadow_tp1, 6), tp2=round(shadow_tp2, 6),
+                        rr_tp1=calc_rr(side, entry_mid, shadow_stop, shadow_tp1),
+                        rr_tp2=calc_rr(side, entry_mid, shadow_stop, shadow_tp2),
+                        invalidation=(
+                            f"Daily close below {key_level:.4f} "
+                            f"(broken resistance reverts to resistance)"
+                        ),
+                        notes=(
+                            f"BR_SHADOW geometry_fail bo_ts={bo_bar[B_TS]} "
+                            f"key={key_level:.4f} retest_tf={retest_tf} "
+                            f"retest_ts={retest_bar[B_TS]} original_sl={stop_loss:.6f}"
+                        ),
+                        setup_ts=retest_bar[B_TS], setup_tf=retest_tf,
+                        score_components=score_components,
+                    )
+                    trace.br_shadow_candidates.append(BRShadowCandidate(
+                        result=shadow_result, breakout_ts_ms=bo_bar[B_TS],
+                        retest_ts_ms=retest_bar[B_TS], retest_tf=retest_tf,
+                        key_level=key_level, original_stop_loss=stop_loss,
+                        shadow_stop_loss=shadow_stop, geometry_gap_abs=gap_abs,
+                        geometry_gap_atr=(gap_abs / atr if atr > 0 else 0.0),
+                    ))
+                    trace.bump(side, "shadow_captured")
                 continue
             tp1          = entry_mid + TP1_ATR_MULT_BREAKOUT * atr
             tp2          = entry_mid + TP2_ATR_MULT_BREAKOUT * atr
@@ -2251,6 +2618,37 @@ def _scan_breakout_side(
             if stop_loss <= entry_high:
                 if trace is not None:
                     trace.bump(side, "geometry_fail")
+                    shadow_stop = entry_high + 0.05 * atr
+                    shadow_tp1 = entry_mid - TP1_ATR_MULT_BREAKOUT * atr
+                    shadow_tp2 = entry_mid - TP2_ATR_MULT_BREAKOUT * atr
+                    gap_abs = max(0.0, entry_high - stop_loss)
+                    shadow_result = SetupResult(
+                        setup_type="BREAKOUT_RETEST", side=side, score=score,
+                        entry_low=round(entry_low, 6), entry_high=round(entry_high, 6),
+                        stop_loss=round(shadow_stop, 6),
+                        tp1=round(shadow_tp1, 6), tp2=round(shadow_tp2, 6),
+                        rr_tp1=calc_rr(side, entry_mid, shadow_stop, shadow_tp1),
+                        rr_tp2=calc_rr(side, entry_mid, shadow_stop, shadow_tp2),
+                        invalidation=(
+                            f"Daily close above {key_level:.4f} "
+                            f"(broken support reverts to support)"
+                        ),
+                        notes=(
+                            f"BR_SHADOW geometry_fail bo_ts={bo_bar[B_TS]} "
+                            f"key={key_level:.4f} retest_tf={retest_tf} "
+                            f"retest_ts={retest_bar[B_TS]} original_sl={stop_loss:.6f}"
+                        ),
+                        setup_ts=retest_bar[B_TS], setup_tf=retest_tf,
+                        score_components=score_components,
+                    )
+                    trace.br_shadow_candidates.append(BRShadowCandidate(
+                        result=shadow_result, breakout_ts_ms=bo_bar[B_TS],
+                        retest_ts_ms=retest_bar[B_TS], retest_tf=retest_tf,
+                        key_level=key_level, original_stop_loss=stop_loss,
+                        shadow_stop_loss=shadow_stop, geometry_gap_abs=gap_abs,
+                        geometry_gap_atr=(gap_abs / atr if atr > 0 else 0.0),
+                    ))
+                    trace.bump(side, "shadow_captured")
                 continue
             tp1          = entry_mid - TP1_ATR_MULT_BREAKOUT * atr
             tp2          = entry_mid - TP2_ATR_MULT_BREAKOUT * atr
@@ -4248,6 +4646,7 @@ async def scan_symbol(
         if store is not None:
             try:
                 store.update_outcomes_for_symbol(sym, state)
+                store.update_br_shadow_outcomes_for_symbol(sym, state)
             except Exception as exc:
                 _diag_warn(f"outcome update failed {sym}: {type(exc).__name__}: {exc}")
 
@@ -4260,6 +4659,10 @@ async def scan_symbol(
             try:
                 store.record_detector_scan(raw_candidates, floor)
                 store.record_stage_traces(sym, stage_traces)
+                for trace in stage_traces:
+                    if trace.detector == "BR":
+                        for shadow in trace.br_shadow_candidates:
+                            store.upsert_br_shadow(sym, state, mkt.btc_regime, shadow)
                 for raw in raw_candidates:
                     final_for_stats = calc_swing_tpsl(raw, state)
                     key = store.upsert_raw_setup(
@@ -5144,6 +5547,10 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_statsdb(app, cid)
                 elif text in ("/brtp", "/detstats"):
                     await _cmd_brtp(app, cid)
+                elif text in ("/brshadow", "/shadowbr"):
+                    await _cmd_brshadow(app, cid)
+                elif text in ("/tpdiag", "/tpdb"):
+                    await _cmd_tpdiag(app, cid)
                 elif text in ("/watchlist", "/pending"):
                     await _cmd_watchlist(app, cid)
                 elif text in ("/candidates", "/dead"):
@@ -5183,7 +5590,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.1 persistent raw + BR/TP deep diagnostics"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.2 persistent raw + BR/TP deep + BR shadow diagnostics"
     ))
 
 
@@ -5462,7 +5869,7 @@ async def _cmd_watchlist(app: web.Application, cid: int) -> None:
 
 
 async def _cmd_statsdb(app: web.Application, cid: int) -> None:
-    """Phase 8L.4 persistent raw-setup statistics summary."""
+    """Phase 8L.4.2 persistent raw-setup + BR-shadow statistics summary."""
     tg: Tg = app["tg"]
     store = _diag_store(app)
     if not DIAGNOSTICS_DB_ENABLED:
@@ -5478,6 +5885,7 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
 
     try:
         st = store.summary()
+        shadow_summary = store.br_shadow_summary()
     except Exception as exc:
         _diag_warn(f"/statsdb failed: {type(exc).__name__}: {exc}")
         await tg.send(cid, "⚠️ <b>Could not read Diagnostic DB statistics.</b>")
@@ -5514,14 +5922,16 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
     size_mb = st["size_bytes"] / (1024 * 1024)
 
     await tg.send(cid, (
-        f"📊 <b>Phase 8L.4.1 — Persistent Diagnostic DB</b>\n\n"
+        f"📊 <b>Phase 8L.4.2 — Persistent Diagnostic DB</b>\n\n"
         f"<b>Status:</b> ✅ active\n"
         f"<b>DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
         f"<b>Size:</b> {size_mb:.2f} MB\n"
         f"<b>Unique raw setups:</b> {st['total']}\n"
         f"<b>By detector:</b> {' · '.join(det_parts)}\n"
         f"<b>First-seen score failures:</b> {st['score_fail']}\n"
-        f"<b>Actual signals emitted:</b> {st['signal_emitted']}\n\n"
+        f"<b>Actual signals emitted:</b> {st['signal_emitted']}\n"
+        f"<b>BR geometry-fail shadows:</b> {shadow_summary['total']} "
+        f"(DONE {shadow_summary['statuses'].get('DONE',0)})\n\n"
         f"<b>Detector observations (persistent):</b>\n"
         + "\n".join(scan_lines) + "\n\n"
         f"<b>Outcome tracker:</b> {status_str}\n"
@@ -5546,7 +5956,7 @@ def _fmt_terminal_line(c: Dict[str, int], order: List[Tuple[str, str]]) -> str:
 
 
 async def _cmd_brtp(app: web.Application, cid: int) -> None:
-    """Deep persistent BR/TP funnel diagnostics (Phase 8L.4.1)."""
+    """Deep persistent BR/TP funnel diagnostics (Phase 8L.4.2)."""
     tg: Tg = app["tg"]
     store = _diag_store(app)
     if store is None:
@@ -5587,11 +5997,12 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
         br_lines.append(ret)
 
     await tg.send(cid, (
-        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.1</b>\n\n"
-        "<i>Stage counters start from the 8L.4.1 deployment; old raw DB rows are preserved.</i>\n\n"
+        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.2</b>\n\n"
+        "<i>Stage counters continue from 8L.4.1; BR shadow outcomes start prospectively from 8L.4.2.</i>\n\n"
         + "\n".join(br_lines) + "\n\n"
         f"<b>Persistent unique BR setups (all DB history):</b> {br_raw['total']} "
-        f"· avg score {br_raw['avg_score']:.1f} · signals {br_raw['signals']}"
+        f"· avg score {br_raw['avg_score']:.1f} · signals {br_raw['signals']}\n"
+        "<i>Geometry-fail outcome tracker: /brshadow</i>"
     ))
 
     tp_stages = [
@@ -5628,8 +6039,8 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
     outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
     passed = tp_raw["score_passed"]
 
-    await tg.send(cid, (
-        "📐 <b>TP Deep Diagnostic — Phase 8L.4.1</b>\n\n"
+    tp_text = (
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2</b>\n\n"
         + "\n".join(tp_lines) + "\n\n"
         f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
         f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · "
@@ -5640,6 +6051,104 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
         f"<b>Final outcomes so far:</b> {outcomes}\n\n"
         "<i>Raw TP statistics include setups rejected by the score floor. "
         "They remain hypothetical and do not change signal generation.</i>"
+    )
+    # Two immediate channel sends can occasionally trip Telegram flood limits.
+    # Delay the second diagnostic message and also expose /tpdiag as a direct command.
+    await asyncio.sleep(1.1)
+    await tg.send(cid, tp_text)
+
+
+async def _cmd_tpdiag(app: web.Application, cid: int) -> None:
+    """Direct TP diagnostic command; avoids dependence on the second /brtp send."""
+    tg: Tg = app["tg"]
+    store = _diag_store(app)
+    if store is None:
+        await tg.send(cid, "⚠️ <b>Diagnostic DB unavailable.</b>")
+        return
+    try:
+        tp = store.detector_stage_summary("TP")
+        tp_raw = store.detector_raw_detail("TREND_PULLBACK")
+    except Exception as exc:
+        _diag_warn(f"/tpdiag failed: {type(exc).__name__}: {exc}")
+        await tg.send(cid, "⚠️ <b>Could not read TP diagnostics.</b>")
+        return
+
+    tp_stages = [
+        ("calls", "calls"), ("trend_context_pass", "trend"),
+        ("pullback_duration_pass", "dur2-7"), ("ema_touch_pass", "touch"),
+        ("4h_close_confirm_pass", "4Hclose"), ("geometry_pass", "geom"),
+        ("raw_result", "raw"),
+    ]
+    tp_term = [
+        ("trend_context_fail", "trend_fail"),
+        ("pullback_duration_fail", "duration_fail"),
+        ("ema_touch_fail", "touch_fail"),
+        ("4h_close_confirm_fail", "4Hclose_fail"),
+        ("hard_reversal_confirm_fail", "rev_fail"),
+        ("hard_reversal_volume_fail", "vol_fail"),
+        ("geometry_fail", "geom_fail"), ("raw_result", "raw"),
+    ]
+    tp_lines = []
+    for side in ("LONG", "SHORT"):
+        c = tp.get(side, {})
+        tp_lines.append(_fmt_stage_line(side, c, tp_stages))
+        tp_lines.append("  terminal: " + _fmt_terminal_line(c, tp_term))
+        tp_lines.append(
+            f"  touches: EMA20={c.get('ema20_touch_pass',0)} "
+            f"EMA50={c.get('ema50_touch_pass',0)}"
+        )
+    buckets = " · ".join(f"{k}:{v}" for k, v in tp_raw["buckets"].items())
+    regimes = " · ".join(f"{k}:{v}" for k, v in sorted(tp_raw["regimes"].items())) or "—"
+    components = " · ".join(
+        f"{x['name']} {x['n']}/{tp_raw['total']} ({x['rate']:.0f}%)"
+        for x in tp_raw["components"][:7]
+    ) or "—"
+    outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
+    passed = tp_raw["score_passed"]
+    await tg.send(cid, (
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2</b>\n\n"
+        + "\n".join(tp_lines) + "\n\n"
+        f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
+        f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · signals {tp_raw['signals']}\n"
+        f"<b>Score buckets:</b> {buckets}\n"
+        f"<b>First regime:</b> {regimes}\n"
+        f"<b>Awarded components:</b> {components}\n"
+        f"<b>Final outcomes so far:</b> {outcomes}\n\n"
+        "<i>Raw TP statistics include setups rejected by the score floor. "
+        "They remain hypothetical and do not change signal generation.</i>"
+    ))
+
+
+async def _cmd_brshadow(app: web.Application, cid: int) -> None:
+    """Prospective outcomes for BR candidates rejected only by geometry."""
+    tg: Tg = app["tg"]
+    store = _diag_store(app)
+    if store is None:
+        await tg.send(cid, "⚠️ <b>Diagnostic DB unavailable.</b>")
+        return
+    try:
+        x = store.br_shadow_summary()
+    except Exception as exc:
+        _diag_warn(f"/brshadow failed: {type(exc).__name__}: {exc}")
+        await tg.send(cid, "⚠️ <b>Could not read BR shadow statistics.</b>")
+        return
+
+    sides = " · ".join(f"{k}:{v}" for k, v in sorted(x["sides"].items())) or "—"
+    statuses = " · ".join(f"{k}:{v}" for k, v in sorted(x["statuses"].items())) or "—"
+    outcomes = " · ".join(f"{k}:{v}" for k, v in sorted(x["outcomes"].items())) or "—"
+    await tg.send(cid, (
+        "🫥 <b>BR Shadow Outcome Tracker — Phase 8L.4.2</b>\n\n"
+        f"<b>Unique geometry-fail shadows:</b> {x['total']}\n"
+        f"<b>By side:</b> {sides}\n"
+        f"<b>Avg raw score:</b> {x['avg_score']:.1f}\n"
+        f"<b>Avg geometry gap:</b> {x['avg_gap_atr']:.3f} ATR inside entry zone\n"
+        f"<b>Tracker:</b> {statuses}\n"
+        f"<b>Final outcomes:</b> {outcomes}\n"
+        f"<b>Avg MFE / MAE:</b> {x['avg_mfe_r']:.2f}R / {x['avg_mae_r']:.2f}R\n\n"
+        "<b>Shadow SL model:</b> 0.05 ATR outside the entry-zone edge.\n"
+        f"<b>Outcome window:</b> {DIAGNOSTICS_OUTCOME_DAYS} days after entry.\n\n"
+        "<i>Shadow setups never enter the trading pipeline and can never emit a signal. "
+        "Tracking starts prospectively from first observation after this deployment.</i>"
     ))
 
 
@@ -6020,7 +6529,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
-        "Phase 8L.4.1 persistent raw + BR/TP deep diagnostics)"
+        "Phase 8L.4.2 persistent raw + BR/TP deep + BR shadow diagnostics)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -6043,12 +6552,12 @@ async def on_startup(app: web.Application) -> None:
         try:
             app["diag_store"] = DiagnosticStore(DIAGNOSTICS_DB_PATH)
             logger.info(
-                f"Phase 8L.4.1 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
+                f"Phase 8L.4.2 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
                 f"outcome_days={DIAGNOSTICS_OUTCOME_DAYS}"
             )
         except Exception as exc:
             logger.warning(
-                f"Phase 8L.4.1 Diagnostic DB disabled after open failure: "
+                f"Phase 8L.4.2 Diagnostic DB disabled after open failure: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -6126,10 +6635,10 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
                 f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
                 f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n"
-                f"<b>Phase 8L.4.1</b> persistent raw + BR/TP deep diagnostics: "
+                f"<b>Phase 8L.4.2</b> persistent raw + BR/TP deep + BR shadow diagnostics: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /statsdb /brtp /watchlist /candidates"
+                f"/close SYMBOL /config /diag /statsdb /brtp /tpdiag /brshadow /watchlist /candidates"
     ))
 
 
@@ -6302,6 +6811,44 @@ def _selftest_phase_8l4_diagnostic_store() -> None:
         store.close()
 
 
+def _selftest_phase_8l42_br_shadow_store() -> None:
+    """Shadow rows must persist separately and never pollute raw-setups totals."""
+    store = DiagnosticStore(":memory:")
+    try:
+        state = SymbolState()
+        ts = 1_700_000_000_000
+        # Two closed bars + one forming bar. First closed bar touches entry,
+        # second reaches TP2 without touching shadow SL.
+        state.bars_1h = [
+            (ts, 100.0, 100.4, 99.8, 100.1, 1.0),
+            (ts + 3_600_000, 100.1, 103.0, 100.0, 102.5, 1.0),
+            (ts + 7_200_000, 102.5, 102.6, 102.4, 102.5, 1.0),
+        ]
+        r = SetupResult(
+            setup_type="BREAKOUT_RETEST", side="LONG", score=65,
+            entry_low=99.5, entry_high=100.5, stop_loss=99.25,
+            tp1=101.0, tp2=102.0, rr_tp1=1.0, rr_tp2=2.0,
+            invalidation="test", setup_ts=ts, setup_tf="1h",
+            score_components={"test": 65},
+        )
+        sh = BRShadowCandidate(
+            result=r, breakout_ts_ms=ts - 86_400_000, retest_ts_ms=ts,
+            retest_tf="1h", key_level=100.0, original_stop_loss=99.7,
+            shadow_stop_loss=99.25, geometry_gap_abs=0.2,
+            geometry_gap_atr=0.1,
+        )
+        store.upsert_br_shadow("BTCUSDT", state, "BULLISH", sh)
+        assert store.conn.execute("SELECT COUNT(*) FROM br_shadow_setups").fetchone()[0] == 1
+        assert store.conn.execute("SELECT COUNT(*) FROM raw_setups").fetchone()[0] == 0
+        # Re-upsert dedups.
+        store.upsert_br_shadow("BTCUSDT", state, "BULLISH", sh)
+        assert store.conn.execute("SELECT COUNT(*) FROM br_shadow_setups").fetchone()[0] == 1
+        x = store.br_shadow_summary()
+        assert x["total"] == 1
+    finally:
+        store.close()
+
+
 def _selftest_phase_8l41_trace_nonintrusive() -> None:
     """Tracing must not change detector return values on identical state."""
     state = SymbolState()
@@ -6331,5 +6878,6 @@ if __name__ == "__main__":
     _selftest_phase_8l1_quality_hotfix()
     _selftest_phase_8l2_post_confirmation_boundary()
     _selftest_phase_8l4_diagnostic_store()
+    _selftest_phase_8l42_br_shadow_store()
     _selftest_phase_8l41_trace_nonintrusive()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
