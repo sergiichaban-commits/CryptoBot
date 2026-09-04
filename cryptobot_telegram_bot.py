@@ -5922,7 +5922,7 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
     size_mb = st["size_bytes"] / (1024 * 1024)
 
     await tg.send(cid, (
-        f"📊 <b>Phase 8L.4.2 — Persistent Diagnostic DB</b>\n\n"
+        f"📊 <b>Phase 8L.4.2a — Persistent Diagnostic DB</b>\n\n"
         f"<b>Status:</b> ✅ active\n"
         f"<b>DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
         f"<b>Size:</b> {size_mb:.2f} MB\n"
@@ -5997,7 +5997,7 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
         br_lines.append(ret)
 
     await tg.send(cid, (
-        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.2</b>\n\n"
+        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
         "<i>Stage counters continue from 8L.4.1; BR shadow outcomes start prospectively from 8L.4.2.</i>\n\n"
         + "\n".join(br_lines) + "\n\n"
         f"<b>Persistent unique BR setups (all DB history):</b> {br_raw['total']} "
@@ -6030,7 +6030,7 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
             f"EMA50={c.get('ema50_touch_pass',0)}"
         )
 
-    buckets = " · ".join(f"{k}:{v}" for k, v in tp_raw["buckets"].items())
+    buckets = " · ".join(f"{html.escape(str(k))}:{v}" for k, v in tp_raw["buckets"].items())
     regimes = " · ".join(f"{k}:{v}" for k, v in sorted(tp_raw["regimes"].items())) or "—"
     components = " · ".join(
         f"{x['name']} {x['n']}/{tp_raw['total']} ({x['rate']:.0f}%)"
@@ -6040,7 +6040,7 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
     passed = tp_raw["score_passed"]
 
     tp_text = (
-        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2</b>\n\n"
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
         + "\n".join(tp_lines) + "\n\n"
         f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
         f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · "
@@ -6097,7 +6097,7 @@ async def _cmd_tpdiag(app: web.Application, cid: int) -> None:
             f"  touches: EMA20={c.get('ema20_touch_pass',0)} "
             f"EMA50={c.get('ema50_touch_pass',0)}"
         )
-    buckets = " · ".join(f"{k}:{v}" for k, v in tp_raw["buckets"].items())
+    buckets = " · ".join(f"{html.escape(str(k))}:{v}" for k, v in tp_raw["buckets"].items())
     regimes = " · ".join(f"{k}:{v}" for k, v in sorted(tp_raw["regimes"].items())) or "—"
     components = " · ".join(
         f"{x['name']} {x['n']}/{tp_raw['total']} ({x['rate']:.0f}%)"
@@ -6106,7 +6106,7 @@ async def _cmd_tpdiag(app: web.Application, cid: int) -> None:
     outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
     passed = tp_raw["score_passed"]
     await tg.send(cid, (
-        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2</b>\n\n"
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
         + "\n".join(tp_lines) + "\n\n"
         f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
         f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · signals {tp_raw['signals']}\n"
@@ -6137,7 +6137,7 @@ async def _cmd_brshadow(app: web.Application, cid: int) -> None:
     statuses = " · ".join(f"{k}:{v}" for k, v in sorted(x["statuses"].items())) or "—"
     outcomes = " · ".join(f"{k}:{v}" for k, v in sorted(x["outcomes"].items())) or "—"
     await tg.send(cid, (
-        "🫥 <b>BR Shadow Outcome Tracker — Phase 8L.4.2</b>\n\n"
+        "🫥 <b>BR Shadow Outcome Tracker — Phase 8L.4.2a</b>\n\n"
         f"<b>Unique geometry-fail shadows:</b> {x['total']}\n"
         f"<b>By side:</b> {sides}\n"
         f"<b>Avg raw score:</b> {x['avg_score']:.1f}\n"
@@ -6552,7 +6552,7 @@ async def on_startup(app: web.Application) -> None:
         try:
             app["diag_store"] = DiagnosticStore(DIAGNOSTICS_DB_PATH)
             logger.info(
-                f"Phase 8L.4.2 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
+                f"Phase 8L.4.2a Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
                 f"outcome_days={DIAGNOSTICS_OUTCOME_DAYS}"
             )
         except Exception as exc:
