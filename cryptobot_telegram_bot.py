@@ -26,7 +26,7 @@ Phase 8L implemented: Signal-Eligible Watchlist · pending setups must pass RR +
 Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · quality gates
 Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
 Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
-Phase 8L.4 Diagnostic: persistent SQLite raw-setup/score/outcome statistics (no trading-rule changes)
+Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + BR/TP internal-stage telemetry (no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -1248,7 +1248,7 @@ class CandidateDebug:
 # === 5B. PHASE 8L.4 PERSISTENT DIAGNOSTICS (SQLite) ===
 # =============================================================================
 
-_DIAG_SCHEMA_VERSION = "1"
+_DIAG_SCHEMA_VERSION = "2"
 _DIAG_DETECTOR_ABBR = {
     "BREAKOUT_RETEST": "BR",
     "TREND_PULLBACK": "TP",
@@ -1259,6 +1259,38 @@ _DIAG_DETECTOR_ABBR = {
 def diagnostic_setup_key(symbol: str, result: SetupResult) -> str:
     """Stable dedup key: one row per detector/side/confirmation timestamp."""
     return f"{symbol}|{result.setup_type}|{result.side}|{int(result.setup_ts)}"
+
+
+@dataclass
+class DetectorStageTrace:
+    """
+    Diagnostics-only trace of the *actual detector execution path*.
+
+    counters keys are ``SIDE|stage`` (e.g. ``LONG|broken_swing``).  The trace
+    is populated during the same detector call that produces the trading
+    SetupResult, so no detector is executed twice and signal behaviour is not
+    changed.  ``terminal`` stores exactly one terminal reason per side/call.
+    """
+    detector: str
+    counters: Dict[str, int] = field(default_factory=dict)
+    terminal: Dict[str, str] = field(default_factory=dict)
+    progress: Dict[str, int] = field(default_factory=dict)
+
+    def bump(self, side: str, stage: str, amount: int = 1) -> None:
+        key = f"{side}|{stage}"
+        self.counters[key] = self.counters.get(key, 0) + int(amount)
+
+    def reach(self, side: str, stage: str, rank: int, amount: int = 1) -> None:
+        self.bump(side, stage, amount)
+        self.progress[side] = max(self.progress.get(side, 0), int(rank))
+
+    def finish(self, side: str, reason: str) -> None:
+        # One terminal bucket per side detector call.  Repeated calls to finish
+        # within the same trace are ignored so aggregate terminal counts remain
+        # interpretable as detector-side invocations.
+        if side not in self.terminal:
+            self.terminal[side] = reason
+            self.bump(side, f"terminal_{reason}")
 
 
 class DiagnosticStore:
@@ -1366,6 +1398,18 @@ class DiagnosticStore:
                     ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS detector_stage_counters (
+                symbol TEXT NOT NULL,
+                detector TEXT NOT NULL,
+                side TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                value INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (symbol, detector, side, stage)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_detector_stage_detector_side
+                ON detector_stage_counters(detector, side, stage);
+
             CREATE INDEX IF NOT EXISTS idx_raw_setups_detector_score
                 ON raw_setups(setup_type, raw_score_first);
             CREATE INDEX IF NOT EXISTS idx_raw_setups_outcome
@@ -1381,7 +1425,7 @@ class DiagnosticStore:
             (_DIAG_SCHEMA_VERSION,),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4')"
+            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4.1')"
         )
         self.conn.commit()
 
@@ -1416,6 +1460,115 @@ class DiagnosticStore:
                 else:
                     self._bump(f"score_fail_{abbr}")
         self.conn.commit()
+
+    def record_stage_traces(
+        self, symbol: str, traces: List[DetectorStageTrace]
+    ) -> None:
+        """Persist BR/TP detector-stage counters without affecting trading."""
+        for trace in traces:
+            for key, amount in trace.counters.items():
+                try:
+                    side, stage = key.split("|", 1)
+                except ValueError:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO detector_stage_counters(symbol,detector,side,stage,value)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(symbol,detector,side,stage)
+                    DO UPDATE SET value=value+excluded.value
+                    """,
+                    (symbol, trace.detector, side, stage, int(amount)),
+                )
+        self.conn.commit()
+
+    def detector_stage_summary(self, detector: str) -> Dict[str, Dict[str, int]]:
+        rows = self.conn.execute(
+            """
+            SELECT side,stage,SUM(value) AS n
+            FROM detector_stage_counters
+            WHERE detector=?
+            GROUP BY side,stage
+            """,
+            (detector,),
+        ).fetchall()
+        out: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            out.setdefault(row["side"], {})[row["stage"]] = int(row["n"] or 0)
+        return out
+
+    def detector_raw_detail(self, setup_type: str) -> Dict[str, Any]:
+        """Persistent unique-setup quality detail for /brtp."""
+        rows = self.conn.execute(
+            """SELECT raw_score_first,regime_first,score_passed_first,final_outcome,
+                      signal_emitted
+               FROM raw_setups WHERE setup_type=?""",
+            (setup_type,),
+        ).fetchall()
+        total = len(rows)
+        scores = [int(r["raw_score_first"]) for r in rows]
+        buckets = {"<45": 0, "45-54": 0, "55-64": 0, "65-74": 0, "75-84": 0, "85+": 0}
+        regimes: Dict[str, int] = {}
+        outcomes: Dict[str, int] = {}
+        pass_outcomes: Dict[str, Dict[str, int]] = {"pass": {}, "fail": {}}
+        score_passed = 0
+        signals = 0
+        for r in rows:
+            score = int(r["raw_score_first"])
+            if score < 45:
+                buckets["<45"] += 1
+            elif score < 55:
+                buckets["45-54"] += 1
+            elif score < 65:
+                buckets["55-64"] += 1
+            elif score < 75:
+                buckets["65-74"] += 1
+            elif score < 85:
+                buckets["75-84"] += 1
+            else:
+                buckets["85+"] += 1
+            regime = r["regime_first"] or "UNKNOWN"
+            regimes[regime] = regimes.get(regime, 0) + 1
+            passed = bool(r["score_passed_first"])
+            score_passed += int(passed)
+            signals += int(bool(r["signal_emitted"]))
+            outcome = r["final_outcome"]
+            if outcome:
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                grp = "pass" if passed else "fail"
+                pass_outcomes[grp][outcome] = pass_outcomes[grp].get(outcome, 0) + 1
+
+        component_rows = self.conn.execute(
+            """
+            SELECT c.component,COUNT(*) AS n,SUM(c.points) AS pts
+            FROM setup_score_components c
+            JOIN raw_setups r ON r.setup_key=c.setup_key
+            WHERE r.setup_type=?
+            GROUP BY c.component
+            ORDER BY n DESC,c.component ASC
+            """,
+            (setup_type,),
+        ).fetchall()
+        components = [
+            {
+                "name": r["component"],
+                "n": int(r["n"] or 0),
+                "rate": (int(r["n"] or 0) / total * 100.0) if total else 0.0,
+                "points": int(r["pts"] or 0),
+            }
+            for r in component_rows
+        ]
+        return {
+            "total": total,
+            "avg_score": (sum(scores) / total) if total else 0.0,
+            "buckets": buckets,
+            "regimes": regimes,
+            "score_passed": score_passed,
+            "signals": signals,
+            "outcomes": outcomes,
+            "pass_outcomes": pass_outcomes,
+            "components": components,
+        }
 
     def upsert_raw_setup(
         self,
@@ -1856,6 +2009,7 @@ def _find_retest(
     atr: float,
     closed_4h: List[Bar],
     closed_1h: List[Bar],
+    trace: Optional[DetectorStageTrace] = None,
 ) -> Optional[Tuple[Bar, str]]:
     """
     Search for the first valid retest candle on 4H (preferred) then 1H.
@@ -1886,12 +2040,23 @@ def _find_retest(
                 continue
             if ts >= deadline_ts:
                 break        # bars are chronological; no point scanning further
+            if trace is not None:
+                trace.bump(side, f"retest_window_bar_{tf_key}")
             if side == "LONG":
-                if bar[B_LOW] <= key_level + tolerance and bar[B_CLOSE] > key_level:
-                    return (bar, tf_key)
+                touch = bar[B_LOW] <= key_level + tolerance
+                close_ok = bar[B_CLOSE] > key_level
             else:            # SHORT
-                if bar[B_HIGH] >= key_level - tolerance and bar[B_CLOSE] < key_level:
-                    return (bar, tf_key)
+                touch = bar[B_HIGH] >= key_level - tolerance
+                close_ok = bar[B_CLOSE] < key_level
+            if trace is not None:
+                if touch:
+                    trace.bump(side, f"retest_touch_{tf_key}")
+                if close_ok:
+                    trace.bump(side, f"retest_close_ok_{tf_key}")
+            if touch and close_ok:
+                if trace is not None:
+                    trace.bump(side, f"retest_valid_{tf_key}")
+                return (bar, tf_key)
     return None
 
 
@@ -1974,6 +2139,7 @@ def _scan_breakout_side(
     vol_sma: float,
     vol_sma_4h: float,
     vol_sma_1h: float,
+    trace: Optional[DetectorStageTrace] = None,
 ) -> Optional[SetupResult]:
     """
     Scan closed 1D bars for the most recent valid Breakout + Retest on one side.
@@ -1989,12 +2155,17 @@ def _scan_breakout_side(
 
     Retest search is delegated to _find_retest (4H first, then 1H fallback).
     """
+    if trace is not None:
+        trace.bump(side, "calls")
+
     max_idx   = len(closed_1d) - 1
     min_idx   = SWING_LOOKBACK_1D + SWING_PROMINENCE_1D * 2
     # Only scan breakout bars that are recent enough for a retest to still be in window
     scan_floor = max(min_idx, max_idx - BREAKOUT_RETEST_MAX_BARS_1D)
 
     for bo_idx in range(max_idx, scan_floor - 1, -1):
+        if trace is not None:
+            trace.reach(side, "scan_bar", 1)
         bo_bar   = closed_1d[bo_idx]
         lookback = closed_1d[bo_idx - SWING_LOOKBACK_1D : bo_idx]
 
@@ -2012,9 +2183,14 @@ def _scan_breakout_side(
                 continue
             key_level = min(broken)   # nearest broken support above the close
 
+        if trace is not None:
+            trace.reach(side, "broken_swing", 2)
+
         # ── Breakout candle quality ─────────────────────────────────────────────
         if bo_bar[B_VOLUME] < vol_sma * BREAKOUT_VOL_MIN:
             continue
+        if trace is not None:
+            trace.reach(side, "volume_pass", 3)
         if side == "LONG":
             if not candle_closes_upper_pct(bo_bar, 0.40):
                 continue
@@ -2022,10 +2198,17 @@ def _scan_breakout_side(
             if not candle_closes_lower_pct(bo_bar, 0.40):
                 continue
 
+        if trace is not None:
+            trace.reach(side, "candle_pass", 4)
+
         # ── Retest search ───────────────────────────────────────────────────────
-        found = _find_retest(side, bo_bar[B_TS], key_level, atr, closed_4h, closed_1h)
+        found = _find_retest(
+            side, bo_bar[B_TS], key_level, atr, closed_4h, closed_1h, trace=trace
+        )
         if found is None:
             continue
+        if trace is not None:
+            trace.reach(side, "retest_found", 5)
         retest_bar, retest_tf = found
         prev_retest = _prev_bar(
             closed_4h if retest_tf == "4h" else closed_1h,
@@ -2050,6 +2233,8 @@ def _scan_breakout_side(
             # zone, making the trade structurally invalid.  Skip this candidate
             # and continue scanning for an older breakout bar.
             if stop_loss >= entry_low:
+                if trace is not None:
+                    trace.bump(side, "geometry_fail")
                 continue
             tp1          = entry_mid + TP1_ATR_MULT_BREAKOUT * atr
             tp2          = entry_mid + TP2_ATR_MULT_BREAKOUT * atr
@@ -2064,6 +2249,8 @@ def _scan_breakout_side(
             stop_loss    = retest_bar[B_HIGH] + 0.1 * atr
             # Geometry guard: SL must be above the entry zone.
             if stop_loss <= entry_high:
+                if trace is not None:
+                    trace.bump(side, "geometry_fail")
                 continue
             tp1          = entry_mid - TP1_ATR_MULT_BREAKOUT * atr
             tp2          = entry_mid - TP2_ATR_MULT_BREAKOUT * atr
@@ -2071,6 +2258,11 @@ def _scan_breakout_side(
                 f"Daily close above {key_level:.4f} "
                 f"(broken support reverts to support)"
             )
+
+        if trace is not None:
+            trace.reach(side, "geometry_pass", 6)
+            trace.reach(side, "raw_result", 7)
+            trace.finish(side, "raw_result")
 
         return SetupResult(
             setup_type   = "BREAKOUT_RETEST",
@@ -2093,10 +2285,24 @@ def _scan_breakout_side(
             score_components = score_components,
         )
 
+    if trace is not None:
+        furthest = trace.progress.get(side, 0)
+        reason = {
+            0: "no_scan",
+            1: "no_broken_swing",
+            2: "volume_fail",
+            3: "candle_fail",
+            4: "retest_fail",
+            5: "geometry_fail",
+            6: "no_raw_result",
+        }.get(furthest, "no_raw_result")
+        trace.finish(side, reason)
     return None
 
 
-def detect_breakout_retest(state: SymbolState) -> Optional[SetupResult]:
+def detect_breakout_retest(
+    state: SymbolState, trace: Optional[DetectorStageTrace] = None
+) -> Optional[SetupResult]:
     """
     Detect a Breakout + Retest setup on a single symbol.
 
@@ -2131,6 +2337,8 @@ def detect_breakout_retest(state: SymbolState) -> Optional[SetupResult]:
 
     min_bars = SWING_LOOKBACK_1D + SWING_PROMINENCE_1D * 2 + 2  # +2 small buffer
     if len(closed_1d) < min_bars or atr <= 0.0 or vol_sma <= 0.0:
+        if trace is not None:
+            trace.bump("ALL", "data_not_ready")
         return None
 
     # Pre-compute TF-specific vol SMAs for retest-volume scoring
@@ -2142,27 +2350,32 @@ def detect_breakout_retest(state: SymbolState) -> Optional[SetupResult]:
     _args = (state, closed_1d, closed_4h, closed_1h,
              atr, vol_sma, vol_sma_4h, vol_sma_1h)
 
-    long_result  = _scan_breakout_side("LONG",  *_args)
-    short_result = _scan_breakout_side("SHORT", *_args)
+    long_result  = _scan_breakout_side("LONG",  *_args, trace=trace)
+    short_result = _scan_breakout_side("SHORT", *_args, trace=trace)
 
     # ── Selection: only one side present ─────────────────────────────────────
     if long_result is None:
-        return short_result   # may also be None
-    if short_result is None:
-        return long_result
-
-    # ── Both sides present: choose by regime then score ───────────────────────
-    regime = state.regime
-    if regime == "BULLISH":
-        return long_result
-    if regime == "BEARISH":
-        return short_result
-    # NEUTRAL (or unknown): prefer higher score; tie → None (ambiguous chop)
-    if long_result.score > short_result.score:
-        return long_result
-    if short_result.score > long_result.score:
-        return short_result
-    return None  # equal scores in NEUTRAL — not a clean setup
+        selected = short_result   # may also be None
+    elif short_result is None:
+        selected = long_result
+    else:
+        # ── Both sides present: choose by regime then score ───────────────────
+        regime = state.regime
+        if regime == "BULLISH":
+            selected = long_result
+        elif regime == "BEARISH":
+            selected = short_result
+        elif long_result.score > short_result.score:
+            selected = long_result
+        elif short_result.score > long_result.score:
+            selected = short_result
+        else:
+            selected = None
+            if trace is not None:
+                trace.bump("ALL", "selection_equal_score_tie")
+    if trace is not None:
+        trace.bump("ALL", "selection_returned" if selected is not None else "selection_none")
+    return selected
 
 
 # ─── Private helpers for detect_trend_pullback ───────────────────────────────
@@ -2294,6 +2507,7 @@ def _scan_pullback_side(
     state: "SymbolState",
     closed_1d: List[Bar],
     closed_4h: List[Bar],
+    trace: Optional[DetectorStageTrace] = None,
 ) -> Optional[SetupResult]:
     """
     Scan for a valid Trend Pullback on one side.  Returns SetupResult or None.
@@ -2307,12 +2521,21 @@ def _scan_pullback_side(
       4. EMA touch (EMA20 preferred; EMA50 deeper pullback as fallback)
       5. 4H confirmation  6. SL  7. Geometry guard  8. TP  9. Score
     """
+    if trace is not None:
+        trace.bump(side, "calls")
+
     if side == "LONG":
         if state.trend_1d != "UP":
+            if trace is not None:
+                trace.finish(side, "trend_context_fail")
             return None
     else:
         if state.trend_1d != "DOWN":
+            if trace is not None:
+                trace.finish(side, "trend_context_fail")
             return None
+    if trace is not None:
+        trace.bump(side, "trend_context_pass")
 
     ema20   = state.ema20_1d
     ema50   = state.ema50_1d
@@ -2322,12 +2545,22 @@ def _scan_pullback_side(
 
     # ── Pullback window ──────────────────────────────────────────────────────
     pullback_bars = _find_pullback_window(closed_1d, ema20, atr, side)
+    if trace is not None:
+        trace.bump(side, "pullback_window_nonempty", int(bool(pullback_bars)))
+        if pullback_bars:
+            trace.bump(side, f"pullback_len_{min(len(pullback_bars), 8)}")
     if not (2 <= len(pullback_bars) <= 7):
+        if trace is not None:
+            trace.finish(side, "pullback_duration_fail")
         return None
+    if trace is not None:
+        trace.bump(side, "pullback_duration_pass")
 
     # ── EMA touch: EMA20 preferred, EMA50 as deeper fallback ────────────────
     if _is_ema_touch(pullback_bars, ema20, atr, side):
         pullback_type = "EMA20"
+        if trace is not None:
+            trace.bump(side, "ema20_touch_pass")
         if side == "LONG":
             entry_low  = ema20 - 0.2 * atr
             entry_high = ema20 + 0.3 * atr
@@ -2336,21 +2569,35 @@ def _scan_pullback_side(
             entry_low  = ema20 - 0.3 * atr
     elif _is_ema_touch(pullback_bars, ema50, atr, side):
         pullback_type = "EMA50"
+        if trace is not None:
+            trace.bump(side, "ema50_touch_pass")
         entry_low  = ema50 - 0.25 * atr
         entry_high = ema50 + 0.25 * atr
     else:
+        if trace is not None:
+            trace.finish(side, "ema_touch_fail")
         return None
+    if trace is not None:
+        trace.bump(side, "ema_touch_pass")
 
     entry_mid = (entry_low + entry_high) / 2.0
 
     # ── 4H confirmation ──────────────────────────────────────────────────────
     if not closed_4h:
+        if trace is not None:
+            trace.finish(side, "4h_data_fail")
         return None
     last_4h = closed_4h[-1]
     if side == "LONG"  and last_4h[B_CLOSE] <= state.ema20_4h:
+        if trace is not None:
+            trace.finish(side, "4h_close_confirm_fail")
         return None    # 4H hasn't closed back above EMA20_4H yet
     if side == "SHORT" and last_4h[B_CLOSE] >= state.ema20_4h:
+        if trace is not None:
+            trace.finish(side, "4h_close_confirm_fail")
         return None    # 4H hasn't closed back below EMA20_4H yet
+    if trace is not None:
+        trace.bump(side, "4h_close_confirm_pass")
 
     # Phase 8L.1: "4H confirmation" must be an actual reversal candle, not
     # merely a close on the correct side of EMA20.
@@ -2362,7 +2609,11 @@ def _scan_pullback_side(
             else is_bearish_retest_candle(last_4h, prev_4h)
         )
         if not reversal_ok:
+            if trace is not None:
+                trace.finish(side, "hard_reversal_confirm_fail")
             return None
+        if trace is not None:
+            trace.bump(side, "hard_reversal_confirm_pass")
 
     # The reversal must also carry at least normal 4H volume when enabled.
     if REQUIRE_TP_REVERSAL_VOLUME:
@@ -2371,7 +2622,11 @@ def _scan_pullback_side(
             if len(closed_4h) >= VOL_SMA_PERIOD else 0.0
         )
         if vol_sma_4h <= 0.0 or last_4h[B_VOLUME] < vol_sma_4h * PULLBACK_REVERSAL_VOL_MIN:
+            if trace is not None:
+                trace.finish(side, "hard_reversal_volume_fail")
             return None
+        if trace is not None:
+            trace.bump(side, "hard_reversal_volume_pass")
 
     # ── SL: beyond the pullback extreme ─────────────────────────────────────
     if side == "LONG":
@@ -2383,9 +2638,15 @@ def _scan_pullback_side(
 
     # ── Geometry guard: SL must be outside the entry zone ───────────────────
     if side == "LONG"  and stop_loss >= entry_low:
+        if trace is not None:
+            trace.finish(side, "geometry_fail")
         return None
     if side == "SHORT" and stop_loss <= entry_high:
+        if trace is not None:
+            trace.finish(side, "geometry_fail")
         return None
+    if trace is not None:
+        trace.bump(side, "geometry_pass")
 
     # ── TP (ATR fallback; Phase 4 adds swing-structure targets) ─────────────
     if side == "LONG":
@@ -2407,6 +2668,10 @@ def _scan_pullback_side(
         pullback_type, ema20, ema50, ema200, atr, vol_sma,
         closed_4h,
     )
+
+    if trace is not None:
+        trace.bump(side, "raw_result")
+        trace.finish(side, "raw_result")
 
     return SetupResult(
         setup_type   = "TREND_PULLBACK",
@@ -2430,7 +2695,9 @@ def _scan_pullback_side(
     )
 
 
-def detect_trend_pullback(state: SymbolState) -> Optional[SetupResult]:
+def detect_trend_pullback(
+    state: SymbolState, trace: Optional[DetectorStageTrace] = None
+) -> Optional[SetupResult]:
     """
     Detect a Trend Pullback setup on a single symbol.
 
@@ -2461,27 +2728,35 @@ def detect_trend_pullback(state: SymbolState) -> Optional[SetupResult]:
             or state.ema20_1d   <= 0.0
             or state.ema50_1d   <= 0.0
             or state.vol_sma20_1d <= 0.0):
+        if trace is not None:
+            trace.bump("ALL", "data_not_ready")
         return None
 
     _args = (state, closed_1d, closed_4h)
-    long_result  = _scan_pullback_side("LONG",  *_args)
-    short_result = _scan_pullback_side("SHORT", *_args)
+    long_result  = _scan_pullback_side("LONG",  *_args, trace=trace)
+    short_result = _scan_pullback_side("SHORT", *_args, trace=trace)
 
     if long_result is None:
-        return short_result
-    if short_result is None:
-        return long_result
-
-    regime = state.regime
-    if regime == "BULLISH":
-        return long_result
-    if regime == "BEARISH":
-        return short_result
-    if long_result.score > short_result.score:
-        return long_result
-    if short_result.score > long_result.score:
-        return short_result
-    return None  # equal scores in NEUTRAL — not a clean setup
+        selected = short_result
+    elif short_result is None:
+        selected = long_result
+    else:
+        regime = state.regime
+        if regime == "BULLISH":
+            selected = long_result
+        elif regime == "BEARISH":
+            selected = short_result
+        elif long_result.score > short_result.score:
+            selected = long_result
+        elif short_result.score > long_result.score:
+            selected = short_result
+        else:
+            selected = None
+            if trace is not None:
+                trace.bump("ALL", "selection_equal_score_tie")
+    if trace is not None:
+        trace.bump("ALL", "selection_returned" if selected is not None else "selection_none")
+    return selected
 
 
 # ── Private helpers for detect_liquidity_sweep ───────────────────────────────
@@ -3768,19 +4043,37 @@ def validate_signal_eligible_pending(
 
 # ── Phase 8F helpers ─────────────────────────────────────────────────────────
 
-def collect_raw_setup_candidates(state: SymbolState) -> List[SetupResult]:
+def collect_raw_setup_candidates(
+    state: SymbolState,
+    trace_out: Optional[List[DetectorStageTrace]] = None,
+) -> List[SetupResult]:
     """
-    Phase 8L.4: run all three detectors and return their raw SetupResult outputs
-    BEFORE any score-floor filtering.  This is the diagnostic observation point.
+    Phase 8L.4.1: run all three detectors and return raw SetupResult outputs
+    BEFORE score-floor filtering.  When ``trace_out`` is supplied, BR and TP
+    populate diagnostics-only internal stage traces during these *same* calls.
 
-    Trading behavior is unchanged: collect_setup_candidates() below applies the
-    same regime-specific floor as Phase 8L.3.
+    No detector is called twice and the returned SetupResult objects are the
+    exact objects used by the trading pipeline.
     """
     raw: List[SetupResult] = []
-    for detector in (detect_breakout_retest, detect_trend_pullback, detect_liquidity_sweep):
-        r = detector(state)
-        if r is not None:
-            raw.append(r)
+
+    br_trace = DetectorStageTrace("BR") if trace_out is not None else None
+    br = detect_breakout_retest(state, trace=br_trace)
+    if br_trace is not None:
+        trace_out.append(br_trace)
+    if br is not None:
+        raw.append(br)
+
+    tp_trace = DetectorStageTrace("TP") if trace_out is not None else None
+    tp = detect_trend_pullback(state, trace=tp_trace)
+    if tp_trace is not None:
+        trace_out.append(tp_trace)
+    if tp is not None:
+        raw.append(tp)
+
+    ls = detect_liquidity_sweep(state)
+    if ls is not None:
+        raw.append(ls)
     return raw
 
 
@@ -3960,11 +4253,13 @@ async def scan_symbol(
 
         # ── Phase 8L.4: collect RAW detector outputs before score filtering ───
         floor = MIN_SCORE_CHOP if state.regime == "NEUTRAL" else MIN_SCORE_NORMAL
-        raw_candidates = collect_raw_setup_candidates(state)
+        stage_traces: List[DetectorStageTrace] = []
+        raw_candidates = collect_raw_setup_candidates(state, trace_out=stage_traces)
         diag_keys: Dict[str, str] = {}
         if store is not None:
             try:
                 store.record_detector_scan(raw_candidates, floor)
+                store.record_stage_traces(sym, stage_traces)
                 for raw in raw_candidates:
                     final_for_stats = calc_swing_tpsl(raw, state)
                     key = store.upsert_raw_setup(
@@ -4847,6 +5142,8 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_diag(app, cid)
                 elif text in ("/statsdb", "/rawstats"):
                     await _cmd_statsdb(app, cid)
+                elif text in ("/brtp", "/detstats"):
+                    await _cmd_brtp(app, cid)
                 elif text in ("/watchlist", "/pending"):
                     await _cmd_watchlist(app, cid)
                 elif text in ("/candidates", "/dead"):
@@ -4886,7 +5183,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4 persistent raw diagnostics"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.1 persistent raw + BR/TP deep diagnostics"
     ))
 
 
@@ -5217,7 +5514,7 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
     size_mb = st["size_bytes"] / (1024 * 1024)
 
     await tg.send(cid, (
-        f"📊 <b>Phase 8L.4 — Persistent Diagnostic DB</b>\n\n"
+        f"📊 <b>Phase 8L.4.1 — Persistent Diagnostic DB</b>\n\n"
         f"<b>Status:</b> ✅ active\n"
         f"<b>DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
         f"<b>Size:</b> {size_mb:.2f} MB\n"
@@ -5230,7 +5527,119 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
         f"<b>Outcome tracker:</b> {status_str}\n"
         f"<b>Final outcomes:</b> {outcome_str}\n\n"
         f"<i>Raw setups are recorded before the score floor. Outcomes are "
-        f"hypothetical and do not change signal generation.</i>"
+        f"hypothetical and do not change signal generation.</i>\n"
+        f"Deep BR/TP funnel: /brtp"
+    ))
+
+
+def _fmt_stage_line(label: str, c: Dict[str, int], stages: List[Tuple[str, str]]) -> str:
+    vals = [f"{name}={c.get(key, 0)}" for key, name in stages]
+    return f"{label}: " + " · ".join(vals)
+
+
+def _fmt_terminal_line(c: Dict[str, int], order: List[Tuple[str, str]]) -> str:
+    vals = [
+        f"{name}={c.get('terminal_' + key, 0)}"
+        for key, name in order if c.get('terminal_' + key, 0)
+    ]
+    return " · ".join(vals) if vals else "—"
+
+
+async def _cmd_brtp(app: web.Application, cid: int) -> None:
+    """Deep persistent BR/TP funnel diagnostics (Phase 8L.4.1)."""
+    tg: Tg = app["tg"]
+    store = _diag_store(app)
+    if store is None:
+        await tg.send(cid, "⚠️ <b>Diagnostic DB unavailable.</b>")
+        return
+    try:
+        br = store.detector_stage_summary("BR")
+        tp = store.detector_stage_summary("TP")
+        br_raw = store.detector_raw_detail("BREAKOUT_RETEST")
+        tp_raw = store.detector_raw_detail("TREND_PULLBACK")
+    except Exception as exc:
+        _diag_warn(f"/brtp failed: {type(exc).__name__}: {exc}")
+        await tg.send(cid, "⚠️ <b>Could not read BR/TP deep diagnostics.</b>")
+        return
+
+    br_stages = [
+        ("calls", "calls"), ("broken_swing", "swing"),
+        ("volume_pass", "vol"), ("candle_pass", "candle"),
+        ("retest_found", "retest"), ("geometry_pass", "geom"),
+        ("raw_result", "raw"),
+    ]
+    br_term = [
+        ("no_broken_swing", "no_swing"), ("volume_fail", "vol_fail"),
+        ("candle_fail", "candle_fail"), ("retest_fail", "retest_fail"),
+        ("geometry_fail", "geom_fail"), ("raw_result", "raw"),
+    ]
+    br_lines = []
+    for side in ("LONG", "SHORT"):
+        c = br.get(side, {})
+        br_lines.append(_fmt_stage_line(side, c, br_stages))
+        br_lines.append("  terminal: " + _fmt_terminal_line(c, br_term))
+        ret = (
+            f"  retest detail: 4H window={c.get('retest_window_bar_4h',0)} "
+            f"touch={c.get('retest_touch_4h',0)} valid={c.get('retest_valid_4h',0)} | "
+            f"1H window={c.get('retest_window_bar_1h',0)} "
+            f"touch={c.get('retest_touch_1h',0)} valid={c.get('retest_valid_1h',0)}"
+        )
+        br_lines.append(ret)
+
+    await tg.send(cid, (
+        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.1</b>\n\n"
+        "<i>Stage counters start from the 8L.4.1 deployment; old raw DB rows are preserved.</i>\n\n"
+        + "\n".join(br_lines) + "\n\n"
+        f"<b>Persistent unique BR setups (all DB history):</b> {br_raw['total']} "
+        f"· avg score {br_raw['avg_score']:.1f} · signals {br_raw['signals']}"
+    ))
+
+    tp_stages = [
+        ("calls", "calls"), ("trend_context_pass", "trend"),
+        ("pullback_duration_pass", "dur2-7"), ("ema_touch_pass", "touch"),
+        ("4h_close_confirm_pass", "4Hclose"), ("geometry_pass", "geom"),
+        ("raw_result", "raw"),
+    ]
+    tp_term = [
+        ("trend_context_fail", "trend_fail"),
+        ("pullback_duration_fail", "duration_fail"),
+        ("ema_touch_fail", "touch_fail"),
+        ("4h_close_confirm_fail", "4Hclose_fail"),
+        ("hard_reversal_confirm_fail", "rev_fail"),
+        ("hard_reversal_volume_fail", "vol_fail"),
+        ("geometry_fail", "geom_fail"), ("raw_result", "raw"),
+    ]
+    tp_lines = []
+    for side in ("LONG", "SHORT"):
+        c = tp.get(side, {})
+        tp_lines.append(_fmt_stage_line(side, c, tp_stages))
+        tp_lines.append("  terminal: " + _fmt_terminal_line(c, tp_term))
+        tp_lines.append(
+            f"  touches: EMA20={c.get('ema20_touch_pass',0)} "
+            f"EMA50={c.get('ema50_touch_pass',0)}"
+        )
+
+    buckets = " · ".join(f"{k}:{v}" for k, v in tp_raw["buckets"].items())
+    regimes = " · ".join(f"{k}:{v}" for k, v in sorted(tp_raw["regimes"].items())) or "—"
+    components = " · ".join(
+        f"{x['name']} {x['n']}/{tp_raw['total']} ({x['rate']:.0f}%)"
+        for x in tp_raw["components"][:7]
+    ) or "—"
+    outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
+    passed = tp_raw["score_passed"]
+
+    await tg.send(cid, (
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.1</b>\n\n"
+        + "\n".join(tp_lines) + "\n\n"
+        f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
+        f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · "
+        f"signals {tp_raw['signals']}\n"
+        f"<b>Score buckets:</b> {buckets}\n"
+        f"<b>First regime:</b> {regimes}\n"
+        f"<b>Awarded components:</b> {components}\n"
+        f"<b>Final outcomes so far:</b> {outcomes}\n\n"
+        "<i>Raw TP statistics include setups rejected by the score floor. "
+        "They remain hypothetical and do not change signal generation.</i>"
     ))
 
 
@@ -5560,6 +5969,16 @@ async def keepalive_loop(app: web.Application) -> None:
                     f"done={st['statuses'].get('DONE',0)} | "
                     f"outcomes={st['outcomes']}"
                 )
+                brs = store.detector_stage_summary("BR")
+                tps = store.detector_stage_summary("TP")
+                logger.info(
+                    "DeepDiag | "
+                    f"BR raw-sides={brs.get('LONG',{}).get('raw_result',0)+brs.get('SHORT',{}).get('raw_result',0)} "
+                    f"retest_fail={brs.get('LONG',{}).get('terminal_retest_fail',0)+brs.get('SHORT',{}).get('terminal_retest_fail',0)} | "
+                    f"TP raw-sides={tps.get('LONG',{}).get('raw_result',0)+tps.get('SHORT',{}).get('raw_result',0)} "
+                    f"duration_fail={tps.get('LONG',{}).get('terminal_pullback_duration_fail',0)+tps.get('SHORT',{}).get('terminal_pullback_duration_fail',0)} "
+                    f"4h_fail={tps.get('LONG',{}).get('terminal_4h_close_confirm_fail',0)+tps.get('SHORT',{}).get('terminal_4h_close_confirm_fail',0)}"
+                )
             except Exception as exc:
                 _diag_warn(f"keepalive summary failed: {type(exc).__name__}: {exc}")
         # Reset last-cycle counters for the next keepalive window
@@ -5601,7 +6020,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
-        "Phase 8L.4 persistent raw diagnostics)"
+        "Phase 8L.4.1 persistent raw + BR/TP deep diagnostics)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -5624,12 +6043,12 @@ async def on_startup(app: web.Application) -> None:
         try:
             app["diag_store"] = DiagnosticStore(DIAGNOSTICS_DB_PATH)
             logger.info(
-                f"Phase 8L.4 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
+                f"Phase 8L.4.1 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
                 f"outcome_days={DIAGNOSTICS_OUTCOME_DAYS}"
             )
         except Exception as exc:
             logger.warning(
-                f"Phase 8L.4 Diagnostic DB disabled after open failure: "
+                f"Phase 8L.4.1 Diagnostic DB disabled after open failure: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -5707,10 +6126,10 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
                 f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
                 f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n"
-                f"<b>Phase 8L.4</b> persistent raw setup/score/outcome diagnostics: "
+                f"<b>Phase 8L.4.1</b> persistent raw + BR/TP deep diagnostics: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /statsdb /watchlist /candidates"
+                f"/close SYMBOL /config /diag /statsdb /brtp /watchlist /candidates"
     ))
 
 
@@ -5848,6 +6267,13 @@ def _selftest_phase_8l4_diagnostic_store() -> None:
             score_components={"factor_a": 20, "factor_b": 25},
         )
         store.record_detector_scan([raw], 55)
+        trace = DetectorStageTrace("BR")
+        trace.bump("LONG", "calls")
+        trace.bump("LONG", "broken_swing", 2)
+        trace.finish("LONG", "retest_fail")
+        store.record_stage_traces("BTCUSDT", [trace])
+        assert store.detector_stage_summary("BR")["LONG"]["calls"] == 1
+        assert store.detector_stage_summary("BR")["LONG"]["terminal_retest_fail"] == 1
         key = store.upsert_raw_setup("BTCUSDT", state, "BULLISH", raw, raw, 55)
         # Same setup must update, not duplicate.
         store.upsert_raw_setup("BTCUSDT", state, "BULLISH", raw, raw, 55)
@@ -5876,6 +6302,19 @@ def _selftest_phase_8l4_diagnostic_store() -> None:
         store.close()
 
 
+def _selftest_phase_8l41_trace_nonintrusive() -> None:
+    """Tracing must not change detector return values on identical state."""
+    state = SymbolState()
+    br_plain = detect_breakout_retest(state)
+    br_trace = DetectorStageTrace("BR")
+    br_traced = detect_breakout_retest(state, trace=br_trace)
+    assert br_plain == br_traced == None
+    tp_plain = detect_trend_pullback(state)
+    tp_trace = DetectorStageTrace("TP")
+    tp_traced = detect_trend_pullback(state, trace=tp_trace)
+    assert tp_plain == tp_traced == None
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -5892,4 +6331,5 @@ if __name__ == "__main__":
     _selftest_phase_8l1_quality_hotfix()
     _selftest_phase_8l2_post_confirmation_boundary()
     _selftest_phase_8l4_diagnostic_store()
+    _selftest_phase_8l41_trace_nonintrusive()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
