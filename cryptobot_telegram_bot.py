@@ -27,7 +27,7 @@ Phase 8L.1 hotfix: temporal-safe LS · lifecycle ordering · post-SL lock · qua
 Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · Telegram polling visibility
 Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
 Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + BR/TP internal-stage telemetry (no trading-rule changes)
-Phase 8L.4.2 Diagnostic: prospective BR geometry-fail shadow outcome tracker + reliable TP diagnostics (no trading-rule changes)
+Phase 8L.4.3 Diagnostic: TP pullback-length distribution + score-bucket outcome analyzer (no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -1510,7 +1510,7 @@ class DiagnosticStore:
             (_DIAG_SCHEMA_VERSION,),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4.2')"
+            "INSERT OR REPLACE INTO diag_meta(key,value) VALUES('phase','8L.4.3')"
         )
         self.conn.commit()
 
@@ -1586,13 +1586,17 @@ class DiagnosticStore:
         """Persistent unique-setup quality detail for /brtp."""
         rows = self.conn.execute(
             """SELECT raw_score_first,regime_first,score_passed_first,final_outcome,
-                      signal_emitted
+                      signal_emitted,observation_status
                FROM raw_setups WHERE setup_type=?""",
             (setup_type,),
         ).fetchall()
         total = len(rows)
         scores = [int(r["raw_score_first"]) for r in rows]
-        buckets = {"<45": 0, "45-54": 0, "55-64": 0, "65-74": 0, "75-84": 0, "85+": 0}
+        bucket_order = ["<45", "45-54", "55-64", "65-74", "75-84", "85+"]
+        buckets = {k: 0 for k in bucket_order}
+        bucket_stats: Dict[str, Dict[str, Any]] = {
+            k: {"total": 0, "statuses": {}, "outcomes": {}} for k in bucket_order
+        }
         regimes: Dict[str, int] = {}
         outcomes: Dict[str, int] = {}
         pass_outcomes: Dict[str, Dict[str, int]] = {"pass": {}, "fail": {}}
@@ -1601,17 +1605,22 @@ class DiagnosticStore:
         for r in rows:
             score = int(r["raw_score_first"])
             if score < 45:
-                buckets["<45"] += 1
+                bucket = "<45"
             elif score < 55:
-                buckets["45-54"] += 1
+                bucket = "45-54"
             elif score < 65:
-                buckets["55-64"] += 1
+                bucket = "55-64"
             elif score < 75:
-                buckets["65-74"] += 1
+                bucket = "65-74"
             elif score < 85:
-                buckets["75-84"] += 1
+                bucket = "75-84"
             else:
-                buckets["85+"] += 1
+                bucket = "85+"
+            buckets[bucket] += 1
+            bucket_stats[bucket]["total"] += 1
+            status = r["observation_status"] or "UNKNOWN"
+            bs = bucket_stats[bucket]["statuses"]
+            bs[status] = bs.get(status, 0) + 1
             regime = r["regime_first"] or "UNKNOWN"
             regimes[regime] = regimes.get(regime, 0) + 1
             passed = bool(r["score_passed_first"])
@@ -1620,6 +1629,8 @@ class DiagnosticStore:
             outcome = r["final_outcome"]
             if outcome:
                 outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                bo = bucket_stats[bucket]["outcomes"]
+                bo[outcome] = bo.get(outcome, 0) + 1
                 grp = "pass" if passed else "fail"
                 pass_outcomes[grp][outcome] = pass_outcomes[grp].get(outcome, 0) + 1
 
@@ -1647,6 +1658,7 @@ class DiagnosticStore:
             "total": total,
             "avg_score": (sum(scores) / total) if total else 0.0,
             "buckets": buckets,
+            "bucket_stats": bucket_stats,
             "regimes": regimes,
             "score_passed": score_passed,
             "signals": signals,
@@ -5590,7 +5602,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.2 persistent raw + BR/TP deep + BR shadow diagnostics"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer"
     ))
 
 
@@ -5869,7 +5881,7 @@ async def _cmd_watchlist(app: web.Application, cid: int) -> None:
 
 
 async def _cmd_statsdb(app: web.Application, cid: int) -> None:
-    """Phase 8L.4.2 persistent raw-setup + BR-shadow statistics summary."""
+    """Phase 8L.4.3 persistent raw-setup + TP-statistics + BR-shadow summary."""
     tg: Tg = app["tg"]
     store = _diag_store(app)
     if not DIAGNOSTICS_DB_ENABLED:
@@ -5922,7 +5934,7 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
     size_mb = st["size_bytes"] / (1024 * 1024)
 
     await tg.send(cid, (
-        f"📊 <b>Phase 8L.4.2a — Persistent Diagnostic DB</b>\n\n"
+        f"📊 <b>Phase 8L.4.3 — Persistent Diagnostic DB</b>\n\n"
         f"<b>Status:</b> ✅ active\n"
         f"<b>DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
         f"<b>Size:</b> {size_mb:.2f} MB\n"
@@ -5955,8 +5967,39 @@ def _fmt_terminal_line(c: Dict[str, int], order: List[Tuple[str, str]]) -> str:
     return " · ".join(vals) if vals else "—"
 
 
+def _tp_pullback_length_line(side: str, c: Dict[str, int]) -> str:
+    """Distribution of TP pullback-window lengths among trend-context passes."""
+    trend_pass = int(c.get("trend_context_pass", 0))
+    lens = {i: int(c.get(f"pullback_len_{i}", 0)) for i in range(1, 8)}
+    eight_plus = int(c.get("pullback_len_8", 0))
+    zero = max(0, trend_pass - sum(lens.values()) - eight_plus)
+    if trend_pass <= 0:
+        return f"{side}: no trend-context passes"
+    parts = [f"0D={zero}"] + [f"{i}D={lens[i]}" for i in range(1, 8)] + [f"8+D={eight_plus}"]
+    return f"{side}: " + " · ".join(parts)
+
+
+def _tp_score_bucket_outcome_lines(tp_raw: Dict[str, Any]) -> List[str]:
+    """Compact outcome/status matrix for persistent unique TP setups by raw-score bucket."""
+    lines: List[str] = []
+    for label, x in tp_raw.get("bucket_stats", {}).items():
+        total = int(x.get("total", 0))
+        if total <= 0:
+            continue
+        st = x.get("statuses", {})
+        out = x.get("outcomes", {})
+        waiting = int(st.get("WAITING_ENTRY", 0))
+        active = int(st.get("ACTIVE", 0))
+        done = int(st.get("DONE", 0))
+        outcome_text = ", ".join(f"{k}={v}" for k, v in sorted(out.items())) or "—"
+        lines.append(
+            f"{html.escape(str(label))}: n={total} · W/A/D={waiting}/{active}/{done} · {html.escape(outcome_text)}"
+        )
+    return lines or ["—"]
+
+
 async def _cmd_brtp(app: web.Application, cid: int) -> None:
-    """Deep persistent BR/TP funnel diagnostics (Phase 8L.4.2)."""
+    """Deep persistent BR/TP funnel + TP statistics diagnostics (Phase 8L.4.3)."""
     tg: Tg = app["tg"]
     store = _diag_store(app)
     if store is None:
@@ -5997,7 +6040,7 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
         br_lines.append(ret)
 
     await tg.send(cid, (
-        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
+        "🔎 <b>BR Deep Diagnostic — Phase 8L.4.3</b>\n\n"
         "<i>Stage counters continue from 8L.4.1; BR shadow outcomes start prospectively from 8L.4.2.</i>\n\n"
         + "\n".join(br_lines) + "\n\n"
         f"<b>Persistent unique BR setups (all DB history):</b> {br_raw['total']} "
@@ -6038,17 +6081,26 @@ async def _cmd_brtp(app: web.Application, cid: int) -> None:
     ) or "—"
     outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
     passed = tp_raw["score_passed"]
+    duration_lines = [
+        _tp_pullback_length_line("LONG", tp.get("LONG", {})),
+        _tp_pullback_length_line("SHORT", tp.get("SHORT", {})),
+    ]
+    bucket_outcome_lines = _tp_score_bucket_outcome_lines(tp_raw)
 
     tp_text = (
-        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.3</b>\n\n"
         + "\n".join(tp_lines) + "\n\n"
+        + "<b>Pullback length among trend-context passes:</b>\n"
+        + "\n".join(duration_lines) + "\n\n"
         f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
         f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · "
         f"signals {tp_raw['signals']}\n"
         f"<b>Score buckets:</b> {buckets}\n"
         f"<b>First regime:</b> {regimes}\n"
         f"<b>Awarded components:</b> {components}\n"
-        f"<b>Final outcomes so far:</b> {outcomes}\n\n"
+        f"<b>Final outcomes so far:</b> {outcomes}\n"
+        + "<b>Outcomes by first-seen score bucket:</b>\n"
+        + "\n".join(bucket_outcome_lines) + "\n\n"
         "<i>Raw TP statistics include setups rejected by the score floor. "
         "They remain hypothetical and do not change signal generation.</i>"
     )
@@ -6105,15 +6157,24 @@ async def _cmd_tpdiag(app: web.Application, cid: int) -> None:
     ) or "—"
     outcomes = " · ".join(f"{k}:{v}" for k, v in tp_raw["outcomes"].items()) or "—"
     passed = tp_raw["score_passed"]
+    duration_lines = [
+        _tp_pullback_length_line("LONG", tp.get("LONG", {})),
+        _tp_pullback_length_line("SHORT", tp.get("SHORT", {})),
+    ]
+    bucket_outcome_lines = _tp_score_bucket_outcome_lines(tp_raw)
     await tg.send(cid, (
-        "📐 <b>TP Deep Diagnostic — Phase 8L.4.2a</b>\n\n"
+        "📐 <b>TP Deep Diagnostic — Phase 8L.4.3</b>\n\n"
         + "\n".join(tp_lines) + "\n\n"
+        + "<b>Pullback length among trend-context passes:</b>\n"
+        + "\n".join(duration_lines) + "\n\n"
         f"<b>Unique TP setups:</b> {tp_raw['total']} · avg score {tp_raw['avg_score']:.1f}\n"
         f"<b>Passed first-seen floor:</b> {passed}/{tp_raw['total']} · signals {tp_raw['signals']}\n"
         f"<b>Score buckets:</b> {buckets}\n"
         f"<b>First regime:</b> {regimes}\n"
         f"<b>Awarded components:</b> {components}\n"
-        f"<b>Final outcomes so far:</b> {outcomes}\n\n"
+        f"<b>Final outcomes so far:</b> {outcomes}\n"
+        + "<b>Outcomes by first-seen score bucket:</b>\n"
+        + "\n".join(bucket_outcome_lines) + "\n\n"
         "<i>Raw TP statistics include setups rejected by the score floor. "
         "They remain hypothetical and do not change signal generation.</i>"
     ))
@@ -6137,7 +6198,7 @@ async def _cmd_brshadow(app: web.Application, cid: int) -> None:
     statuses = " · ".join(f"{k}:{v}" for k, v in sorted(x["statuses"].items())) or "—"
     outcomes = " · ".join(f"{k}:{v}" for k, v in sorted(x["outcomes"].items())) or "—"
     await tg.send(cid, (
-        "🫥 <b>BR Shadow Outcome Tracker — Phase 8L.4.2a</b>\n\n"
+        "🫥 <b>BR Shadow Outcome Tracker — Phase 8L.4.3</b>\n\n"
         f"<b>Unique geometry-fail shadows:</b> {x['total']}\n"
         f"<b>By side:</b> {sides}\n"
         f"<b>Avg raw score:</b> {x['avg_score']:.1f}\n"
@@ -6529,7 +6590,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
-        "Phase 8L.4.2 persistent raw + BR/TP deep + BR shadow diagnostics)"
+        "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -6552,12 +6613,12 @@ async def on_startup(app: web.Application) -> None:
         try:
             app["diag_store"] = DiagnosticStore(DIAGNOSTICS_DB_PATH)
             logger.info(
-                f"Phase 8L.4.2a Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
+                f"Phase 8L.4.3 Diagnostic DB ready path={DIAGNOSTICS_DB_PATH} "
                 f"outcome_days={DIAGNOSTICS_OUTCOME_DAYS}"
             )
         except Exception as exc:
             logger.warning(
-                f"Phase 8L.4.2 Diagnostic DB disabled after open failure: "
+                f"Phase 8L.4.3 Diagnostic DB disabled after open failure: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -6635,7 +6696,7 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L.1</b> temporal/lifecycle/quality hotfix: active ✅\n"
                 f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
                 f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n"
-                f"<b>Phase 8L.4.2</b> persistent raw + BR/TP deep + BR shadow diagnostics: "
+                f"<b>Phase 8L.4.3</b> persistent raw + BR/TP deep + BR shadow + TP stats analyzer: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
                 f"/close SYMBOL /config /diag /statsdb /brtp /tpdiag /brshadow /watchlist /candidates"
@@ -6849,6 +6910,36 @@ def _selftest_phase_8l42_br_shadow_store() -> None:
         store.close()
 
 
+def _selftest_phase_8l43_tp_statistics_helpers() -> None:
+    """Regression test for pullback-length and score-bucket outcome analytics."""
+    c = {
+        "trend_context_pass": 10,
+        "pullback_len_1": 3,
+        "pullback_len_2": 2,
+        "pullback_len_8": 1,
+    }
+    line = _tp_pullback_length_line("LONG", c)
+    assert "0D=4" in line and "1D=3" in line and "2D=2" in line and "8+D=1" in line
+
+    raw = {
+        "bucket_stats": {
+            "<45": {
+                "total": 2,
+                "statuses": {"DONE": 1, "ACTIVE": 1},
+                "outcomes": {"SL": 1},
+            },
+            "65-74": {
+                "total": 3,
+                "statuses": {"WAITING_ENTRY": 1, "ACTIVE": 1, "DONE": 1},
+                "outcomes": {"TP2": 1},
+            },
+        }
+    }
+    lines = _tp_score_bucket_outcome_lines(raw)
+    assert any("&lt;45" in x and "SL=1" in x for x in lines)
+    assert any("65-74" in x and "TP2=1" in x for x in lines)
+
+
 def _selftest_phase_8l41_trace_nonintrusive() -> None:
     """Tracing must not change detector return values on identical state."""
     state = SymbolState()
@@ -6879,5 +6970,6 @@ if __name__ == "__main__":
     _selftest_phase_8l2_post_confirmation_boundary()
     _selftest_phase_8l4_diagnostic_store()
     _selftest_phase_8l42_br_shadow_store()
+    _selftest_phase_8l43_tp_statistics_helpers()
     _selftest_phase_8l41_trace_nonintrusive()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
