@@ -28,6 +28,7 @@ Phase 8L.2 hotfix: post-confirmation TP/SL timing · dead-matrix diagnostics · 
 Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving temporal/lifecycle fixes
 Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + BR/TP internal-stage telemetry (no trading-rule changes)
 Phase 8L.4.3 Diagnostic: TP pullback-length distribution + score-bucket outcome analyzer (no trading-rule changes)
+Phase 8M Calibration Review: BR/TP cohort readiness + calibration summaries (diagnostic only; no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -5563,6 +5564,8 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_brshadow(app, cid)
                 elif text in ("/tpdiag", "/tpdb"):
                     await _cmd_tpdiag(app, cid)
+                elif text in ("/calibration", "/review8m", "/8m"):
+                    await _cmd_calibration(app, cid)
                 elif text in ("/watchlist", "/pending"):
                     await _cmd_watchlist(app, cid)
                 elif text in ("/candidates", "/dead"):
@@ -5950,7 +5953,7 @@ async def _cmd_statsdb(app: web.Application, cid: int) -> None:
         f"<b>Final outcomes:</b> {outcome_str}\n\n"
         f"<i>Raw setups are recorded before the score floor. Outcomes are "
         f"hypothetical and do not change signal generation.</i>\n"
-        f"Deep BR/TP funnel: /brtp"
+        f"Deep BR/TP funnel: /brtp · Calibration review: /calibration"
     ))
 
 
@@ -5996,6 +5999,348 @@ def _tp_score_bucket_outcome_lines(tp_raw: Dict[str, Any]) -> List[str]:
             f"{html.escape(str(label))}: n={total} · W/A/D={waiting}/{active}/{done} · {html.escape(outcome_text)}"
         )
     return lines or ["—"]
+
+
+
+def _cal_score_bucket(score: int) -> str:
+    if score < 45:
+        return "<45"
+    if score < 55:
+        return "45-54"
+    if score < 65:
+        return "55-64"
+    if score < 75:
+        return "65-74"
+    if score < 85:
+        return "75-84"
+    return "85+"
+
+
+def _cal_gap_bucket(gap_atr: float) -> str:
+    gap = float(gap_atr or 0.0)
+    if gap <= 0.10:
+        return "≤0.10"
+    if gap <= 0.20:
+        return "0.10-0.20"
+    if gap <= 0.30:
+        return "0.20-0.30"
+    return ">0.30"
+
+
+def _cal_is_clean_done(row: Dict[str, Any]) -> bool:
+    if (row.get("observation_status") or "") != "DONE":
+        return False
+    return (row.get("final_outcome") or "") not in (
+        "AMBIGUOUS", "ENTRY_BAR_AMBIGUOUS", ""
+    )
+
+
+def _cal_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    statuses: Dict[str, int] = {}
+    outcomes: Dict[str, int] = {}
+    regimes: Dict[str, int] = {}
+    btc_regimes: Dict[str, int] = {}
+    symbols: Dict[str, Dict[str, int]] = {}
+    mfe: List[float] = []
+    mae: List[float] = []
+    rr2: List[float] = []
+    entry_delays_h: List[float] = []
+    final_after_entry_h: List[float] = []
+    first_seen_values: List[int] = []
+    clean_done = 0
+    ambiguous_done = 0
+
+    for row in rows:
+        status = str(row.get("observation_status") or "UNKNOWN")
+        statuses[status] = statuses.get(status, 0) + 1
+
+        outcome = str(row.get("final_outcome") or "")
+        if outcome:
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+        if _cal_is_clean_done(row):
+            clean_done += 1
+        elif status == "DONE" and outcome in ("AMBIGUOUS", "ENTRY_BAR_AMBIGUOUS"):
+            ambiguous_done += 1
+
+        regime = str(row.get("regime_first") or "UNKNOWN")
+        regimes[regime] = regimes.get(regime, 0) + 1
+        btc_regime = str(row.get("btc_regime_first") or "UNKNOWN")
+        btc_regimes[btc_regime] = btc_regimes.get(btc_regime, 0) + 1
+
+        sym = str(row.get("symbol") or "UNKNOWN")
+        s = symbols.setdefault(sym, {"n": 0, "clean_done": 0})
+        s["n"] += 1
+        s["clean_done"] += int(_cal_is_clean_done(row))
+
+        mfe.append(float(row.get("mfe_r") or 0.0))
+        mae.append(float(row.get("mae_r") or 0.0))
+        rr2.append(float(row.get("rr_tp2") or 0.0))
+
+        first_seen = int(row.get("first_seen_ts") or 0)
+        if first_seen > 0:
+            first_seen_values.append(first_seen)
+
+        entry_ts = int(row.get("entry_activated_ts") or 0)
+        final_ts = int(row.get("final_outcome_ts") or 0)
+        if first_seen > 0 and entry_ts > 0 and entry_ts >= first_seen:
+            entry_delays_h.append((entry_ts - first_seen) / 3600.0)
+        if entry_ts > 0 and final_ts > 0 and final_ts >= entry_ts:
+            final_after_entry_h.append((final_ts - entry_ts) / 3600.0)
+
+    symbol_rows = sorted(
+        (
+            {"symbol": sym, "n": vals["n"], "clean_done": vals["clean_done"]}
+            for sym, vals in symbols.items()
+        ),
+        key=lambda x: (-x["n"], x["symbol"]),
+    )
+
+    age_days = (
+        max(0.0, (now_s() - min(first_seen_values)) / 86400.0)
+        if first_seen_values else 0.0
+    )
+    return {
+        "n": len(rows),
+        "statuses": statuses,
+        "outcomes": outcomes,
+        "regimes": regimes,
+        "btc_regimes": btc_regimes,
+        "symbols": symbol_rows,
+        "clean_done": clean_done,
+        "ambiguous_done": ambiguous_done,
+        "avg_mfe_r": (sum(mfe) / len(mfe)) if mfe else 0.0,
+        "avg_mae_r": (sum(mae) / len(mae)) if mae else 0.0,
+        "avg_rr2": (sum(rr2) / len(rr2)) if rr2 else 0.0,
+        "avg_entry_delay_h": (
+            sum(entry_delays_h) / len(entry_delays_h) if entry_delays_h else 0.0
+        ),
+        "avg_final_after_entry_h": (
+            sum(final_after_entry_h) / len(final_after_entry_h)
+            if final_after_entry_h else 0.0
+        ),
+        "age_days": age_days,
+    }
+
+
+def _cal_group(rows: List[Dict[str, Any]], key_fn) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(key_fn(row)), []).append(row)
+    return {k: _cal_summary(v) for k, v in grouped.items()}
+
+
+def _calibration_review_data(store: DiagnosticStore) -> Dict[str, Any]:
+    br_rows = [
+        dict(r) for r in store.conn.execute(
+            """
+            SELECT symbol,side,raw_score_first,regime_first,btc_regime_first,
+                   geometry_gap_atr,observation_status,final_outcome,
+                   mfe_r,mae_r,rr_tp2,first_seen_ts,entry_activated_ts,
+                   final_outcome_ts
+            FROM br_shadow_setups
+            """
+        ).fetchall()
+    ]
+
+    tp_rows = [
+        dict(r) for r in store.conn.execute(
+            """
+            SELECT setup_key,symbol,side,raw_score_first,regime_first,
+                   btc_regime_first,observation_status,final_outcome,
+                   mfe_r,mae_r,rr_tp2,first_seen_ts,entry_activated_ts,
+                   final_outcome_ts
+            FROM raw_setups
+            WHERE setup_type='TREND_PULLBACK'
+            """
+        ).fetchall()
+    ]
+
+    full_stack_keys = {
+        str(r["setup_key"])
+        for r in store.conn.execute(
+            """
+            SELECT setup_key FROM setup_score_components
+            WHERE component='ema_full_stack'
+            """
+        ).fetchall()
+    }
+    for row in tp_rows:
+        row["full_stack"] = str(row.get("setup_key") or "") in full_stack_keys
+
+    return {
+        "br": _cal_summary(br_rows),
+        "br_gap": _cal_group(
+            br_rows, lambda r: _cal_gap_bucket(r.get("geometry_gap_atr", 0.0))
+        ),
+        "br_score": _cal_group(
+            br_rows, lambda r: _cal_score_bucket(int(r.get("raw_score_first") or 0))
+        ),
+        "tp": _cal_summary(tp_rows),
+        "tp_score": _cal_group(
+            tp_rows, lambda r: _cal_score_bucket(int(r.get("raw_score_first") or 0))
+        ),
+        "tp_full_stack": _cal_group(
+            tp_rows, lambda r: "YES" if r.get("full_stack") else "NO"
+        ),
+    }
+
+
+def _cal_outcome_text(x: Dict[str, Any]) -> str:
+    order = (
+        "TP2", "SL", "TP1_THEN_SL", "TP1_ONLY_EXPIRED",
+        "EXPIRED", "NO_ENTRY", "AMBIGUOUS", "ENTRY_BAR_AMBIGUOUS",
+    )
+    parts = [
+        f"{k}={x['outcomes'].get(k, 0)}"
+        for k in order if x["outcomes"].get(k, 0)
+    ]
+    return " · ".join(parts) if parts else "—"
+
+
+def _cal_cohort_line(label: str, x: Dict[str, Any]) -> str:
+    w = x["statuses"].get("WAITING_ENTRY", 0)
+    a = x["statuses"].get("ACTIVE", 0)
+    return (
+        f"{html.escape(label)}: n={x['n']} · cleanD={x['clean_done']} · "
+        f"W/A={w}/{a} · {_cal_outcome_text(x)} · "
+        f"MFE/MAE={x['avg_mfe_r']:.2f}/{x['avg_mae_r']:.2f}R"
+    )
+
+
+def _cal_dict_text(d: Dict[str, int]) -> str:
+    return " · ".join(
+        f"{html.escape(str(k))}:{v}" for k, v in sorted(d.items())
+    ) or "—"
+
+
+def _cal_symbols_text(x: Dict[str, Any], limit: int = 5) -> str:
+    rows = x.get("symbols", [])[:limit]
+    if not rows:
+        return "—"
+    return " · ".join(
+        f"{html.escape(r['symbol'])} n={r['n']}/D={r['clean_done']}" for r in rows
+    )
+
+
+async def _cmd_calibration(app: web.Application, cid: int) -> None:
+    """Phase 8M calibration review. Read-only diagnostics; never changes trading."""
+    tg: Tg = app["tg"]
+    store = _diag_store(app)
+    if store is None:
+        await tg.send(cid, "⚠️ <b>Diagnostic DB unavailable.</b>")
+        return
+    try:
+        data = _calibration_review_data(store)
+    except Exception as exc:
+        _diag_warn(f"/calibration failed: {type(exc).__name__}: {exc}")
+        await tg.send(cid, "⚠️ <b>Could not build Phase 8M calibration review.</b>")
+        return
+
+    br = data["br"]
+    tp = data["tp"]
+    empty = _cal_summary([])
+    tp55 = data["tp_score"].get("55-64", empty)
+    tp65 = data["tp_score"].get("65-74", empty)
+
+    br_first_target = 15
+    br_robust_target = 30
+    tp_first_target = 20
+    tp_robust_target = 50
+    tp_bucket_target = 15
+
+    first_ready = (
+        br["clean_done"] >= br_first_target
+        and tp["clean_done"] >= tp_first_target
+    )
+    robust_ready = (
+        br["clean_done"] >= br_robust_target
+        and tp["clean_done"] >= tp_robust_target
+        and tp55["clean_done"] >= tp_bucket_target
+        and tp65["clean_done"] >= tp_bucket_target
+    )
+    readiness = (
+        "🟢 ROBUST REVIEW READY" if robust_ready
+        else "🟡 FIRST REVIEW READY" if first_ready
+        else "🔵 COLLECTING"
+    )
+
+    await tg.send(cid, (
+        "🧪 <b>Phase 8M — Calibration Review</b>\n\n"
+        "<b>Mode:</b> diagnostic only — trading logic unchanged\n"
+        f"<b>Status:</b> {readiness}\n\n"
+        "<b>Collection age:</b>\n"
+        f"BR shadow ≈ {br['age_days']:.1f}d · TP raw ≈ {tp['age_days']:.1f}d\n\n"
+        "<b>Decision readiness:</b>\n"
+        f"BR clean DONE: {br['clean_done']}/{br_first_target} first review "
+        f"· {br['clean_done']}/{br_robust_target} robust\n"
+        f"TP clean DONE: {tp['clean_done']}/{tp_first_target} first review "
+        f"· {tp['clean_done']}/{tp_robust_target} robust\n"
+        f"TP 55-64 clean DONE: {tp55['clean_done']}/{tp_bucket_target}\n"
+        f"TP 65-74 clean DONE: {tp65['clean_done']}/{tp_bucket_target}\n\n"
+        "<i>Readiness is a sample-size gate only. It does not automatically "
+        "recommend any trading-rule change.</i>"
+    ))
+
+    gap_order = ("≤0.10", "0.10-0.20", "0.20-0.30", ">0.30")
+    br_gap_lines = [
+        _cal_cohort_line(label, data["br_gap"][label])
+        for label in gap_order if label in data["br_gap"]
+    ] or ["—"]
+    score_order = ("<45", "45-54", "55-64", "65-74", "75-84", "85+")
+    br_score_lines = [
+        _cal_cohort_line(label, data["br_score"][label])
+        for label in score_order if label in data["br_score"]
+    ] or ["—"]
+
+    await asyncio.sleep(1.1)
+    await tg.send(cid, (
+        "🫥 <b>8M BR Calibration Cohorts</b>\n\n"
+        f"<b>Total shadows:</b> {br['n']} · clean DONE {br['clean_done']} "
+        f"· ambiguous DONE {br['ambiguous_done']}\n"
+        f"<b>Overall:</b> {_cal_outcome_text(br)}\n"
+        f"<b>Avg MFE/MAE:</b> {br['avg_mfe_r']:.2f}/{br['avg_mae_r']:.2f}R "
+        f"· avg RR2 {br['avg_rr2']:.2f}\n"
+        f"<b>Avg entry delay:</b> {br['avg_entry_delay_h']:.1f}h "
+        f"· avg entry→final {br['avg_final_after_entry_h']:.1f}h\n"
+        f"<b>First regime:</b> {_cal_dict_text(br['regimes'])}\n"
+        f"<b>BTC regime:</b> {_cal_dict_text(br['btc_regimes'])}\n"
+        f"<b>Top symbols:</b> {_cal_symbols_text(br)}\n\n"
+        "<b>By geometry gap (ATR inside entry zone):</b>\n"
+        + "\n".join(br_gap_lines) + "\n\n"
+        "<b>By raw score:</b>\n"
+        + "\n".join(br_score_lines)
+    ))
+
+    tp_score_lines = [
+        _cal_cohort_line(label, data["tp_score"][label])
+        for label in score_order if label in data["tp_score"]
+    ] or ["—"]
+    stack_lines = [
+        _cal_cohort_line(label, data["tp_full_stack"][label])
+        for label in ("YES", "NO") if label in data["tp_full_stack"]
+    ] or ["—"]
+
+    await asyncio.sleep(1.1)
+    await tg.send(cid, (
+        "📐 <b>8M TP Calibration Cohorts</b>\n\n"
+        f"<b>Total raw TP:</b> {tp['n']} · clean DONE {tp['clean_done']} "
+        f"· ambiguous DONE {tp['ambiguous_done']}\n"
+        f"<b>Overall:</b> {_cal_outcome_text(tp)}\n"
+        f"<b>Avg MFE/MAE:</b> {tp['avg_mfe_r']:.2f}/{tp['avg_mae_r']:.2f}R "
+        f"· avg RR2 {tp['avg_rr2']:.2f}\n"
+        f"<b>Avg entry delay:</b> {tp['avg_entry_delay_h']:.1f}h "
+        f"· avg entry→final {tp['avg_final_after_entry_h']:.1f}h\n"
+        f"<b>First regime:</b> {_cal_dict_text(tp['regimes'])}\n"
+        f"<b>BTC regime:</b> {_cal_dict_text(tp['btc_regimes'])}\n"
+        f"<b>Top symbols:</b> {_cal_symbols_text(tp)}\n\n"
+        "<b>By first-seen raw score:</b>\n"
+        + "\n".join(tp_score_lines) + "\n\n"
+        "<b>EMA full-stack cohort:</b>\n"
+        + "\n".join(stack_lines) + "\n\n"
+        "<i>Use these cohorts for the month-end calibration decision; "
+        "do not infer a threshold from unfinished cohorts alone.</i>"
+    ))
 
 
 async def _cmd_brtp(app: web.Application, cid: int) -> None:
@@ -6697,9 +7042,11 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L.2</b> post-confirmation timing + dead matrix + Tg polling logs: active ✅\n"
                 f"<b>Phase 8L.3</b> Phase-8L signal-flow rollback: active ✅\n"
                 f"<b>Phase 8L.4.3</b> persistent raw + BR/TP deep + BR shadow + TP stats analyzer: "
+                f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n"
+                f"<b>Phase 8M</b> calibration review / cohort readiness: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /statsdb /brtp /tpdiag /brshadow /watchlist /candidates"
+                f"/close SYMBOL /config /diag /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
 
 
@@ -6940,6 +7287,47 @@ def _selftest_phase_8l43_tp_statistics_helpers() -> None:
     assert any("65-74" in x and "TP2=1" in x for x in lines)
 
 
+
+def _selftest_phase_8m_calibration_helpers() -> None:
+    rows = [
+        {
+            "symbol": "AAAUSDT", "observation_status": "DONE",
+            "final_outcome": "TP2", "regime_first": "NEUTRAL",
+            "btc_regime_first": "BULLISH", "mfe_r": 2.4, "mae_r": 0.3,
+            "rr_tp2": 2.1, "first_seen_ts": 1000, "entry_activated_ts": 4600,
+            "final_outcome_ts": 11800, "raw_score_first": 68,
+            "geometry_gap_atr": 0.18,
+        },
+        {
+            "symbol": "BBBUSDT", "observation_status": "DONE",
+            "final_outcome": "ENTRY_BAR_AMBIGUOUS", "regime_first": "NEUTRAL",
+            "btc_regime_first": "BULLISH", "mfe_r": 1.0, "mae_r": 0.2,
+            "rr_tp2": 2.0, "first_seen_ts": 2000, "entry_activated_ts": 5600,
+            "final_outcome_ts": 5600, "raw_score_first": 58,
+            "geometry_gap_atr": 0.24,
+        },
+        {
+            "symbol": "AAAUSDT", "observation_status": "ACTIVE",
+            "final_outcome": None, "regime_first": "BULLISH",
+            "btc_regime_first": "BULLISH", "mfe_r": 0.8, "mae_r": 0.1,
+            "rr_tp2": 2.2, "first_seen_ts": 3000, "entry_activated_ts": 6600,
+            "final_outcome_ts": None, "raw_score_first": 68,
+            "geometry_gap_atr": 0.31,
+        },
+    ]
+    x = _cal_summary(rows)
+    assert x["n"] == 3
+    assert x["clean_done"] == 1
+    assert x["ambiguous_done"] == 1
+    assert x["outcomes"]["TP2"] == 1
+    assert _cal_score_bucket(68) == "65-74"
+    assert _cal_gap_bucket(0.18) == "0.10-0.20"
+    assert _cal_gap_bucket(0.31) == ">0.30"
+    grouped = _cal_group(rows, lambda r: _cal_score_bucket(r["raw_score_first"]))
+    assert grouped["65-74"]["n"] == 2
+    assert grouped["55-64"]["n"] == 1
+
+
 def _selftest_phase_8l41_trace_nonintrusive() -> None:
     """Tracing must not change detector return values on identical state."""
     state = SymbolState()
@@ -6971,5 +7359,6 @@ if __name__ == "__main__":
     _selftest_phase_8l4_diagnostic_store()
     _selftest_phase_8l42_br_shadow_store()
     _selftest_phase_8l43_tp_statistics_helpers()
+    _selftest_phase_8m_calibration_helpers()
     _selftest_phase_8l41_trace_nonintrusive()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
