@@ -31,6 +31,7 @@ Phase 8L.4.3 Diagnostic: TP pullback-length distribution + score-bucket outcome 
 Phase 8M Calibration Review: BR/TP cohort readiness + calibration summaries (diagnostic only; no trading-rule changes)
 Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /bybit · expiry reminders (GET-only; no order endpoints; no trading-rule changes)
 Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margin planning · 10% equity reserve · shadow margin reservations · /plan (planning only; no Bybit write endpoints; no trading-rule changes)
+Phase 9C Net PnL & Expiry Safety Shadow: account fee-rate + funding estimate · net TP/SL economics · remaining-leg break-even · persistent EXPIRED_WAIT_EXIT shadow lifecycle (still GET-only; no order endpoints; no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -59,7 +60,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
@@ -121,6 +122,18 @@ EXECUTION_PLANNER_RESERVE_PCT = max(
 )
 EXECUTION_PLANNER_TP1_FRACTION = 0.50
 EXECUTION_PLANNER_TP2_FRACTION = 0.50
+
+
+
+# ── Phase 9C: net economics + expiry safety shadow ────────────────────────────
+# Still simulation only. Fee-rate is read from the authenticated Bybit account;
+# funding is estimated from the current public funding rate and funding interval.
+# Shadow execution state is persisted so EXPIRED_WAIT_EXIT survives redeploys.
+EXECUTION_ECONOMICS_ENABLED = _bool_env("EXECUTION_ECONOMICS_ENABLED", True)
+EXECUTION_SHADOW_STATE_PATH = (
+    os.getenv("EXECUTION_SHADOW_STATE_PATH")
+    or "/data/bybit_execution_shadow_state.json"
+).strip()
 
 
 ALLOWED_CHAT_IDS   = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
@@ -933,6 +946,27 @@ class BybitRest:
             ]
 
 
+    async def ticker_linear(self, symbol: str) -> Dict[str, Any]:
+        """Fetch one linear ticker, including current funding-rate fields."""
+        url = f"{self.base}/v5/market/tickers"
+        params = {"category": "linear", "symbol": symbol}
+        async with self.http.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            body = await r.json()
+            if r.status != 200 or int(body.get("retCode", -1)) != 0:
+                raise RuntimeError(
+                    f"Bybit ticker failed HTTP {r.status}: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            rows = body.get("result", {}).get("list", []) or []
+            if not rows:
+                raise RuntimeError(f"No Bybit linear ticker for {symbol}")
+            return rows[0]
+
+
     async def instrument_linear(self, symbol: str) -> Dict[str, Any]:
         """Fetch current Bybit contract specification for one linear symbol."""
         url = f"{self.base}/v5/market/instruments-info"
@@ -1088,6 +1122,15 @@ class BybitPrivateReadOnly:
         # Bybit normally returns only size>0 when settleCoin is supplied; keep a
         # defensive size filter so /bybit never counts empty placeholder rows.
         return [r for r in rows if _safe_float(r.get("size")) > 0.0]
+
+    async def fee_rate_linear(self, symbol: str) -> Dict[str, Any]:
+        """Read the account's current linear trading fee rate for one symbol."""
+        body = await self._get(
+            "/v5/account/fee-rate",
+            {"category": "linear", "symbol": symbol},
+        )
+        rows = body.get("result", {}).get("list", []) or []
+        return rows[0] if rows else {}
 
     async def health_snapshot(self) -> Dict[str, Any]:
         """Query all Phase-9A read endpoints independently; never writes state."""
@@ -1647,7 +1690,7 @@ class CandidateDebug:
 
 
 # =============================================================================
-# === 5A. PHASE 9B MINIMUM-SIZE EXECUTION PLANNER (SHADOW ONLY) ===
+# === 5A. PHASE 9B/9C EXECUTION PLANNER + NET ECONOMICS (SHADOW ONLY) ===
 # =============================================================================
 
 @dataclass
@@ -1686,6 +1729,35 @@ class ExecutionPlan:
     open_positions: int
     already_open_symbol: bool
 
+    # Phase 9C economics. All fee/funding values are estimates until real fills
+    # exist. Entry and exits are conservatively modelled at taker fee rate.
+    economics_ready: bool = False
+    taker_fee_rate: float = 0.0
+    maker_fee_rate: float = 0.0
+    fee_source: str = "UNAVAILABLE"
+    funding_rate: float = 0.0
+    funding_interval_min: int = 0
+    funding_periods_est: float = 0.0
+    funding_cost_est_usdt: float = 0.0
+    entry_fee_est_usdt: float = 0.0
+    tp1_exit_fee_est_usdt: float = 0.0
+    tp2_exit_fee_est_usdt: float = 0.0
+    sl_exit_fee_est_usdt: float = 0.0
+    tp1_gross_profit_usdt: float = 0.0
+    tp2_gross_profit_usdt: float = 0.0
+    total_gross_profit_usdt: float = 0.0
+    tp1_net_profit_usdt: float = 0.0
+    tp2_net_profit_usdt: float = 0.0
+    total_net_profit_usdt: float = 0.0
+    tp1_net_equity_pct: float = 0.0
+    tp2_net_equity_pct: float = 0.0
+    total_net_equity_pct: float = 0.0
+    total_net_notional_pct: float = 0.0
+    sl_net_pnl_usdt: float = 0.0
+    sl_net_equity_pct: float = 0.0
+    remaining_break_even_price: float = 0.0
+    remaining_break_even_move_pct: float = 0.0
+
 
 def _dec(value: Any) -> Decimal:
     try:
@@ -1718,6 +1790,277 @@ def _step_decimals(step: Any) -> int:
 def _fmt_step(value: float, step: Any) -> str:
     decimals = min(12, _step_decimals(step))
     return f"{value:.{decimals}f}"
+
+
+
+def _ceil_to_tick(value: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return value
+    units = (value / tick).to_integral_value(rounding=ROUND_CEILING)
+    return units * tick
+
+
+def _floor_to_tick(value: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return value
+    units = (value / tick).to_integral_value(rounding=ROUND_FLOOR)
+    return units * tick
+
+
+def _load_execution_shadow_state(path: str) -> Dict[str, Dict[str, Any]]:
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return raw if isinstance(raw, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9C shadow-state load failed {path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {}
+
+
+def _save_execution_shadow_state(app: web.Application) -> None:
+    if not EXECUTION_SHADOW_STATE_PATH:
+        return
+    runtime = app.get("runtime_state")
+    if not isinstance(runtime, dict):
+        return
+    state = runtime.get("execution_shadow_reservations")
+    if not isinstance(state, dict):
+        return
+    try:
+        parent = os.path.dirname(EXECUTION_SHADOW_STATE_PATH) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = EXECUTION_SHADOW_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, sort_keys=True, indent=2)
+        os.replace(tmp, EXECUTION_SHADOW_STATE_PATH)
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9C shadow-state save failed {EXECUTION_SHADOW_STATE_PATH}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _funding_interval_minutes(
+    instrument: Dict[str, Any],
+    ticker: Dict[str, Any],
+) -> int:
+    # Current REST ticker may expose fundingIntervalHour; instruments-info is
+    # the authoritative fallback and documents fundingInterval in minutes.
+    hours = _safe_float(ticker.get("fundingIntervalHour"))
+    if hours > 0:
+        return max(1, int(round(hours * 60.0)))
+    try:
+        minutes = int(instrument.get("fundingInterval") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return minutes if minutes > 0 else 480
+
+
+def _signed_funding_cost(
+    side: str,
+    notional_usdt: Decimal,
+    funding_rate: Decimal,
+    periods: Decimal,
+) -> Decimal:
+    """
+    Positive result = cost paid by this position; negative = funding credit.
+    Bybit convention: with a positive funding rate LONG pays SHORT.
+    """
+    direction = Decimal("1") if side == "LONG" else Decimal("-1")
+    return notional_usdt * funding_rate * periods * direction
+
+
+def _remaining_break_even_price(
+    side: str,
+    entry: Decimal,
+    taker_fee_rate: Decimal,
+    funding_cost_usdt: Decimal,
+    remaining_qty: Decimal,
+    tick: Decimal,
+) -> Decimal:
+    """
+    Net break-even for the still-open leg only.
+    Realised TP1 profit is deliberately NOT included.
+    """
+    if entry <= 0 or remaining_qty <= 0:
+        return Decimal("0")
+
+    funding_per_unit = funding_cost_usdt / remaining_qty
+
+    if side == "LONG":
+        denom = Decimal("1") - taker_fee_rate
+        if denom <= 0:
+            return Decimal("0")
+        raw = (
+            entry * (Decimal("1") + taker_fee_rate)
+            + funding_per_unit
+        ) / denom
+        return _ceil_to_tick(raw, tick)
+
+    denom = Decimal("1") + taker_fee_rate
+    raw = (
+        entry * (Decimal("1") - taker_fee_rate)
+        - funding_per_unit
+    ) / denom
+    return _floor_to_tick(raw, tick)
+
+
+def _apply_execution_economics(
+    plan: ExecutionPlan,
+    idea: ActiveIdea,
+    instrument: Dict[str, Any],
+    ticker: Dict[str, Any],
+    fee_row: Dict[str, Any],
+) -> None:
+    """Populate Phase 9C fee/funding-aware economics on an existing plan."""
+    if not EXECUTION_ECONOMICS_ENABLED:
+        return
+
+    taker = _dec(fee_row.get("takerFeeRate"))
+    maker = _dec(fee_row.get("makerFeeRate"))
+    if taker < 0 or maker < 0 or not fee_row:
+        return
+
+    entry = _dec(plan.entry_price)
+    qty = _dec(plan.qty)
+    q1 = _dec(plan.tp1_qty)
+    q2 = _dec(plan.tp2_qty)
+    tp1 = _dec(plan.tp1)
+    tp2 = _dec(plan.tp2)
+    sl = _dec(plan.stop_loss)
+    equity = _dec(plan.equity_usdt)
+    notional = _dec(plan.notional_usdt)
+    tick = _dec(plan.tick_size)
+
+    funding_rate = _dec(ticker.get("fundingRate"))
+    interval_min = _funding_interval_minutes(instrument, ticker)
+    horizon_min = Decimal(str(MAX_IDEA_DURATION_DAYS * 24 * 60))
+    funding_periods = horizon_min / Decimal(str(interval_min))
+    funding_cost = _signed_funding_cost(
+        plan.side, notional, funding_rate, funding_periods
+    )
+
+    entry_fee = notional * taker
+    tp1_exit_fee = q1 * tp1 * taker
+    tp2_exit_fee = q2 * tp2 * taker
+    sl_exit_fee = qty * sl * taker
+
+    gross1 = q1 * abs(tp1 - entry)
+    gross2 = q2 * abs(tp2 - entry)
+    gross_total = gross1 + gross2
+
+    # Funding is allocated by quantity/notional share. With a 50/50 split this
+    # is exactly half to each leg. It is a conservative max-hold estimate.
+    f1 = funding_cost * (q1 / qty) if qty > 0 else Decimal("0")
+    f2 = funding_cost * (q2 / qty) if qty > 0 else Decimal("0")
+    entry_fee1 = q1 * entry * taker
+    entry_fee2 = q2 * entry * taker
+
+    net1 = gross1 - entry_fee1 - tp1_exit_fee - f1
+    net2 = gross2 - entry_fee2 - tp2_exit_fee - f2
+    net_total = net1 + net2
+
+    gross_sl_loss = qty * abs(entry - sl)
+    sl_net_pnl = -gross_sl_loss - entry_fee - sl_exit_fee - funding_cost
+
+    remaining_notional = q2 * entry
+    remaining_funding = _signed_funding_cost(
+        plan.side, remaining_notional, funding_rate, funding_periods
+    )
+    be = _remaining_break_even_price(
+        plan.side, entry, taker, remaining_funding, q2, tick
+    )
+    be_move_pct = Decimal("0")
+    if entry > 0 and be > 0:
+        if plan.side == "LONG":
+            be_move_pct = (be - entry) / entry * Decimal("100")
+        else:
+            be_move_pct = (entry - be) / entry * Decimal("100")
+
+    plan.economics_ready = True
+    plan.taker_fee_rate = float(taker)
+    plan.maker_fee_rate = float(maker)
+    plan.fee_source = "BYBIT_ACCOUNT"
+    plan.funding_rate = float(funding_rate)
+    plan.funding_interval_min = int(interval_min)
+    plan.funding_periods_est = float(funding_periods)
+    plan.funding_cost_est_usdt = float(funding_cost)
+    plan.entry_fee_est_usdt = float(entry_fee)
+    plan.tp1_exit_fee_est_usdt = float(tp1_exit_fee)
+    plan.tp2_exit_fee_est_usdt = float(tp2_exit_fee)
+    plan.sl_exit_fee_est_usdt = float(sl_exit_fee)
+    plan.tp1_gross_profit_usdt = float(gross1)
+    plan.tp2_gross_profit_usdt = float(gross2)
+    plan.total_gross_profit_usdt = float(gross_total)
+    plan.tp1_net_profit_usdt = float(net1)
+    plan.tp2_net_profit_usdt = float(net2)
+    plan.total_net_profit_usdt = float(net_total)
+    plan.tp1_net_equity_pct = float(net1 / equity * Decimal("100")) if equity > 0 else 0.0
+    plan.tp2_net_equity_pct = float(net2 / equity * Decimal("100")) if equity > 0 else 0.0
+    plan.total_net_equity_pct = float(net_total / equity * Decimal("100")) if equity > 0 else 0.0
+    plan.total_net_notional_pct = float(net_total / notional * Decimal("100")) if notional > 0 else 0.0
+    plan.sl_net_pnl_usdt = float(sl_net_pnl)
+    plan.sl_net_equity_pct = float(sl_net_pnl / equity * Decimal("100")) if equity > 0 else 0.0
+    plan.remaining_break_even_price = float(be)
+    plan.remaining_break_even_move_pct = float(be_move_pct)
+
+
+def _shadow_remaining_net_pnl(
+    row: Dict[str, Any],
+    price: float,
+    at_ts: Optional[int] = None,
+) -> Tuple[float, float, float]:
+    """
+    Approximate net PnL of the remaining shadow leg at `price`.
+
+    Returns (net_pnl_usdt, break_even_price, funding_cost_usdt).
+    TP1 realised profit is intentionally excluded.
+    """
+    at_ts = int(at_ts or now_s())
+    entry = _dec(row.get("entry_price"))
+    qty = _dec(row.get("open_qty"))
+    px = _dec(price)
+    taker = _dec(row.get("taker_fee_rate"))
+    funding_rate = _dec(row.get("funding_rate"))
+    interval_min = max(1, int(row.get("funding_interval_min") or 480))
+    emitted_at = int(row.get("emitted_at") or at_ts)
+    tick = _dec(row.get("tick_size"))
+
+    if entry <= 0 or qty <= 0 or px <= 0:
+        return 0.0, 0.0, 0.0
+
+    elapsed_min = Decimal(str(max(0, at_ts - emitted_at))) / Decimal("60")
+    periods = elapsed_min / Decimal(str(interval_min))
+    remaining_notional = qty * entry
+    funding_cost = _signed_funding_cost(
+        str(row.get("side") or ""), remaining_notional, funding_rate, periods
+    )
+
+    entry_fee = qty * entry * taker
+    exit_fee = qty * px * taker
+
+    if row.get("side") == "LONG":
+        gross = qty * (px - entry)
+    else:
+        gross = qty * (entry - px)
+
+    net = gross - entry_fee - exit_fee - funding_cost
+    be = _remaining_break_even_price(
+        str(row.get("side") or ""),
+        entry,
+        taker,
+        funding_cost,
+        qty,
+        tick,
+    )
+    return float(net), float(be), float(funding_cost)
 
 
 def _execution_shadow_reservations(app: web.Application) -> Dict[str, Dict[str, Any]]:
@@ -1766,10 +2109,20 @@ def _update_execution_shadow_reservation(
     if event == "TP1_HIT":
         if not row.get("tp1_released"):
             row["margin_usdt"] = max(0.0, _safe_float(row.get("margin_usdt")) * 0.5)
+            row["open_qty"] = max(0.0, _safe_float(row.get("tp2_qty")))
+            row["status"] = "TP1_HIT"
             row["tp1_released"] = True
             row["updated_at"] = now_s()
-    elif event in ("TP2_HIT", "SL_HIT", "EXPIRED", "INVALIDATED", "AMBIGUOUS"):
+            _save_execution_shadow_state(app)
+    elif event in ("TP2_HIT", "SL_HIT", "INVALIDATED", "AMBIGUOUS"):
         reservations.pop(idea.symbol, None)
+        _save_execution_shadow_state(app)
+    elif event == "EXPIRED":
+        # Phase 9C decides separately whether expiry closes the remaining
+        # shadow position or moves it into EXPIRED_WAIT_EXIT.
+        row["strategy_expired_at"] = now_s()
+        row["updated_at"] = now_s()
+        _save_execution_shadow_state(app)
 
 
 def calculate_execution_plan(
@@ -1933,29 +2286,68 @@ async def build_execution_plan(
     if not isinstance(private, BybitPrivateReadOnly):
         raise RuntimeError("Bybit private read-only bridge unavailable")
 
-    instrument, wallet, positions = await asyncio.gather(
+    instrument, wallet, positions, ticker = await asyncio.gather(
         rest.instrument_linear(idea.symbol),
         private.wallet_balance(),
         private.positions_linear(),
+        rest.ticker_linear(idea.symbol),
     )
 
-    # Existing reservation for this same idea must not be counted twice when
-    # /plan is requested after the automatic Phase 9B plan was already sent.
+    fee_row: Dict[str, Any] = {}
+    fee_error = ""
+    if EXECUTION_ECONOMICS_ENABLED:
+        try:
+            fee_row = await private.fee_rate_linear(idea.symbol)
+        except Exception as exc:
+            fee_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                f"Phase 9C fee-rate read failed {idea.symbol}: {fee_error}"
+            )
+
+    reservations = _execution_shadow_reservations(app)
+    existing = reservations.get(idea.symbol)
     reserved_other = _execution_shadow_reserved_total(app, exclude_symbol=idea.symbol)
     plan = calculate_execution_plan(idea, instrument, wallet, positions, reserved_other)
 
+    if isinstance(existing, dict) and int(existing.get("emitted_at") or 0) != idea.emitted_at:
+        plan.status = "SKIPPED_SHADOW_POSITION_OPEN"
+        plan.reason = str(existing.get("status") or "shadow_position_open").lower()
+
+    if fee_row:
+        _apply_execution_economics(plan, idea, instrument, ticker, fee_row)
+    elif fee_error:
+        plan.fee_source = "UNAVAILABLE"
+
     if reserve_shadow_margin and plan.status == "EXECUTABLE":
-        reservations = _execution_shadow_reservations(app)
         if idea.symbol not in reservations:
             reservations[idea.symbol] = {
+                "status": "ACTIVE",
+                "symbol": idea.symbol,
+                "side": idea.side,
+                "setup_type": idea.setup_type,
+                "entry_price": plan.entry_price,
+                "stop_loss": plan.stop_loss,
+                "tp1": plan.tp1,
+                "tp2": plan.tp2,
+                "qty": plan.qty,
+                "open_qty": plan.qty,
+                "tp1_qty": plan.tp1_qty,
+                "tp2_qty": plan.tp2_qty,
                 "margin_usdt": plan.margin_required_usdt,
                 "original_margin_usdt": plan.margin_required_usdt,
                 "notional_usdt": plan.notional_usdt,
-                "qty": plan.qty,
                 "emitted_at": idea.emitted_at,
+                "expires_at": idea.expires_at,
                 "tp1_released": False,
+                "taker_fee_rate": plan.taker_fee_rate,
+                "maker_fee_rate": plan.maker_fee_rate,
+                "funding_rate": plan.funding_rate,
+                "funding_interval_min": plan.funding_interval_min,
+                "tick_size": plan.tick_size,
+                "planned_break_even_price": plan.remaining_break_even_price,
                 "updated_at": now_s(),
             }
+            _save_execution_shadow_state(app)
     return plan, instrument
 
 
@@ -1969,6 +2361,8 @@ def format_execution_plan(plan: ExecutionPlan, instrument: Dict[str, Any]) -> st
         status_line = "⛔ <b>SKIPPED — NO MARGIN</b>"
     elif plan.status == "SKIPPED_ALREADY_OPEN":
         status_line = "⛔ <b>SKIPPED — SYMBOL ALREADY OPEN</b>"
+    elif plan.status == "SKIPPED_SHADOW_POSITION_OPEN":
+        status_line = "⛔ <b>SKIPPED — SHADOW POSITION STILL OPEN</b>"
     else:
         status_line = f"⛔ <b>{html.escape(plan.status)}</b>"
 
@@ -1979,35 +2373,70 @@ def format_execution_plan(plan: ExecutionPlan, instrument: Dict[str, Any]) -> st
     tp1 = _fmt_step(plan.tp1, tick)
     tp2 = _fmt_step(plan.tp2, tick)
 
-    return (
-        "🧮 <b>Execution Plan — Phase 9B</b>\n\n"
-        f"<b>{html.escape(plan.symbol)} {html.escape(plan.side)}</b>\n"
-        f"<b>Status:</b> {status_line}\n"
-        f"<b>Reason:</b> <code>{html.escape(plan.reason)}</code>\n\n"
-        f"<b>Entry:</b> Market @ signal reference {plan.entry_price:.6g}\n"
-        f"<b>Qty:</b> <code>{html.escape(qty)}</code> · "
-        f"<b>Notional:</b> ${plan.notional_usdt:.2f}\n"
-        f"<b>Planned leverage:</b> {plan.leverage:.2f}x "
-        "<i>(not changed by Phase 9B)</i>\n"
-        f"<b>Estimated margin:</b> ${plan.margin_required_usdt:.2f}\n\n"
-        f"<b>SL:</b> <code>{html.escape(sl)}</code> · {plan.sl_distance_pct:.2f}% from entry\n"
-        f"<b>Loss at SL:</b> ~${plan.loss_at_sl_usdt:.3f} · "
-        f"{plan.account_risk_pct:.2f}% of equity\n"
-        f"<b>TP1:</b> <code>{html.escape(tp1)}</code> · qty {html.escape(q1)} (50%) · "
-        f"~${plan.tp1_profit_usdt:.3f}\n"
-        f"<b>TP2:</b> <code>{html.escape(tp2)}</code> · qty {html.escape(q2)} (50%) · "
-        f"~${plan.tp2_profit_usdt:.3f}\n\n"
-        f"<b>Equity:</b> ${plan.equity_usdt:.2f} · "
-        f"<b>Bybit available:</b> ${plan.available_usdt:.2f}\n"
-        f"<b>10% reserve:</b> ${plan.reserve_usdt:.2f}\n"
-        f"<b>Shadow reserved before:</b> ${plan.shadow_reserved_before_usdt:.2f}\n"
-        f"<b>Planner margin before:</b> ${plan.planner_available_before_usdt:.2f}\n"
-        f"<b>Planner margin after:</b> ${plan.planner_available_after_usdt:.2f}\n"
-        f"<b>Same-size capacity before this plan:</b> {plan.same_size_capacity}\n\n"
+    parts: List[str] = [
+        "🧮 <b>Execution Plan — Phase 9C</b>\n\n",
+        f"<b>{html.escape(plan.symbol)} {html.escape(plan.side)}</b>\n",
+        f"<b>Status:</b> {status_line}\n",
+        f"<b>Reason:</b> <code>{html.escape(plan.reason)}</code>\n\n",
+        f"<b>Entry:</b> Market @ signal reference {plan.entry_price:.6g}\n",
+        f"<b>Qty:</b> <code>{html.escape(qty)}</code> · ",
+        f"<b>Notional:</b> ${plan.notional_usdt:.2f}\n",
+        f"<b>Planned leverage:</b> {plan.leverage:.2f}x ",
+        "<i>(not changed by Phase 9C)</i>\n",
+        f"<b>Estimated margin:</b> ${plan.margin_required_usdt:.2f}\n\n",
+        f"<b>SL:</b> <code>{html.escape(sl)}</code> · {plan.sl_distance_pct:.2f}% from entry\n",
+        f"<b>Gross loss at SL:</b> ~${plan.loss_at_sl_usdt:.3f}\n",
+    ]
+
+    if plan.economics_ready:
+        parts.extend([
+            f"<b>Net PnL at SL:</b> ${plan.sl_net_pnl_usdt:+.3f} · "
+            f"{plan.sl_net_equity_pct:+.2f}% equity\n",
+            f"<b>TP1:</b> <code>{html.escape(tp1)}</code> · qty {html.escape(q1)} (50%)\n",
+            f"  Gross: +${plan.tp1_gross_profit_usdt:.3f} · "
+            f"Net est.: ${plan.tp1_net_profit_usdt:+.3f} "
+            f"({plan.tp1_net_equity_pct:+.2f}% equity)\n",
+            f"<b>TP2:</b> <code>{html.escape(tp2)}</code> · qty {html.escape(q2)} (50%)\n",
+            f"  Gross: +${plan.tp2_gross_profit_usdt:.3f} · "
+            f"Net est.: ${plan.tp2_net_profit_usdt:+.3f} "
+            f"({plan.tp2_net_equity_pct:+.2f}% equity)\n",
+            f"<b>Expected total:</b> gross +${plan.total_gross_profit_usdt:.3f} · "
+            f"net est. ${plan.total_net_profit_usdt:+.3f} · "
+            f"{plan.total_net_equity_pct:+.2f}% equity · "
+            f"{plan.total_net_notional_pct:+.2f}% notional\n\n",
+            f"<b>Fees est.:</b> entry ${plan.entry_fee_est_usdt:.3f} · "
+            f"TP exits ${plan.tp1_exit_fee_est_usdt + plan.tp2_exit_fee_est_usdt:.3f} · "
+            f"taker {plan.taker_fee_rate * 100:.4f}%\n",
+            f"<b>Funding est.:</b> ${plan.funding_cost_est_usdt:+.3f} over "
+            f"{MAX_IDEA_DURATION_DAYS}d at current {plan.funding_rate * 100:+.4f}% / "
+            f"{plan.funding_interval_min}m\n",
+            f"<b>Remaining-leg net BE:</b> {plan.remaining_break_even_price:.6g} "
+            f"({plan.remaining_break_even_move_pct:+.3f}% from entry)\n",
+            "<i>TP1 realised profit is NOT counted in this break-even.</i>\n\n",
+        ])
+    else:
+        parts.extend([
+            "<b>Net economics:</b> unavailable — Bybit account fee-rate could not be read.\n",
+            f"<b>TP1 gross:</b> +${plan.tp1_profit_usdt:.3f}\n",
+            f"<b>TP2 gross:</b> +${plan.tp2_profit_usdt:.3f}\n\n",
+        ])
+
+    parts.extend([
+        f"<b>Equity:</b> ${plan.equity_usdt:.2f} · ",
+        f"<b>Bybit available:</b> ${plan.available_usdt:.2f}\n",
+        f"<b>10% reserve:</b> ${plan.reserve_usdt:.2f}\n",
+        f"<b>Shadow reserved before:</b> ${plan.shadow_reserved_before_usdt:.2f}\n",
+        f"<b>Planner margin before:</b> ${plan.planner_available_before_usdt:.2f}\n",
+        f"<b>Planner margin after:</b> ${plan.planner_available_after_usdt:.2f}\n",
+        f"<b>Same-size capacity before this plan:</b> {plan.same_size_capacity}\n\n",
         f"<b>Bybit minimums:</b> qty {plan.min_order_qty:g} · "
-        f"step {plan.qty_step:g} · notional ${plan.min_notional_usdt:g}\n"
-        "<b>ORDER NOT SENT.</b> Phase 9B contains no Bybit write endpoints. ✅"
-    )
+        f"step {plan.qty_step:g} · notional ${plan.min_notional_usdt:g}\n",
+        f"<b>Expiry policy:</b> after {MAX_IDEA_DURATION_DAYS}d, positive/net-BE remainder exits; "
+        "negative remainder waits for original SL or its own net break-even.\n",
+        "<b>SL safety:</b> future live SL remains active until Bybit confirms position size = 0.\n",
+        "<b>ORDER NOT SENT.</b> Phase 9C still contains no Bybit write endpoints. ✅",
+    ])
+    return "".join(parts)
 
 
 async def send_execution_plan(
@@ -2029,10 +2458,10 @@ async def send_execution_plan(
         text = format_execution_plan(plan, instrument)
     except Exception as exc:
         logger.warning(
-            f"Phase 9B execution plan failed {idea.symbol}: {type(exc).__name__}: {exc}"
+            f"Phase 9C execution plan failed {idea.symbol}: {type(exc).__name__}: {exc}"
         )
         text = (
-            "⚠️ <b>Execution Plan — Phase 9B failed</b>\n\n"
+            "⚠️ <b>Execution Plan — Phase 9C failed</b>\n\n"
             f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
             f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n\n"
             "<b>ORDER NOT SENT.</b>"
@@ -2041,6 +2470,147 @@ async def send_execution_plan(
     for cid in get_broadcast_targets():
         with contextlib.suppress(Exception):
             await tg.send(cid, text)
+
+
+
+async def _handle_execution_shadow_expiry(
+    app: web.Application,
+    idea: ActiveIdea,
+) -> Optional[str]:
+    """
+    Phase 9C shadow implementation of the approved future live expiry rule.
+
+    If the remaining leg is net non-negative at expiry, the shadow position
+    closes. If it is net negative, it remains open as EXPIRED_WAIT_EXIT until
+    either the original strategy SL or the remaining leg's own net break-even.
+    TP1 realised profit is never used to subsidise that break-even.
+    """
+    reservations = _execution_shadow_reservations(app)
+    row = reservations.get(idea.symbol)
+    if not isinstance(row, dict):
+        return None
+
+    mkt = app.get("mkt")
+    state = mkt.state.get(idea.symbol) if isinstance(mkt, Market) else None
+    if not isinstance(state, SymbolState):
+        return None
+
+    price = get_current_price(state)
+    if price <= 0:
+        row["status"] = "EXPIRED_WAIT_EXIT"
+        row["expiry_wait_started_at"] = now_s()
+        row["updated_at"] = now_s()
+        _save_execution_shadow_state(app)
+        return (
+            "⏳ <b>Execution Shadow — EXPIRED_WAIT_EXIT</b>\n"
+            f"<b>{html.escape(idea.symbol)}</b>: current price unavailable, "
+            "so the shadow remainder is NOT force-closed."
+        )
+
+    net_pnl, be_price, funding_cost = _shadow_remaining_net_pnl(row, price)
+    row["last_net_pnl_usdt"] = net_pnl
+    row["last_break_even_price"] = be_price
+    row["last_funding_cost_usdt"] = funding_cost
+
+    if net_pnl >= 0:
+        reservations.pop(idea.symbol, None)
+        _save_execution_shadow_state(app)
+        return (
+            "✅ <b>Execution Shadow — EXPIRY EXIT</b>\n"
+            f"<b>{html.escape(idea.symbol)}</b> remainder is net non-negative at expiry.\n"
+            f"Price: {price:.6g} · Net PnL est.: ${net_pnl:+.3f}\n"
+            "<i>Future live action: reduce-only close; original SL remains until "
+            "Bybit confirms position size = 0.</i>"
+        )
+
+    row["status"] = "EXPIRED_WAIT_EXIT"
+    row["expiry_wait_started_at"] = now_s()
+    row["updated_at"] = now_s()
+    _save_execution_shadow_state(app)
+
+    return (
+        "⏳ <b>Execution Shadow — EXPIRED_WAIT_EXIT</b>\n"
+        f"<b>{html.escape(idea.symbol)}</b> remainder is negative at expiry, "
+        "so it is NOT force-closed.\n"
+        f"Current net PnL est.: ${net_pnl:+.3f}\n"
+        f"Original SL: {float(row.get('stop_loss') or 0):.6g}\n"
+        f"Current net break-even: {be_price:.6g}\n"
+        f"Funding accrued est.: ${funding_cost:+.3f}\n"
+        "<i>Wait for original SL or the remaining leg's own net break-even. "
+        "TP1 realised profit is excluded.</i>"
+    )
+
+
+async def check_execution_shadow_wait_exit(
+    sym: str,
+    state: SymbolState,
+    app: web.Application,
+) -> None:
+    """
+    Continue Phase 9C EXPIRED_WAIT_EXIT after the strategy ActiveIdea is gone.
+
+    This is a shadow policy test only; no order is sent. The real live phase
+    will keep an exchange-side SL active and require a confirmed flat position.
+    """
+    reservations = _execution_shadow_reservations(app)
+    row = reservations.get(sym)
+    if not isinstance(row, dict) or row.get("status") != "EXPIRED_WAIT_EXIT":
+        return
+
+    price = get_current_price(state)
+    if price <= 0:
+        return
+
+    side = str(row.get("side") or "")
+    stop = _safe_float(row.get("stop_loss"))
+    net_pnl, be_price, funding_cost = _shadow_remaining_net_pnl(row, price)
+
+    sl_hit = (price <= stop) if side == "LONG" else (price >= stop)
+    be_hit = (price >= be_price) if side == "LONG" else (price <= be_price)
+
+    outcome = ""
+    if sl_hit:
+        outcome = "SL"
+    elif be_price > 0 and be_hit and net_pnl >= -0.000001:
+        outcome = "NET_BREAK_EVEN"
+
+    row["last_net_pnl_usdt"] = net_pnl
+    row["last_break_even_price"] = be_price
+    row["last_funding_cost_usdt"] = funding_cost
+    row["updated_at"] = now_s()
+
+    if not outcome:
+        _save_execution_shadow_state(app)
+        return
+
+    reservations.pop(sym, None)
+    _save_execution_shadow_state(app)
+
+    tg = app.get("tg")
+    if not isinstance(tg, Tg):
+        return
+
+    if outcome == "SL":
+        msg = (
+            "🛑 <b>Execution Shadow — WAIT EXIT finished at SL</b>\n"
+            f"<b>{html.escape(sym)}</b> · price {price:.6g} · "
+            f"original SL {stop:.6g}\n"
+            f"Net PnL est.: ${net_pnl:+.3f}"
+        )
+    else:
+        msg = (
+            "🟰 <b>Execution Shadow — WAIT EXIT reached net break-even</b>\n"
+            f"<b>{html.escape(sym)}</b> · price {price:.6g} · "
+            f"net BE {be_price:.6g}\n"
+            f"Net PnL est.: ${net_pnl:+.3f}\n"
+            "<i>Future live action: reduce-only close, then wait for confirmed flat "
+            "before removing the original SL.</i>"
+        )
+
+    for cid in get_broadcast_targets():
+        with contextlib.suppress(Exception):
+            await tg.send(cid, msg)
+
 
 
 
@@ -5786,6 +6356,13 @@ async def poll_symbol(
             logger.warning(f"check_idea_lifecycle failed {sym}: {e}")
             await report_error(app, f"check_idea_lifecycle/{sym}", e)
 
+        # ── Phase 9C: execution-shadow post-expiry safety lifecycle ────────────
+        try:
+            await check_execution_shadow_wait_exit(sym, state, app)
+        except Exception as e:
+            logger.warning(f"check_execution_shadow_wait_exit failed {sym}: {e}")
+            await report_error(app, f"execution_shadow_wait/{sym}", e)
+
         # ── Phase 5: scan pipeline — ActiveIdea creation + Phase 6 Telegram dispatch ──
         try:
             await scan_symbol(sym, state, mkt, app)
@@ -6299,6 +6876,11 @@ async def send_idea_update(
     shadow ledger. This does not touch Bybit or alter strategy lifecycle.
     """
     _update_execution_shadow_reservation(app, idea, event)
+    expiry_shadow_message: Optional[str] = None
+    if event == "EXPIRED":
+        with contextlib.suppress(Exception):
+            expiry_shadow_message = await _handle_execution_shadow_expiry(app, idea)
+
     tg: Optional[Tg] = app.get("tg")
     if tg is None:
         return
@@ -6316,6 +6898,9 @@ async def send_idea_update(
             logger.warning(
                 f"send_idea_update {event} FAIL → {cid}  ({idea.symbol})"
             )
+        if expiry_shadow_message:
+            with contextlib.suppress(Exception):
+                await tg.send(cid, expiry_shadow_message)
 
 
 # =============================================================================
@@ -6386,6 +6971,11 @@ async def tg_loop(app: web.Application) -> None:
                         parts = text.split(maxsplit=1)
                         sym = parts[1].upper().strip() if len(parts) > 1 else ""
                         await _cmd_plan(app, cid, sym)
+                elif text in ("/execshadow", "/shadowexec"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await _cmd_execshadow(app, cid)
                 elif text in ("/statsdb", "/rawstats"):
                     await _cmd_statsdb(app, cid)
                 elif text in ("/brtp", "/detstats"):
@@ -6553,6 +7143,48 @@ async def _cmd_plan(app: web.Application, cid: int, sym: str) -> None:
         )
 
 
+async def _cmd_execshadow(app: web.Application, cid: int) -> None:
+    """Show currently reserved/open Phase 9C shadow execution positions."""
+    tg: Tg = app["tg"]
+    rows = _execution_shadow_reservations(app)
+    if not rows:
+        await tg.send(cid, "🫥 <b>Execution Shadow</b>\nNo open shadow positions.")
+        return
+
+    lines = ["🧪 <b>Execution Shadow — Phase 9C</b>", ""]
+    total_margin = 0.0
+    for sym, row in sorted(rows.items()):
+        status = str(row.get("status") or "ACTIVE")
+        margin = _safe_float(row.get("margin_usdt"))
+        qty = _safe_float(row.get("open_qty") or row.get("qty"))
+        total_margin += margin
+        state = app["mkt"].state.get(sym)
+        price = get_current_price(state) if isinstance(state, SymbolState) else 0.0
+        net = be = funding = 0.0
+        if price > 0:
+            net, be, funding = _shadow_remaining_net_pnl(row, price)
+        lines.append(
+            f"<b>{html.escape(sym)}</b> {html.escape(str(row.get('side') or ''))} · "
+            f"{html.escape(status)}"
+        )
+        lines.append(
+            f"qty {qty:g} · shadow margin ${margin:.2f} · "
+            f"net est. ${net:+.3f}"
+        )
+        if status == "EXPIRED_WAIT_EXIT":
+            lines.append(
+                f"SL {_safe_float(row.get('stop_loss')):.6g} · "
+                f"net BE {be:.6g} · funding ${funding:+.3f}"
+            )
+        lines.append("")
+
+    lines.append(f"<b>Total shadow margin:</b> ${total_margin:.2f}")
+    lines.append("<i>No Bybit orders are created by this state.</i>")
+    await tg.send(cid, "\n".join(lines))
+
+
+
+
 async def _cmd_status(app: web.Application, cid: int) -> None:
     tg:  Tg     = app["tg"]
     mkt: Market = app["mkt"]
@@ -6580,7 +7212,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner · 9C net economics/expiry shadow"
     ))
 
 
@@ -7588,6 +8220,10 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>TP split:</b> 50/50\n"
         f"<b>Planner auto-send:</b> {'yes' if EXECUTION_PLANNER_AUTO_SEND else 'no'} · "
         f"<b>Bybit writes:</b> disabled by code\n"
+        f"<b>Net economics:</b> {'enabled' if EXECUTION_ECONOMICS_ENABLED else 'off'} (Phase 9C) · "
+        f"fees=Bybit account · funding=current-rate estimate\n"
+        f"<b>Expiry execution policy:</b> net ≥ 0 exit; net < 0 → EXPIRED_WAIT_EXIT → SL or own net BE\n"
+        f"<b>Shadow state:</b> <code>{html.escape(EXECUTION_SHADOW_STATE_PATH)}</code>\n"
         f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
         f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
@@ -7920,7 +8556,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
-        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner)"
+        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -8031,9 +8667,11 @@ async def on_startup(app: web.Application) -> None:
         "apikey_reminder_state": _load_apikey_reminder_state(
             BYBIT_API_REMINDER_STATE_PATH
         ),
-        # Phase 9B shadow-only margin ledger. It intentionally resets on
-        # redeploy because Phase 9B never creates a real Bybit position.
-        "execution_shadow_reservations": {},
+        # Phase 9C persists the shadow execution lifecycle across redeploys so
+        # EXPIRED_WAIT_EXIT and reserved test margin are not silently forgotten.
+        "execution_shadow_reservations": _load_execution_shadow_state(
+            EXECUTION_SHADOW_STATE_PATH
+        ),
     }
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
@@ -8096,9 +8734,12 @@ async def on_startup(app: web.Application) -> None:
                 f"{'connected ✅' if bybit_bridge_status.get('api_ok') else ('configured ⚠️' if bybit_bridge_status.get('configured') else 'off ⚪')}\n"
                 f"<b>Phase 9B</b> minimum-size execution planner: "
                 f"{'active ✅' if EXECUTION_PLANNER_ENABLED else 'off ⚪'} · "
-                f"{EXECUTION_PLANNER_LEVERAGE:.1f}x plan · {EXECUTION_PLANNER_RESERVE_PCT:.0f}% reserve · 50/50 · no orders\n\n"
+                f"{EXECUTION_PLANNER_LEVERAGE:.1f}x plan · {EXECUTION_PLANNER_RESERVE_PCT:.0f}% reserve · 50/50 · no orders\n"
+                f"<b>Phase 9C</b> net PnL + expiry safety shadow: "
+                f"{'active ✅' if EXECUTION_ECONOMICS_ENABLED else 'off ⚪'} · "
+                f"fees/funding estimates · EXPIRED_WAIT_EXIT · persistent shadow state\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
+                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /execshadow /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
 
 
@@ -8473,6 +9114,88 @@ def _selftest_phase_9b_execution_planner() -> None:
     assert p3.status == "SKIPPED_NO_MARGIN"
 
 
+def _selftest_phase_9c_net_economics() -> None:
+    """Fee/funding math must be internally consistent and TP1 must not subsidise BE."""
+    idea = ActiveIdea(
+        symbol="TESTUSDT",
+        side="LONG",
+        setup_type="LIQUIDITY_SWEEP",
+        setup_score=80,
+        entry_low=99.0,
+        entry_high=101.0,
+        stop_loss=95.0,
+        tp1=105.0,
+        tp2=110.0,
+        rr_tp1=1.0,
+        rr_tp2=2.0,
+        status="ACTIVE",
+        emitted_at=1,
+        expires_at=1 + 10 * 86400,
+        invalidation="test",
+        current_price_at_signal=100.0,
+    )
+    instrument = {
+        "symbol": "TESTUSDT",
+        "status": "Trading",
+        "fundingInterval": 480,
+        "lotSizeFilter": {
+            "minOrderQty": "0.01",
+            "qtyStep": "0.01",
+            "minNotionalValue": "5",
+            "maxMktOrderQty": "1000",
+        },
+        "priceFilter": {"tickSize": "0.1"},
+        "leverageFilter": {"maxLeverage": "10"},
+    }
+    wallet = {"totalEquity": "30", "totalAvailableBalance": "30"}
+    p = calculate_execution_plan(idea, instrument, wallet, [], 0.0)
+    _apply_execution_economics(
+        p,
+        idea,
+        instrument,
+        {"fundingRate": "0.0001"},
+        {"takerFeeRate": "0.00055", "makerFeeRate": "0.0002"},
+    )
+    assert p.economics_ready
+    assert p.total_gross_profit_usdt > p.total_net_profit_usdt
+    assert p.entry_fee_est_usdt > 0
+    assert p.funding_cost_est_usdt > 0  # positive rate => LONG pays
+    assert p.remaining_break_even_price > p.entry_price
+    assert p.sl_net_pnl_usdt < -p.loss_at_sl_usdt
+
+    # SHORT with positive funding should receive funding, not pay it.
+    idea_s = ActiveIdea(
+        symbol="TESTUSDT",
+        side="SHORT",
+        setup_type="LIQUIDITY_SWEEP",
+        setup_score=80,
+        entry_low=99.0,
+        entry_high=101.0,
+        stop_loss=105.0,
+        tp1=95.0,
+        tp2=90.0,
+        rr_tp1=1.0,
+        rr_tp2=2.0,
+        status="ACTIVE",
+        emitted_at=1,
+        expires_at=1 + 10 * 86400,
+        invalidation="test",
+        current_price_at_signal=100.0,
+    )
+    ps = calculate_execution_plan(idea_s, instrument, wallet, [], 0.0)
+    _apply_execution_economics(
+        ps,
+        idea_s,
+        instrument,
+        {"fundingRate": "0.0001"},
+        {"takerFeeRate": "0.00055", "makerFeeRate": "0.0002"},
+    )
+    assert ps.funding_cost_est_usdt < 0
+    # A sufficiently large funding credit can move a SHORT net break-even
+    # slightly above entry, so direction alone is not a valid invariant.
+    assert ps.remaining_break_even_price > 0
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -8495,4 +9218,5 @@ if __name__ == "__main__":
     _selftest_phase_8l41_trace_nonintrusive()
     _selftest_phase_9a_readonly_bridge()
     _selftest_phase_9b_execution_planner()
+    _selftest_phase_9c_net_economics()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
