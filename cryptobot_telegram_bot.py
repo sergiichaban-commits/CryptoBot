@@ -30,6 +30,7 @@ Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + 
 Phase 8L.4.3 Diagnostic: TP pullback-length distribution + score-bucket outcome analyzer (no trading-rule changes)
 Phase 8M Calibration Review: BR/TP cohort readiness + calibration summaries (diagnostic only; no trading-rule changes)
 Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /bybit · expiry reminders (GET-only; no order endpoints; no trading-rule changes)
+Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margin planning · 10% equity reserve · shadow margin reservations · /plan (planning only; no Bybit write endpoints; no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -58,6 +59,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
@@ -101,6 +103,24 @@ BYBIT_API_REMINDER_STATE_PATH = (
     or "/data/bybit_apikey_reminders.json"
 ).strip()
 BYBIT_API_REMINDER_THRESHOLDS: Tuple[int, ...] = (30, 21, 14, 7, 1)
+
+
+
+# ── Phase 9B: minimum-size execution planner (SHADOW ONLY) ────────────────────
+# No Bybit write endpoint is implemented in this phase. The planner converts
+# an emitted ActiveIdea into the smallest 50/50-splittable Bybit position that
+# satisfies current instrument quantity/notional rules, estimates margin at the
+# planned leverage, and reserves that margin only in an in-memory shadow ledger.
+EXECUTION_PLANNER_ENABLED = _bool_env("EXECUTION_PLANNER_ENABLED", True)
+EXECUTION_PLANNER_AUTO_SEND = _bool_env("EXECUTION_PLANNER_AUTO_SEND", True)
+EXECUTION_PLANNER_LEVERAGE = max(
+    1.0, min(float(os.getenv("EXECUTION_PLANNER_LEVERAGE", "2")), 2.0)
+)
+EXECUTION_PLANNER_RESERVE_PCT = max(
+    0.0, min(float(os.getenv("EXECUTION_PLANNER_RESERVE_PCT", "10")), 50.0)
+)
+EXECUTION_PLANNER_TP1_FRACTION = 0.50
+EXECUTION_PLANNER_TP2_FRACTION = 0.50
 
 
 ALLOWED_CHAT_IDS   = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
@@ -913,6 +933,27 @@ class BybitRest:
             ]
 
 
+    async def instrument_linear(self, symbol: str) -> Dict[str, Any]:
+        """Fetch current Bybit contract specification for one linear symbol."""
+        url = f"{self.base}/v5/market/instruments-info"
+        params = {"category": "linear", "symbol": symbol}
+        async with self.http.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            body = await r.json()
+            if r.status != 200 or int(body.get("retCode", -1)) != 0:
+                raise RuntimeError(
+                    f"Bybit instruments-info failed HTTP {r.status}: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            rows = body.get("result", {}).get("list", []) or []
+            if not rows:
+                raise RuntimeError(f"No Bybit linear instrument info for {symbol}")
+            return rows[0]
+
+
 # ── Phase 9A: authenticated Bybit V5 RSA bridge (GET-only) ──────────────────
 
 class BybitPrivateReadOnly:
@@ -1601,6 +1642,405 @@ class CandidateDebug:
     regime:        str
     btc_regime:    str
     notes:         str = ""
+
+
+
+
+# =============================================================================
+# === 5A. PHASE 9B MINIMUM-SIZE EXECUTION PLANNER (SHADOW ONLY) ===
+# =============================================================================
+
+@dataclass
+class ExecutionPlan:
+    symbol: str
+    side: str
+    status: str
+    reason: str
+    entry_price: float
+    qty: float
+    tp1_qty: float
+    tp2_qty: float
+    notional_usdt: float
+    leverage: float
+    margin_required_usdt: float
+    equity_usdt: float
+    available_usdt: float
+    reserve_usdt: float
+    shadow_reserved_before_usdt: float
+    planner_available_before_usdt: float
+    planner_available_after_usdt: float
+    same_size_capacity: int
+    stop_loss: float
+    tp1: float
+    tp2: float
+    sl_distance_pct: float
+    loss_at_sl_usdt: float
+    account_risk_pct: float
+    tp1_profit_usdt: float
+    tp2_profit_usdt: float
+    min_order_qty: float
+    qty_step: float
+    min_notional_usdt: float
+    tick_size: float
+    instrument_max_leverage: float
+    open_positions: int
+    already_open_symbol: bool
+
+
+def _dec(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_CEILING)
+    return units * step
+
+
+def _round_to_tick(value: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return value
+    units = (value / tick).to_integral_value(rounding=ROUND_HALF_UP)
+    return units * tick
+
+
+def _step_decimals(step: Any) -> int:
+    d = _dec(step)
+    if d <= 0:
+        return 8
+    return max(0, -d.normalize().as_tuple().exponent)
+
+
+def _fmt_step(value: float, step: Any) -> str:
+    decimals = min(12, _step_decimals(step))
+    return f"{value:.{decimals}f}"
+
+
+def _execution_shadow_reservations(app: web.Application) -> Dict[str, Dict[str, Any]]:
+    runtime = app.get("runtime_state")
+    if not isinstance(runtime, dict):
+        return {}
+    reservations = runtime.get("execution_shadow_reservations")
+    if not isinstance(reservations, dict):
+        reservations = {}
+        runtime["execution_shadow_reservations"] = reservations
+    return reservations
+
+
+def _execution_shadow_reserved_total(
+    app: web.Application,
+    exclude_symbol: Optional[str] = None,
+) -> float:
+    reservations = _execution_shadow_reservations(app)
+    total = 0.0
+    for sym, row in reservations.items():
+        if exclude_symbol and sym == exclude_symbol:
+            continue
+        total += max(0.0, _safe_float(row.get("margin_usdt")))
+    return total
+
+
+def _update_execution_shadow_reservation(
+    app: web.Application,
+    idea: ActiveIdea,
+    event: str,
+) -> None:
+    """
+    Mirror the future 50/50 margin release in memory only.
+
+    TP1_HIT releases half of the shadow margin. Final lifecycle events release
+    the rest. This ledger exists only to make Phase 9B capacity checks realistic
+    while no actual Bybit positions are opened.
+    """
+    if not EXECUTION_PLANNER_ENABLED:
+        return
+    reservations = _execution_shadow_reservations(app)
+    row = reservations.get(idea.symbol)
+    if not isinstance(row, dict):
+        return
+
+    if event == "TP1_HIT":
+        if not row.get("tp1_released"):
+            row["margin_usdt"] = max(0.0, _safe_float(row.get("margin_usdt")) * 0.5)
+            row["tp1_released"] = True
+            row["updated_at"] = now_s()
+    elif event in ("TP2_HIT", "SL_HIT", "EXPIRED", "INVALIDATED", "AMBIGUOUS"):
+        reservations.pop(idea.symbol, None)
+
+
+def calculate_execution_plan(
+    idea: ActiveIdea,
+    instrument: Dict[str, Any],
+    wallet: Dict[str, Any],
+    positions: List[Dict[str, Any]],
+    shadow_reserved_before_usdt: float,
+) -> ExecutionPlan:
+    """
+    Pure Phase 9B sizing/risk calculation.
+
+    Policy:
+      - market-entry reference = price captured when the signal was emitted
+      - position size = smallest Bybit quantity that can be split 50/50
+      - each 50% leg is conservatively sized to satisfy minOrderQty and
+        minNotionalValue at the lowest relevant entry/TP price
+      - leverage plan = up to 2x (Phase 9B never sends a leverage change)
+      - 10% of total equity is kept outside planner allocation
+      - SL/TP are the strategy's own levels, rounded only to Bybit tick size
+      - there is NO artificial 1% stop/risk cap in Phase 9B
+    """
+    symbol = idea.symbol
+    side = idea.side
+
+    lot = instrument.get("lotSizeFilter") or {}
+    price_filter = instrument.get("priceFilter") or {}
+    leverage_filter = instrument.get("leverageFilter") or {}
+
+    min_qty = _dec(lot.get("minOrderQty"))
+    qty_step = _dec(lot.get("qtyStep"))
+    min_notional = _dec(lot.get("minNotionalValue"))
+    max_mkt_qty = _dec(lot.get("maxMktOrderQty"))
+    tick = _dec(price_filter.get("tickSize"))
+    instrument_max_lev = _dec(leverage_filter.get("maxLeverage"))
+
+    entry = _dec(idea.current_price_at_signal)
+    if entry <= 0:
+        entry = _dec((idea.entry_low + idea.entry_high) / 2.0)
+
+    sl = _round_to_tick(_dec(idea.stop_loss), tick)
+    tp1 = _round_to_tick(_dec(idea.tp1), tick)
+    tp2 = _round_to_tick(_dec(idea.tp2), tick)
+
+    equity = _dec(wallet.get("totalEquity"))
+    available = _dec(wallet.get("totalAvailableBalance"))
+    reserve = equity * _dec(EXECUTION_PLANNER_RESERVE_PCT) / Decimal("100")
+    alloc_cap = max(Decimal("0"), equity - reserve)
+    planner_available = max(
+        Decimal("0"),
+        min(available, alloc_cap) - _dec(shadow_reserved_before_usdt),
+    )
+
+    planned_lev = _dec(EXECUTION_PLANNER_LEVERAGE)
+    if instrument_max_lev > 0:
+        planned_lev = min(planned_lev, instrument_max_lev)
+    planned_lev = max(Decimal("1"), planned_lev)
+
+    open_positions = [p for p in positions if _safe_float(p.get("size")) > 0.0]
+    already_open = any(str(p.get("symbol") or "") == symbol for p in open_positions)
+
+    reason = "ok"
+    status = "EXECUTABLE"
+
+    if instrument.get("status") not in (None, "", "Trading"):
+        status, reason = "SKIPPED_INSTRUMENT", "instrument_not_trading"
+    elif entry <= 0 or qty_step <= 0 or min_qty <= 0 or min_notional <= 0:
+        status, reason = "SKIPPED_INSTRUMENT", "invalid_instrument_limits"
+    elif already_open:
+        status, reason = "SKIPPED_ALREADY_OPEN", "symbol_already_open"
+
+    # Geometry remains the Telegram bot's own strategy geometry.
+    if status == "EXECUTABLE":
+        if side == "LONG":
+            geometry_ok = sl < entry < tp1 and tp2 > tp1
+        else:
+            geometry_ok = sl > entry > tp1 and tp2 < tp1
+        if not geometry_ok:
+            status, reason = "SKIPPED_GEOMETRY", "signal_geometry_invalid_after_tick_rounding"
+
+    # Make each 50% close leg independently valid under current Bybit minimums.
+    relevant_prices = [x for x in (entry, tp1, tp2) if x > 0]
+    worst_price = min(relevant_prices) if relevant_prices else Decimal("0")
+    half_by_notional = min_notional / worst_price if worst_price > 0 else Decimal("0")
+    half_qty = _ceil_to_step(max(min_qty, half_by_notional), qty_step)
+    total_qty = half_qty * Decimal("2")
+    notional = total_qty * entry
+    margin_required = notional / planned_lev if planned_lev > 0 else notional
+
+    if status == "EXECUTABLE" and max_mkt_qty > 0 and total_qty > max_mkt_qty:
+        status, reason = "SKIPPED_SIZE_LIMIT", "minimum_50_50_qty_above_max_market_qty"
+    if status == "EXECUTABLE" and margin_required > planner_available:
+        status, reason = "SKIPPED_NO_MARGIN", "insufficient_margin_after_10pct_reserve"
+
+    sl_distance = abs(entry - sl)
+    sl_pct = (sl_distance / entry * Decimal("100")) if entry > 0 else Decimal("0")
+    loss_at_sl = total_qty * sl_distance
+    account_risk = loss_at_sl / equity * Decimal("100") if equity > 0 else Decimal("0")
+    tp1_profit = half_qty * abs(tp1 - entry)
+    tp2_profit = half_qty * abs(tp2 - entry)
+
+    if margin_required > 0:
+        same_size_capacity = int(planner_available // margin_required)
+    else:
+        same_size_capacity = 0
+
+    after = planner_available
+    if status == "EXECUTABLE":
+        after = max(Decimal("0"), planner_available - margin_required)
+
+    return ExecutionPlan(
+        symbol=symbol,
+        side=side,
+        status=status,
+        reason=reason,
+        entry_price=float(entry),
+        qty=float(total_qty),
+        tp1_qty=float(half_qty),
+        tp2_qty=float(half_qty),
+        notional_usdt=float(notional),
+        leverage=float(planned_lev),
+        margin_required_usdt=float(margin_required),
+        equity_usdt=float(equity),
+        available_usdt=float(available),
+        reserve_usdt=float(reserve),
+        shadow_reserved_before_usdt=float(_dec(shadow_reserved_before_usdt)),
+        planner_available_before_usdt=float(planner_available),
+        planner_available_after_usdt=float(after),
+        same_size_capacity=max(0, same_size_capacity),
+        stop_loss=float(sl),
+        tp1=float(tp1),
+        tp2=float(tp2),
+        sl_distance_pct=float(sl_pct),
+        loss_at_sl_usdt=float(loss_at_sl),
+        account_risk_pct=float(account_risk),
+        tp1_profit_usdt=float(tp1_profit),
+        tp2_profit_usdt=float(tp2_profit),
+        min_order_qty=float(min_qty),
+        qty_step=float(qty_step),
+        min_notional_usdt=float(min_notional),
+        tick_size=float(tick),
+        instrument_max_leverage=float(instrument_max_lev),
+        open_positions=len(open_positions),
+        already_open_symbol=already_open,
+    )
+
+
+async def build_execution_plan(
+    app: web.Application,
+    idea: ActiveIdea,
+    state: SymbolState,
+    reserve_shadow_margin: bool = False,
+) -> Tuple[ExecutionPlan, Dict[str, Any]]:
+    if not EXECUTION_PLANNER_ENABLED:
+        raise RuntimeError("Phase 9B execution planner is disabled")
+
+    rest = app.get("rest")
+    private = app.get("bybit_private")
+    if not isinstance(rest, BybitRest):
+        raise RuntimeError("Bybit public REST client unavailable")
+    if not isinstance(private, BybitPrivateReadOnly):
+        raise RuntimeError("Bybit private read-only bridge unavailable")
+
+    instrument, wallet, positions = await asyncio.gather(
+        rest.instrument_linear(idea.symbol),
+        private.wallet_balance(),
+        private.positions_linear(),
+    )
+
+    # Existing reservation for this same idea must not be counted twice when
+    # /plan is requested after the automatic Phase 9B plan was already sent.
+    reserved_other = _execution_shadow_reserved_total(app, exclude_symbol=idea.symbol)
+    plan = calculate_execution_plan(idea, instrument, wallet, positions, reserved_other)
+
+    if reserve_shadow_margin and plan.status == "EXECUTABLE":
+        reservations = _execution_shadow_reservations(app)
+        if idea.symbol not in reservations:
+            reservations[idea.symbol] = {
+                "margin_usdt": plan.margin_required_usdt,
+                "original_margin_usdt": plan.margin_required_usdt,
+                "notional_usdt": plan.notional_usdt,
+                "qty": plan.qty,
+                "emitted_at": idea.emitted_at,
+                "tp1_released": False,
+                "updated_at": now_s(),
+            }
+    return plan, instrument
+
+
+def format_execution_plan(plan: ExecutionPlan, instrument: Dict[str, Any]) -> str:
+    qty_step = (instrument.get("lotSizeFilter") or {}).get("qtyStep") or plan.qty_step
+    tick = (instrument.get("priceFilter") or {}).get("tickSize") or plan.tick_size
+
+    if plan.status == "EXECUTABLE":
+        status_line = "✅ <b>EXECUTABLE — SHADOW ONLY</b>"
+    elif plan.status == "SKIPPED_NO_MARGIN":
+        status_line = "⛔ <b>SKIPPED — NO MARGIN</b>"
+    elif plan.status == "SKIPPED_ALREADY_OPEN":
+        status_line = "⛔ <b>SKIPPED — SYMBOL ALREADY OPEN</b>"
+    else:
+        status_line = f"⛔ <b>{html.escape(plan.status)}</b>"
+
+    qty = _fmt_step(plan.qty, qty_step)
+    q1 = _fmt_step(plan.tp1_qty, qty_step)
+    q2 = _fmt_step(plan.tp2_qty, qty_step)
+    sl = _fmt_step(plan.stop_loss, tick)
+    tp1 = _fmt_step(plan.tp1, tick)
+    tp2 = _fmt_step(plan.tp2, tick)
+
+    return (
+        "🧮 <b>Execution Plan — Phase 9B</b>\n\n"
+        f"<b>{html.escape(plan.symbol)} {html.escape(plan.side)}</b>\n"
+        f"<b>Status:</b> {status_line}\n"
+        f"<b>Reason:</b> <code>{html.escape(plan.reason)}</code>\n\n"
+        f"<b>Entry:</b> Market @ signal reference {plan.entry_price:.6g}\n"
+        f"<b>Qty:</b> <code>{html.escape(qty)}</code> · "
+        f"<b>Notional:</b> ${plan.notional_usdt:.2f}\n"
+        f"<b>Planned leverage:</b> {plan.leverage:.2f}x "
+        "<i>(not changed by Phase 9B)</i>\n"
+        f"<b>Estimated margin:</b> ${plan.margin_required_usdt:.2f}\n\n"
+        f"<b>SL:</b> <code>{html.escape(sl)}</code> · {plan.sl_distance_pct:.2f}% from entry\n"
+        f"<b>Loss at SL:</b> ~${plan.loss_at_sl_usdt:.3f} · "
+        f"{plan.account_risk_pct:.2f}% of equity\n"
+        f"<b>TP1:</b> <code>{html.escape(tp1)}</code> · qty {html.escape(q1)} (50%) · "
+        f"~${plan.tp1_profit_usdt:.3f}\n"
+        f"<b>TP2:</b> <code>{html.escape(tp2)}</code> · qty {html.escape(q2)} (50%) · "
+        f"~${plan.tp2_profit_usdt:.3f}\n\n"
+        f"<b>Equity:</b> ${plan.equity_usdt:.2f} · "
+        f"<b>Bybit available:</b> ${plan.available_usdt:.2f}\n"
+        f"<b>10% reserve:</b> ${plan.reserve_usdt:.2f}\n"
+        f"<b>Shadow reserved before:</b> ${plan.shadow_reserved_before_usdt:.2f}\n"
+        f"<b>Planner margin before:</b> ${plan.planner_available_before_usdt:.2f}\n"
+        f"<b>Planner margin after:</b> ${plan.planner_available_after_usdt:.2f}\n"
+        f"<b>Same-size capacity before this plan:</b> {plan.same_size_capacity}\n\n"
+        f"<b>Bybit minimums:</b> qty {plan.min_order_qty:g} · "
+        f"step {plan.qty_step:g} · notional ${plan.min_notional_usdt:g}\n"
+        "<b>ORDER NOT SENT.</b> Phase 9B contains no Bybit write endpoints. ✅"
+    )
+
+
+async def send_execution_plan(
+    app: web.Application,
+    idea: ActiveIdea,
+    state: SymbolState,
+    reserve_shadow_margin: bool = True,
+) -> None:
+    if not EXECUTION_PLANNER_ENABLED or not EXECUTION_PLANNER_AUTO_SEND:
+        return
+    tg = app.get("tg")
+    if not isinstance(tg, Tg):
+        return
+
+    try:
+        plan, instrument = await build_execution_plan(
+            app, idea, state, reserve_shadow_margin=reserve_shadow_margin
+        )
+        text = format_execution_plan(plan, instrument)
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9B execution plan failed {idea.symbol}: {type(exc).__name__}: {exc}"
+        )
+        text = (
+            "⚠️ <b>Execution Plan — Phase 9B failed</b>\n\n"
+            f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n\n"
+            "<b>ORDER NOT SENT.</b>"
+        )
+
+    for cid in get_broadcast_targets():
+        with contextlib.suppress(Exception):
+            await tg.send(cid, text)
 
 
 
@@ -5167,6 +5607,17 @@ async def scan_symbol(
             except Exception as e:
                 logger.warning(f"send_signal failed {sym}: {e}")
                 await report_error(app, f"send_signal/{sym}", e)
+
+            # Phase 9B is downstream of the existing signal engine. It cannot
+            # create or block an ActiveIdea and never calls a Bybit write endpoint.
+            if EXECUTION_PLANNER_ENABLED and EXECUTION_PLANNER_AUTO_SEND:
+                try:
+                    await send_execution_plan(
+                        app, idea, state, reserve_shadow_margin=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Phase 9B auto-plan failed {sym}: {e}")
+                    await report_error(app, f"execution_plan/{sym}", e)
             return
 
         # ── No actionable — check for signal-eligible pending (Phase 8L) ──────
@@ -5843,7 +6294,11 @@ async def send_idea_update(
     """
     Send a lifecycle-event message via get_broadcast_targets().
     Returns silently when no targets are configured or tg is unavailable.
+
+    Phase 9B also mirrors future 50/50 margin release in an in-memory
+    shadow ledger. This does not touch Bybit or alter strategy lifecycle.
     """
+    _update_execution_shadow_reservation(app, idea, event)
     tg: Optional[Tg] = app.get("tg")
     if tg is None:
         return
@@ -5924,6 +6379,13 @@ async def tg_loop(app: web.Application) -> None:
                         await tg.send(cid, "⛔ Unauthorized.")
                     else:
                         await _cmd_bybit(app, cid)
+                elif text.startswith("/plan"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split(maxsplit=1)
+                        sym = parts[1].upper().strip() if len(parts) > 1 else ""
+                        await _cmd_plan(app, cid, sym)
                 elif text in ("/statsdb", "/rawstats"):
                     await _cmd_statsdb(app, cid)
                 elif text in ("/brtp", "/detstats"):
@@ -6058,6 +6520,39 @@ async def _cmd_bybit(app: web.Application, cid: int) -> None:
     ))
 
 
+async def _cmd_plan(app: web.Application, cid: int, sym: str) -> None:
+    """Build a fresh Phase 9B plan for an existing active idea."""
+    tg: Tg = app["tg"]
+    mkt: Market = app["mkt"]
+
+    if not EXECUTION_PLANNER_ENABLED:
+        await tg.send(cid, "⚠️ <b>Phase 9B execution planner is disabled.</b>")
+        return
+    if not sym:
+        await tg.send(cid, "Usage: <code>/plan BTCUSDT</code>")
+        return
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+
+    state = mkt.state.get(sym)
+    if state is None or state.active_idea is None:
+        await tg.send(cid, f"No active idea for <b>{html.escape(sym)}</b>.")
+        return
+
+    idea = state.active_idea
+    try:
+        plan, instrument = await build_execution_plan(
+            app, idea, state, reserve_shadow_margin=False
+        )
+        await tg.send(cid, format_execution_plan(plan, instrument))
+    except Exception as exc:
+        await tg.send(
+            cid,
+            "❌ <b>Phase 9B plan failed</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
+        )
+
+
 async def _cmd_status(app: web.Application, cid: int) -> None:
     tg:  Tg     = app["tg"]
     mkt: Market = app["mkt"]
@@ -6085,7 +6580,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner"
     ))
 
 
@@ -7087,6 +7582,12 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Diagnostics DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
         f"<b>Raw outcome window:</b> {DIAGNOSTICS_OUTCOME_DAYS} days after entry (Phase 8L.4)\n"
         f"<b>Bybit private bridge:</b> {'GET-only enabled' if BYBIT_PRIVATE_READONLY_ENABLED else 'off'} (Phase 9A)\n"
+        f"<b>Execution planner:</b> {'enabled' if EXECUTION_PLANNER_ENABLED else 'off'} (Phase 9B)\n"
+        f"<b>Planner leverage:</b> {EXECUTION_PLANNER_LEVERAGE:.1f}x · "
+        f"<b>equity reserve:</b> {EXECUTION_PLANNER_RESERVE_PCT:.0f}% · "
+        f"<b>TP split:</b> 50/50\n"
+        f"<b>Planner auto-send:</b> {'yes' if EXECUTION_PLANNER_AUTO_SEND else 'no'} · "
+        f"<b>Bybit writes:</b> disabled by code\n"
         f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
         f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
@@ -7419,7 +7920,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
-        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge)"
+        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -7530,6 +8031,9 @@ async def on_startup(app: web.Application) -> None:
         "apikey_reminder_state": _load_apikey_reminder_state(
             BYBIT_API_REMINDER_STATE_PATH
         ),
+        # Phase 9B shadow-only margin ledger. It intentionally resets on
+        # redeploy because Phase 9B never creates a real Bybit position.
+        "execution_shadow_reservations": {},
     }
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
@@ -7589,9 +8093,12 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8M</b> calibration review / cohort readiness: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n"
                 f"<b>Phase 9A</b> Bybit RSA read-only bridge: "
-                f"{'connected ✅' if bybit_bridge_status.get('api_ok') else ('configured ⚠️' if bybit_bridge_status.get('configured') else 'off ⚪')}\n\n"
+                f"{'connected ✅' if bybit_bridge_status.get('api_ok') else ('configured ⚠️' if bybit_bridge_status.get('configured') else 'off ⚪')}\n"
+                f"<b>Phase 9B</b> minimum-size execution planner: "
+                f"{'active ✅' if EXECUTION_PLANNER_ENABLED else 'off ⚪'} · "
+                f"{EXECUTION_PLANNER_LEVERAGE:.1f}x plan · {EXECUTION_PLANNER_RESERVE_PCT:.0f}% reserve · 50/50 · no orders\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /apikey /bybit /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
+                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
 
 
@@ -7907,6 +8414,65 @@ def _selftest_phase_9a_readonly_bridge() -> None:
     assert bybit_api_expiry(ip_info)["status"] == "ACTIVE_IP_BOUND"
 
 
+def _selftest_phase_9b_execution_planner() -> None:
+    """Minimum sizing must be 50/50-safe and respect reserve/margin."""
+    idea = ActiveIdea(
+        symbol="TESTUSDT",
+        side="LONG",
+        setup_type="LIQUIDITY_SWEEP",
+        setup_score=80,
+        entry_low=99.0,
+        entry_high=101.0,
+        stop_loss=95.0,
+        tp1=105.0,
+        tp2=110.0,
+        rr_tp1=1.0,
+        rr_tp2=2.0,
+        status="ACTIVE",
+        emitted_at=1,
+        expires_at=2,
+        invalidation="test",
+        current_price_at_signal=100.0,
+    )
+    instrument = {
+        "symbol": "TESTUSDT",
+        "status": "Trading",
+        "lotSizeFilter": {
+            "minOrderQty": "0.01",
+            "qtyStep": "0.01",
+            "minNotionalValue": "5",
+            "maxMktOrderQty": "1000",
+        },
+        "priceFilter": {"tickSize": "0.1"},
+        "leverageFilter": {"maxLeverage": "10"},
+    }
+    wallet = {"totalEquity": "30", "totalAvailableBalance": "30"}
+
+    p = calculate_execution_plan(idea, instrument, wallet, [], 0.0)
+    assert p.status == "EXECUTABLE"
+    assert p.tp1_qty == p.tp2_qty
+    assert abs(p.qty - (p.tp1_qty + p.tp2_qty)) < 1e-12
+    # Each 50% close leg is safe against the $5 notional floor at the
+    # worst relevant price, so the total position is at least about $10.
+    assert p.notional_usdt >= 10.0
+    assert abs(p.leverage - 2.0) < 1e-9
+    assert abs(p.reserve_usdt - 3.0) < 1e-9
+    assert p.margin_required_usdt <= 27.0
+    assert p.loss_at_sl_usdt > 0.0
+
+    p2 = calculate_execution_plan(
+        idea,
+        instrument,
+        wallet,
+        [{"symbol": "TESTUSDT", "size": "1", "side": "Buy"}],
+        0.0,
+    )
+    assert p2.status == "SKIPPED_ALREADY_OPEN"
+
+    p3 = calculate_execution_plan(idea, instrument, wallet, [], 26.0)
+    assert p3.status == "SKIPPED_NO_MARGIN"
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -7928,4 +8494,5 @@ if __name__ == "__main__":
     _selftest_phase_8m_calibration_helpers()
     _selftest_phase_8l41_trace_nonintrusive()
     _selftest_phase_9a_readonly_bridge()
+    _selftest_phase_9b_execution_planner()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
