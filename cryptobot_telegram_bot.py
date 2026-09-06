@@ -29,6 +29,7 @@ Phase 8L.3 rollback: restore Phase 8L signal-flow thresholds while preserving te
 Phase 8L.4.1 Diagnostic: persistent SQLite raw-setup/score/outcome statistics + BR/TP internal-stage telemetry (no trading-rule changes)
 Phase 8L.4.3 Diagnostic: TP pullback-length distribution + score-bucket outcome analyzer (no trading-rule changes)
 Phase 8M Calibration Review: BR/TP cohort readiness + calibration summaries (diagnostic only; no trading-rule changes)
+Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /bybit · expiry reminders (GET-only; no order endpoints; no trading-rule changes)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -45,8 +46,10 @@ Closed-candle rule (hard):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import html
+import math
 import json
 import logging
 import os
@@ -56,9 +59,12 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 
 import aiohttp
 from aiohttp import web
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 # =============================================================================
 # === 1. CONFIG ===
@@ -77,6 +83,24 @@ def _bool_env(name: str, default: bool) -> bool:
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# ── Phase 9A: authenticated Bybit read-only bridge ────────────────────────────
+# The API key itself may have Order/Position permissions, but this phase only
+# implements authenticated GET endpoints.  There is intentionally no method
+# for order create/amend/cancel, leverage changes, transfers, or withdrawals.
+BYBIT_PRIVATE_READONLY_ENABLED = _bool_env("BYBIT_PRIVATE_READONLY_ENABLED", True)
+BYBIT_API_KEY = (os.getenv("BYBIT_API_KEY") or "").strip()
+BYBIT_PRIVATE_KEY_PATH = (
+    os.getenv("BYBIT_PRIVATE_KEY_PATH") or "/run/secrets/bybit_private_key.pem"
+).strip()
+BYBIT_RECV_WINDOW = int(os.getenv("BYBIT_RECV_WINDOW", "5000"))
+BYBIT_API_REMINDER_CHECK_SEC = int(os.getenv("BYBIT_API_REMINDER_CHECK_SEC", "21600"))
+BYBIT_API_REMINDER_STATE_PATH = (
+    os.getenv("BYBIT_API_REMINDER_STATE_PATH")
+    or "/data/bybit_apikey_reminders.json"
+).strip()
+BYBIT_API_REMINDER_THRESHOLDS: Tuple[int, ...] = (30, 21, 14, 7, 1)
 
 
 ALLOWED_CHAT_IDS   = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
@@ -823,6 +847,7 @@ def command_keyboard() -> Dict[str, Any]:
         "keyboard": [
             [{"text": "/status"}, {"text": "/regime"}],
             [{"text": "/ideas"},  {"text": "/config"}],
+            [{"text": "/apikey"}, {"text": "/bybit"}],
             [{"text": "/diag"},   {"text": "/ping"}],
         ],
         "resize_keyboard":   True,
@@ -886,6 +911,339 @@ class BybitRest:
                 )
                 for it in reversed(raw)
             ]
+
+
+# ── Phase 9A: authenticated Bybit V5 RSA bridge (GET-only) ──────────────────
+
+class BybitPrivateReadOnly:
+    """
+    Authenticated Bybit V5 RSA client intentionally limited to GET endpoints.
+
+    Security boundary for Phase 9A:
+      - supported: API-key info, Unified wallet balance, linear positions
+      - not implemented: create/amend/cancel order, leverage/margin changes,
+        transfers, withdrawals, or any other state-changing endpoint
+
+    RSA signing follows Bybit V5: timestamp + api_key + recv_window + queryString,
+    signed with RSA-SHA256 / PKCS#1 v1.5 and base64 encoded.
+    """
+
+    def __init__(
+        self,
+        base: str,
+        http: aiohttp.ClientSession,
+        api_key: str,
+        private_key_path: str,
+        recv_window: int = 5000,
+    ) -> None:
+        self.base = base.rstrip("/")
+        self.http = http
+        self.api_key = api_key.strip()
+        self.private_key_path = private_key_path.strip()
+        self.recv_window = int(recv_window)
+        self._private_key: Any = None
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key and self.private_key_path)
+
+    def _load_private_key(self) -> Any:
+        if self._private_key is not None:
+            return self._private_key
+        if not self.private_key_path:
+            raise RuntimeError("BYBIT_PRIVATE_KEY_PATH is empty")
+        try:
+            with open(self.private_key_path, "rb") as fh:
+                pem = fh.read()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Bybit RSA private key is not readable at {self.private_key_path}"
+            ) from exc
+        try:
+            self._private_key = serialization.load_pem_private_key(pem, password=None)
+        except Exception as exc:
+            raise RuntimeError("Bybit RSA private key is not a valid unencrypted PEM key") from exc
+        return self._private_key
+
+    def _sign_get(self, timestamp_ms: int, query_string: str) -> str:
+        key = self._load_private_key()
+        payload = (
+            f"{timestamp_ms}{self.api_key}{self.recv_window}{query_string}"
+        ).encode("utf-8")
+        signature = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+        return base64.b64encode(signature).decode("ascii")
+
+    async def _get(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("BYBIT_API_KEY is empty")
+
+        clean_params = {
+            str(k): v for k, v in (params or {}).items() if v is not None
+        }
+        # Match pybit/Bybit examples: deterministic alphabetical query order.
+        query_string = urlencode(sorted(clean_params.items()), doseq=True)
+        timestamp_ms = now_ms()
+        signature = self._sign_get(timestamp_ms, query_string)
+        headers = {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-TIMESTAMP": str(timestamp_ms),
+            "X-BAPI-RECV-WINDOW": str(self.recv_window),
+            "Accept": "application/json",
+        }
+        url = f"{self.base}{path}"
+        if query_string:
+            url += f"?{query_string}"
+
+        async with self.http.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as response:
+            try:
+                body = await response.json()
+            except Exception as exc:
+                raw = await response.text()
+                raise RuntimeError(
+                    f"Bybit private GET {path} returned non-JSON HTTP {response.status}: "
+                    f"{raw[:200]}"
+                ) from exc
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Bybit private GET {path} HTTP {response.status}: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            if int(body.get("retCode", -1)) != 0:
+                raise RuntimeError(
+                    f"Bybit private GET {path} failed: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            return body
+
+    async def api_key_info(self) -> Dict[str, Any]:
+        body = await self._get("/v5/user/query-api")
+        return body.get("result", {}) or {}
+
+    async def wallet_balance(self) -> Dict[str, Any]:
+        body = await self._get(
+            "/v5/account/wallet-balance",
+            {"accountType": "UNIFIED", "coin": "USDT"},
+        )
+        rows = body.get("result", {}).get("list", []) or []
+        return rows[0] if rows else {}
+
+    async def positions_linear(self) -> List[Dict[str, Any]]:
+        body = await self._get(
+            "/v5/position/list",
+            {"category": "linear", "settleCoin": "USDT", "limit": 200},
+        )
+        rows = body.get("result", {}).get("list", []) or []
+        # Bybit normally returns only size>0 when settleCoin is supplied; keep a
+        # defensive size filter so /bybit never counts empty placeholder rows.
+        return [r for r in rows if _safe_float(r.get("size")) > 0.0]
+
+    async def health_snapshot(self) -> Dict[str, Any]:
+        """Query all Phase-9A read endpoints independently; never writes state."""
+        out: Dict[str, Any] = {
+            "api_key_info": None,
+            "wallet": None,
+            "positions": None,
+            "errors": {},
+        }
+        for name, fn in (
+            ("api_key_info", self.api_key_info),
+            ("wallet", self.wallet_balance),
+            ("positions", self.positions_linear),
+        ):
+            try:
+                out[name] = await fn()
+            except Exception as exc:
+                out["errors"][name] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_bybit_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    # 1970 is Bybit's common sentinel for "no finite expiry reported".
+    if dt.year <= 1971:
+        return None
+    return dt
+
+
+def bybit_api_expiry(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Bybit deadlineDay/expiredAt into a safe display/reminder model."""
+    ips = info.get("ips") or []
+    expired_dt = _parse_bybit_datetime(info.get("expiredAt"))
+
+    days_left: Optional[int] = None
+    raw_deadline = info.get("deadlineDay")
+    try:
+        deadline = int(raw_deadline)
+    except (TypeError, ValueError):
+        deadline = -999999
+
+    if deadline >= 0:
+        days_left = deadline
+    elif expired_dt is not None:
+        seconds = (expired_dt - datetime.now(timezone.utc)).total_seconds()
+        days_left = max(0, int(math.ceil(seconds / 86400.0)))
+
+    if days_left is not None:
+        status = "EXPIRED" if days_left <= 0 else "ACTIVE"
+    elif ips:
+        status = "ACTIVE_IP_BOUND"
+    else:
+        status = "UNKNOWN"
+
+    return {
+        "status": status,
+        "days_left": days_left,
+        "expired_dt": expired_dt,
+        "expired_at": expired_dt.strftime("%Y-%m-%d %H:%M UTC") if expired_dt else None,
+        "ips_bound": len(ips),
+    }
+
+
+def _apikey_expiry_identity(info: Dict[str, Any], expiry: Dict[str, Any]) -> str:
+    """Stable identifier that changes after key replacement or expiry renewal."""
+    expired_at = expiry.get("expired_at") or "no-expiry"
+    created_at = str(info.get("createdAt") or "unknown-created")
+    # Do not persist the API key itself in the reminder state file.
+    return f"{created_at}|{expired_at}"
+
+
+def _select_apikey_reminder_threshold(days_left: int, already_sent: Set[int]) -> Optional[int]:
+    """
+    Pick the most relevant newly crossed threshold.
+
+    Example: if the bot was offline at day 21 and returns at day 13, send the
+    14-day warning (not stale 30/21-day warnings).  Larger crossed thresholds
+    are marked sent together after successful delivery.
+    """
+    due = [
+        t for t in BYBIT_API_REMINDER_THRESHOLDS
+        if days_left <= t and t not in already_sent
+    ]
+    return min(due) if due else None
+
+
+def _load_apikey_reminder_state(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_apikey_reminder_state(path: str, state: Dict[str, Any]) -> None:
+    try:
+        parent = os.path.dirname(path) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning(
+            f"Bybit API reminder state could not be persisted at {path}: {exc}"
+        )
+
+
+async def maybe_send_apikey_expiry_reminder(
+    app: web.Application,
+    info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Send at most one current 30/21/14/7/1-day warning per expiry cycle."""
+    client = app.get("bybit_private")
+    if not isinstance(client, BybitPrivateReadOnly):
+        return
+
+    if info is None:
+        info = await client.api_key_info()
+    expiry = bybit_api_expiry(info)
+    days_left = expiry.get("days_left")
+    if days_left is None or days_left > max(BYBIT_API_REMINDER_THRESHOLDS):
+        return
+
+    runtime_state = app.get("runtime_state") or {}
+    state = runtime_state.get("apikey_reminder_state")
+    if not isinstance(state, dict):
+        state = _load_apikey_reminder_state(BYBIT_API_REMINDER_STATE_PATH)
+        runtime_state["apikey_reminder_state"] = state
+
+    expiry_id = _apikey_expiry_identity(info, expiry)
+    if state.get("expiry_id") != expiry_id:
+        state.clear()
+        state.update({"expiry_id": expiry_id, "sent_thresholds": []})
+
+    already_sent = {
+        int(x) for x in state.get("sent_thresholds", [])
+        if isinstance(x, (int, float, str)) and str(x).lstrip("-").isdigit()
+    }
+    threshold = _select_apikey_reminder_threshold(int(days_left), already_sent)
+    if threshold is None:
+        return
+
+    expiry_text = expiry.get("expired_at") or "not reported"
+    text = (
+        "⚠️ <b>Bybit API key expiry</b>\n\n"
+        f"<b>Remaining:</b> {int(days_left)} day{'s' if int(days_left) != 1 else ''}\n"
+        f"<b>Expires:</b> {html.escape(expiry_text)}\n\n"
+        "Renew the key validity in Bybit before expiry. Check anytime with /apikey."
+    )
+    delivered = False
+    for chat_id in get_broadcast_targets():
+        with contextlib.suppress(Exception):
+            delivered = (await app["tg"].send(chat_id, text)) or delivered
+
+    if delivered:
+        # Mark the selected threshold and any older/larger threshold as handled,
+        # preventing catch-up spam after downtime.
+        handled = {
+            t for t in BYBIT_API_REMINDER_THRESHOLDS if t >= threshold
+        }
+        already_sent.update(handled)
+        state["sent_thresholds"] = sorted(already_sent, reverse=True)
+        state["last_days_left"] = int(days_left)
+        state["last_sent_ts"] = now_s()
+        _save_apikey_reminder_state(BYBIT_API_REMINDER_STATE_PATH, state)
+
+
+async def apikey_reminder_loop(app: web.Application) -> None:
+    """Periodic key-expiry watcher.  GET-only and isolated from trading logic."""
+    while True:
+        try:
+            await asyncio.sleep(max(3600, BYBIT_API_REMINDER_CHECK_SEC))
+            await maybe_send_apikey_expiry_reminder(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"Bybit API expiry check failed: {type(exc).__name__}: {exc}"
+            )
 
 
 # =============================================================================
@@ -5556,6 +5914,16 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_config(app, cid)
                 elif text == "/diag":
                     await _cmd_diag(app, cid)
+                elif text == "/apikey":
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await _cmd_apikey(app, cid)
+                elif text in ("/bybit", "/account"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await _cmd_bybit(app, cid)
                 elif text in ("/statsdb", "/rawstats"):
                     await _cmd_statsdb(app, cid)
                 elif text in ("/brtp", "/detstats"):
@@ -5577,6 +5945,118 @@ async def tg_loop(app: web.Application) -> None:
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
+
+async def _cmd_apikey(app: web.Application, cid: int) -> None:
+    """Show Bybit API-key validity without exposing the key itself."""
+    tg: Tg = app["tg"]
+    client = app.get("bybit_private")
+    if not isinstance(client, BybitPrivateReadOnly):
+        await tg.send(
+            cid,
+            "⚠️ <b>Bybit RSA bridge is not configured.</b>\n"
+            "Check BYBIT_API_KEY and the private-key secret file.",
+        )
+        return
+    try:
+        info = await client.api_key_info()
+        expiry = bybit_api_expiry(info)
+    except Exception as exc:
+        await tg.send(
+            cid,
+            "❌ <b>Bybit API check failed.</b>\n"
+            f"<code>{html.escape(str(exc)[:500])}</code>",
+        )
+        return
+
+    status = expiry["status"]
+    if status == "ACTIVE":
+        status_text = "✅ ACTIVE"
+    elif status == "ACTIVE_IP_BOUND":
+        status_text = "✅ ACTIVE · IP-bound"
+    elif status == "EXPIRED":
+        status_text = "❌ EXPIRED"
+    else:
+        status_text = "⚠️ UNKNOWN"
+
+    days = expiry.get("days_left")
+    days_text = f"{days} days" if days is not None else "not reported"
+    expiry_text = expiry.get("expired_at") or (
+        "no finite expiry reported" if expiry.get("ips_bound") else "not reported"
+    )
+    permissions = info.get("permissions") or {}
+    contract = permissions.get("ContractTrade") or []
+    perm_text = ", ".join(str(x) for x in contract) or "none"
+    key_mode = "Read-only" if int(info.get("readOnly", 0) or 0) == 1 else "Read-write"
+
+    await tg.send(cid, (
+        "🔐 <b>Bybit API Key</b>\n\n"
+        f"<b>Status:</b> {status_text}\n"
+        f"<b>Remaining:</b> {html.escape(days_text)}\n"
+        f"<b>Expiration:</b> {html.escape(expiry_text)}\n"
+        f"<b>API-key mode:</b> {html.escape(key_mode)}\n"
+        f"<b>Contract permissions:</b> {html.escape(perm_text)}\n"
+        f"<b>IP bindings:</b> {expiry.get('ips_bound', 0)}\n"
+        "<b>Bot bridge:</b> GET-only (Phase 9A) ✅"
+    ))
+
+
+async def _cmd_bybit(app: web.Application, cid: int) -> None:
+    """Read-only authenticated Bybit account snapshot: key, wallet, positions."""
+    tg: Tg = app["tg"]
+    client = app.get("bybit_private")
+    if not isinstance(client, BybitPrivateReadOnly):
+        await tg.send(cid, "⚠️ <b>Bybit RSA bridge is not configured.</b>")
+        return
+
+    snap = await client.health_snapshot()
+    errors = snap.get("errors") or {}
+    info = snap.get("api_key_info") or {}
+    wallet = snap.get("wallet") or {}
+    positions = snap.get("positions") or []
+
+    if info:
+        expiry = bybit_api_expiry(info)
+        days = expiry.get("days_left")
+        key_line = (
+            f"✅ API authenticated · {days}d left"
+            if days is not None else "✅ API authenticated"
+        )
+    else:
+        key_line = "❌ API-key info unavailable"
+
+    if wallet:
+        equity = _safe_float(wallet.get("totalEquity"))
+        available = _safe_float(wallet.get("totalAvailableBalance"))
+        wallet_line = f"${equity:.2f} equity · ${available:.2f} available"
+    else:
+        wallet_line = "unavailable"
+
+    pos_lines: List[str] = []
+    for pos in positions[:5]:
+        sym = html.escape(str(pos.get("symbol") or "?"))
+        side = html.escape(str(pos.get("side") or "?"))
+        size = html.escape(str(pos.get("size") or "0"))
+        upl = _safe_float(pos.get("unrealisedPnl"))
+        pos_lines.append(f"  {sym} {side} · size {size} · uPnL {upl:+.2f}")
+    positions_text = "\n".join(pos_lines) if pos_lines else "  none"
+
+    error_text = ""
+    if errors:
+        compact = "; ".join(
+            f"{k}: {str(v)[:180]}" for k, v in sorted(errors.items())
+        )
+        error_text = f"\n\n⚠️ <b>Partial errors:</b> <code>{html.escape(compact)}</code>"
+
+    await tg.send(cid, (
+        "🏦 <b>Bybit Read-Only Bridge — Phase 9A</b>\n\n"
+        f"<b>API:</b> {key_line}\n"
+        f"<b>Unified account:</b> {html.escape(wallet_line)}\n"
+        f"<b>Open USDT-perp positions:</b> {len(positions)}\n"
+        f"{positions_text}\n\n"
+        "<b>Trading actions:</b> disabled by code — GET endpoints only ✅"
+        + error_text
+    ))
+
 
 async def _cmd_status(app: web.Application, cid: int) -> None:
     tg:  Tg     = app["tg"]
@@ -6605,7 +7085,10 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Post-confirmation TP/SL boundary:</b> enabled (Phase 8L.2)\n"
         f"<b>Persistent raw diagnostics:</b> {'enabled' if DIAGNOSTICS_DB_ENABLED else 'off'}\n"
         f"<b>Diagnostics DB:</b> <code>{html.escape(DIAGNOSTICS_DB_PATH)}</code>\n"
-        f"<b>Raw outcome window:</b> {DIAGNOSTICS_OUTCOME_DAYS} days after entry (Phase 8L.4)"
+        f"<b>Raw outcome window:</b> {DIAGNOSTICS_OUTCOME_DAYS} days after entry (Phase 8L.4)\n"
+        f"<b>Bybit private bridge:</b> {'GET-only enabled' if BYBIT_PRIVATE_READONLY_ENABLED else 'off'} (Phase 9A)\n"
+        f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
+        f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
 
 
@@ -6935,7 +7418,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.1 temporal/lifecycle/quality hotfix · "
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
-        "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer)"
+        "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
+        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -6950,6 +7434,49 @@ async def on_startup(app: web.Application) -> None:
     app["http"] = http
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
     app["rest"] = BybitRest(BYBIT_REST, http)
+
+    # Phase 9A authenticated bridge is non-critical and GET-only.  Failure here
+    # never blocks public market polling or the existing signal engine.
+    app["bybit_private"] = None
+    bybit_bridge_status: Dict[str, Any] = {"configured": False, "api_ok": False}
+    if BYBIT_PRIVATE_READONLY_ENABLED:
+        if not BYBIT_API_KEY:
+            logger.warning("Phase 9A Bybit bridge disabled: BYBIT_API_KEY is empty")
+        elif not BYBIT_PRIVATE_KEY_PATH:
+            logger.warning("Phase 9A Bybit bridge disabled: BYBIT_PRIVATE_KEY_PATH is empty")
+        else:
+            private_client = BybitPrivateReadOnly(
+                BYBIT_REST, http, BYBIT_API_KEY, BYBIT_PRIVATE_KEY_PATH, BYBIT_RECV_WINDOW
+            )
+            app["bybit_private"] = private_client
+            bybit_bridge_status["configured"] = True
+            try:
+                snap = await private_client.health_snapshot()
+                info = snap.get("api_key_info") or {}
+                wallet = snap.get("wallet") or {}
+                positions = snap.get("positions") or []
+                errors = snap.get("errors") or {}
+                bybit_bridge_status["api_ok"] = bool(info)
+                bybit_bridge_status["errors"] = errors
+                if info:
+                    exp = bybit_api_expiry(info)
+                    bybit_bridge_status["days_left"] = exp.get("days_left")
+                if wallet:
+                    bybit_bridge_status["equity"] = _safe_float(wallet.get("totalEquity"))
+                bybit_bridge_status["positions"] = len(positions)
+                logger.info(
+                    "Phase 9A Bybit read-only bridge | "
+                    f"api={'OK' if info else 'FAIL'} "
+                    f"days={bybit_bridge_status.get('days_left', 'n/a')} "
+                    f"equity={bybit_bridge_status.get('equity', 'n/a')} "
+                    f"positions={len(positions)} "
+                    f"partial_errors={list(errors)}"
+                )
+            except Exception as exc:
+                bybit_bridge_status["errors"] = {"startup": f"{type(exc).__name__}: {exc}"}
+                logger.warning(
+                    f"Phase 9A Bybit bridge startup check failed: {type(exc).__name__}: {exc}"
+                )
 
     # Phase 8L.4 diagnostics are deliberately non-critical: failure to open
     # the DB never prevents the trading bot from starting.
@@ -6997,11 +7524,27 @@ async def on_startup(app: web.Application) -> None:
     # runtime_state is a plain mutable dict used by report_error() and other
     # helpers that need to persist small values without mutating the app mapping
     # after startup (which triggers aiohttp DeprecationWarning).
-    app["runtime_state"] = {"last_error_ts": 0}
+    app["runtime_state"] = {
+        "last_error_ts": 0,
+        "bybit_bridge_status": bybit_bridge_status,
+        "apikey_reminder_state": _load_apikey_reminder_state(
+            BYBIT_API_REMINDER_STATE_PATH
+        ),
+    }
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
     app["watchdog_task"]  = asyncio.create_task(watchdog_loop(app))
     app["keepalive_task"] = asyncio.create_task(keepalive_loop(app))
+    app["apikey_task"]    = None
+    if isinstance(app.get("bybit_private"), BybitPrivateReadOnly):
+        # Immediate threshold check, then periodic 6h/default checks.
+        try:
+            await maybe_send_apikey_expiry_reminder(app)
+        except Exception as exc:
+            logger.warning(
+                f"Phase 9A initial expiry reminder check failed: {type(exc).__name__}: {exc}"
+            )
+        app["apikey_task"] = asyncio.create_task(apikey_reminder_loop(app))
 
     # 6. Startup notification to Telegram
     btc_e   = _regime_emoji(mkt.btc_regime)
@@ -7044,14 +7587,16 @@ async def on_startup(app: web.Application) -> None:
                 f"<b>Phase 8L.4.3</b> persistent raw + BR/TP deep + BR shadow + TP stats analyzer: "
                 f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n"
                 f"<b>Phase 8M</b> calibration review / cohort readiness: "
-                f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n\n"
+                f"{'active ✅' if _diag_store(app) is not None else 'unavailable ⚠️'}\n"
+                f"<b>Phase 9A</b> Bybit RSA read-only bridge: "
+                f"{'connected ✅' if bybit_bridge_status.get('api_ok') else ('configured ⚠️' if bybit_bridge_status.get('configured') else 'off ⚪')}\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
+                f"/close SYMBOL /config /diag /apikey /bybit /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
 
 
 async def on_cleanup(app: web.Application) -> None:
-    for key in ("poll_task", "tg_task", "watchdog_task", "keepalive_task"):
+    for key in ("poll_task", "tg_task", "watchdog_task", "keepalive_task", "apikey_task"):
         task = app.get(key)
         if task:
             task.cancel()
@@ -7341,6 +7886,27 @@ def _selftest_phase_8l41_trace_nonintrusive() -> None:
     assert tp_plain == tp_traced == None
 
 
+def _selftest_phase_9a_readonly_bridge() -> None:
+    """Deterministic expiry/reminder helper checks; no network or credentials."""
+    info = {
+        "deadlineDay": 30,
+        "expiredAt": "2099-01-01T00:00:00Z",
+        "createdAt": "2026-09-06T00:00:00Z",
+        "ips": [],
+    }
+    exp = bybit_api_expiry(info)
+    assert exp["status"] == "ACTIVE"
+    assert exp["days_left"] == 30
+    assert _select_apikey_reminder_threshold(30, set()) == 30
+    assert _select_apikey_reminder_threshold(20, {30}) == 21
+    assert _select_apikey_reminder_threshold(13, {30, 21}) == 14
+    assert _select_apikey_reminder_threshold(6, {30, 21, 14}) == 7
+    assert _select_apikey_reminder_threshold(1, {30, 21, 14, 7}) == 1
+    assert _select_apikey_reminder_threshold(1, {30, 21, 14, 7, 1}) is None
+    ip_info = {"deadlineDay": -2, "expiredAt": "1970-01-01T00:00:00Z", "ips": ["1.2.3.4"]}
+    assert bybit_api_expiry(ip_info)["status"] == "ACTIVE_IP_BOUND"
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -7361,4 +7927,5 @@ if __name__ == "__main__":
     _selftest_phase_8l43_tp_statistics_helpers()
     _selftest_phase_8m_calibration_helpers()
     _selftest_phase_8l41_trace_nonintrusive()
+    _selftest_phase_9a_readonly_bridge()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
