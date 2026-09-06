@@ -1,2 +1,3 @@
 # requirements.txt — минимально достаточный для текущего бота
 aiohttp>=3.9,<3.11
+cryptography>=42
