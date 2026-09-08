@@ -32,6 +32,7 @@ Phase 8M Calibration Review: BR/TP cohort readiness + calibration summaries (dia
 Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /bybit · expiry reminders (GET-only; no order endpoints; no trading-rule changes)
 Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margin planning · 10% equity reserve · shadow margin reservations · /plan (planning only; no Bybit write endpoints; no trading-rule changes)
 Phase 9C Net PnL & Expiry Safety Shadow: account fee-rate + funding estimate · net TP/SL economics · remaining-leg break-even · persistent EXPIRED_WAIT_EXIT shadow lifecycle (still GET-only; no order endpoints; no trading-rule changes)
+Phase 9D Execution Scenario Simulator: isolated synthetic signals · real Bybit read-only limits/fees/funding · PLAN/TP/SL/expiry/no-margin/min-split scenarios (simulation-only; never enters strategy stats/diagnostics; no order endpoints)
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -134,6 +135,24 @@ EXECUTION_SHADOW_STATE_PATH = (
     os.getenv("EXECUTION_SHADOW_STATE_PATH")
     or "/data/bybit_execution_shadow_state.json"
 ).strip()
+
+
+
+# ── Phase 9D: isolated execution scenario simulator ───────────────────────────
+# Generates synthetic execution ideas without touching Phase 8M detectors,
+# ActiveIdea slots, signal_stats, diagnostics DB, watchlist, cooldowns, or the
+# real Phase 9C execution-shadow ledger. All Bybit interaction remains GET-only.
+EXECUTION_SIMULATOR_ENABLED = _bool_env("EXECUTION_SIMULATOR_ENABLED", True)
+EXECUTION_SIMULATOR_SL_PCT = max(
+    0.25, min(float(os.getenv("EXECUTION_SIMULATOR_SL_PCT", "2.0")), 20.0)
+)
+EXECUTION_SIMULATOR_TP1_PCT = max(
+    0.25, min(float(os.getenv("EXECUTION_SIMULATOR_TP1_PCT", "2.0")), 30.0)
+)
+EXECUTION_SIMULATOR_TP2_PCT = max(
+    EXECUTION_SIMULATOR_TP1_PCT + 0.25,
+    min(float(os.getenv("EXECUTION_SIMULATOR_TP2_PCT", "4.0")), 50.0),
+)
 
 
 ALLOWED_CHAT_IDS   = [int(x) for x in (os.getenv("ALLOWED_CHAT_IDS") or "").split(",") if x.strip()]
@@ -2610,6 +2629,547 @@ async def check_execution_shadow_wait_exit(
     for cid in get_broadcast_targets():
         with contextlib.suppress(Exception):
             await tg.send(cid, msg)
+
+
+
+
+# =============================================================================
+# === 5A.1 PHASE 9D EXECUTION SCENARIO SIMULATOR (ISOLATED / GET-ONLY) ===
+# =============================================================================
+
+_SIM_CASES: Tuple[str, ...] = (
+    "PLAN",
+    "TP1_TP2",
+    "TP1_SL",
+    "SL",
+    "EXPIRY_PROFIT",
+    "EXPIRY_LOSS_BE",
+    "EXPIRY_LOSS_SL",
+    "NO_MARGIN",
+    "SAME_SYMBOL_LOCK",
+    "MIN_SPLIT",
+)
+
+
+def _simulator_runtime(app: web.Application) -> Dict[str, Any]:
+    runtime = app.get("runtime_state")
+    if not isinstance(runtime, dict):
+        return {"runs": 0, "last": []}
+    sim = runtime.get("execution_simulator")
+    if not isinstance(sim, dict):
+        sim = {"runs": 0, "last": []}
+        runtime["execution_simulator"] = sim
+    return sim
+
+
+def _sim_record_run(
+    app: web.Application,
+    symbol: str,
+    side: str,
+    case: str,
+    status: str,
+) -> None:
+    sim = _simulator_runtime(app)
+    sim["runs"] = int(sim.get("runs") or 0) + 1
+    last = sim.get("last")
+    if not isinstance(last, list):
+        last = []
+        sim["last"] = last
+    last.append({
+        "ts": now_s(),
+        "symbol": symbol,
+        "side": side,
+        "case": case,
+        "status": status,
+    })
+    del last[:-10]
+
+
+def _sim_synthetic_idea(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    instrument: Dict[str, Any],
+) -> ActiveIdea:
+    """
+    Create a synthetic execution-only idea around the live market price.
+
+    This object is NEVER assigned to Market.state[symbol].active_idea and is
+    never written to Phase 8M diagnostics/statistics.
+    """
+    tick = _dec((instrument.get("priceFilter") or {}).get("tickSize"))
+    entry = _dec(entry_price)
+    if entry <= 0:
+        raise RuntimeError("Simulator current price is unavailable")
+
+    sl_pct = _dec(EXECUTION_SIMULATOR_SL_PCT) / Decimal("100")
+    tp1_pct = _dec(EXECUTION_SIMULATOR_TP1_PCT) / Decimal("100")
+    tp2_pct = _dec(EXECUTION_SIMULATOR_TP2_PCT) / Decimal("100")
+
+    if side == "LONG":
+        stop = _floor_to_tick(entry * (Decimal("1") - sl_pct), tick)
+        tp1 = _ceil_to_tick(entry * (Decimal("1") + tp1_pct), tick)
+        tp2 = _ceil_to_tick(entry * (Decimal("1") + tp2_pct), tick)
+    else:
+        stop = _ceil_to_tick(entry * (Decimal("1") + sl_pct), tick)
+        tp1 = _floor_to_tick(entry * (Decimal("1") - tp1_pct), tick)
+        tp2 = _floor_to_tick(entry * (Decimal("1") - tp2_pct), tick)
+
+    # Defensive minimum one-tick separation for very coarse-price instruments.
+    if tick > 0:
+        if side == "LONG":
+            if stop >= entry:
+                stop = entry - tick
+            if tp1 <= entry:
+                tp1 = entry + tick
+            if tp2 <= tp1:
+                tp2 = tp1 + tick
+        else:
+            if stop <= entry:
+                stop = entry + tick
+            if tp1 >= entry:
+                tp1 = entry - tick
+            if tp2 >= tp1:
+                tp2 = tp1 - tick
+
+    zone_half = entry * Decimal("0.001")
+    entry_low = float(max(Decimal("0"), entry - zone_half))
+    entry_high = float(entry + zone_half)
+    emitted = now_s()
+
+    return ActiveIdea(
+        symbol=symbol,
+        side=side,
+        setup_type="SIMULATOR",
+        setup_score=100,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        stop_loss=float(stop),
+        tp1=float(tp1),
+        tp2=float(tp2),
+        rr_tp1=calc_rr(side, float(entry), float(stop), float(tp1)),
+        rr_tp2=calc_rr(side, float(entry), float(stop), float(tp2)),
+        status="ACTIVE",
+        emitted_at=emitted,
+        expires_at=emitted + MAX_IDEA_DURATION_DAYS * 86400,
+        invalidation="Phase 9D synthetic execution-only scenario",
+        current_price_at_signal=float(entry),
+        setup_ts=0,
+        setup_tf="",
+    )
+
+
+def _sim_leg_net(
+    plan: ExecutionPlan,
+    qty: float,
+    exit_price: float,
+    elapsed_days: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Net PnL for one simulated leg at a selected exit and elapsed time.
+
+    Returns: (gross_signed, fees, funding_cost, net).
+    """
+    q = _dec(qty)
+    entry = _dec(plan.entry_price)
+    exit_px = _dec(exit_price)
+    taker = _dec(plan.taker_fee_rate)
+    funding_rate = _dec(plan.funding_rate)
+    interval_min = max(1, int(plan.funding_interval_min or 480))
+    elapsed_min = _dec(elapsed_days) * Decimal("1440")
+    periods = elapsed_min / Decimal(str(interval_min))
+    notional = q * entry
+
+    if plan.side == "LONG":
+        gross = q * (exit_px - entry)
+    else:
+        gross = q * (entry - exit_px)
+
+    entry_fee = q * entry * taker
+    exit_fee = q * exit_px * taker
+    fees = entry_fee + exit_fee
+    funding = _signed_funding_cost(
+        plan.side, notional, funding_rate, periods
+    )
+    net = gross - fees - funding
+    return float(gross), float(fees), float(funding), float(net)
+
+
+def _sim_shadow_row(plan: ExecutionPlan, idea: ActiveIdea) -> Dict[str, Any]:
+    return {
+        "status": "ACTIVE",
+        "symbol": idea.symbol,
+        "side": idea.side,
+        "entry_price": plan.entry_price,
+        "stop_loss": plan.stop_loss,
+        "tp1": plan.tp1,
+        "tp2": plan.tp2,
+        "qty": plan.qty,
+        "open_qty": plan.qty,
+        "tp1_qty": plan.tp1_qty,
+        "tp2_qty": plan.tp2_qty,
+        "emitted_at": idea.emitted_at,
+        "expires_at": idea.expires_at,
+        "taker_fee_rate": plan.taker_fee_rate,
+        "maker_fee_rate": plan.maker_fee_rate,
+        "funding_rate": plan.funding_rate,
+        "funding_interval_min": plan.funding_interval_min,
+        "tick_size": plan.tick_size,
+    }
+
+
+async def _build_simulation_plan(
+    app: web.Application,
+    symbol: str,
+    side: str,
+    case: str,
+) -> Tuple[ActiveIdea, ExecutionPlan, Dict[str, Any], Dict[str, Any]]:
+    """
+    Build a plan from real read-only Bybit market/account metadata without
+    reserving production shadow margin or touching strategy state.
+    """
+    rest = app.get("rest")
+    private = app.get("bybit_private")
+    if not isinstance(rest, BybitRest):
+        raise RuntimeError("Bybit public REST client unavailable")
+    if not isinstance(private, BybitPrivateReadOnly):
+        raise RuntimeError("Bybit private read-only bridge unavailable")
+
+    instrument, ticker, wallet, positions = await asyncio.gather(
+        rest.instrument_linear(symbol),
+        rest.ticker_linear(symbol),
+        private.wallet_balance(),
+        private.positions_linear(),
+    )
+
+    last_price = _safe_float(ticker.get("lastPrice"))
+    if last_price <= 0:
+        mkt = app.get("mkt")
+        state = mkt.state.get(symbol) if isinstance(mkt, Market) else None
+        if isinstance(state, SymbolState):
+            last_price = get_current_price(state)
+    if last_price <= 0:
+        raise RuntimeError(f"No current price for {symbol}")
+
+    idea = _sim_synthetic_idea(symbol, side, last_price, instrument)
+
+    calc_wallet = dict(wallet)
+    calc_positions = list(positions)
+
+    if case == "NO_MARGIN":
+        # Isolated simulation override only; real Bybit balance is untouched.
+        calc_wallet["totalAvailableBalance"] = "0.01"
+    elif case == "SAME_SYMBOL_LOCK":
+        # Inject a fake existing position into the pure planner input only.
+        calc_positions.append({
+            "symbol": symbol,
+            "size": "1",
+            "side": "Buy" if side == "LONG" else "Sell",
+        })
+
+    plan = calculate_execution_plan(
+        idea,
+        instrument,
+        calc_wallet,
+        calc_positions,
+        shadow_reserved_before_usdt=0.0,
+    )
+
+    fee_row: Dict[str, Any] = {}
+    if EXECUTION_ECONOMICS_ENABLED:
+        try:
+            fee_row = await private.fee_rate_linear(symbol)
+        except Exception as exc:
+            logger.warning(
+                f"Phase 9D fee-rate read failed {symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    if fee_row:
+        _apply_execution_economics(plan, idea, instrument, ticker, fee_row)
+
+    return idea, plan, instrument, ticker
+
+
+def _format_simulated_signal(idea: ActiveIdea, case: str) -> str:
+    return (
+        "🧪 <b>SIMULATED EXECUTION SIGNAL — Phase 9D</b>\n\n"
+        "<b>Strategy source:</b> NONE — synthetic test only\n"
+        f"<b>Scenario:</b> {html.escape(case)}\n"
+        f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
+        f"<b>Entry reference:</b> {idea.current_price_at_signal:.6g}\n"
+        f"<b>SL:</b> {idea.stop_loss:.6g}\n"
+        f"<b>TP1:</b> {idea.tp1:.6g}\n"
+        f"<b>TP2:</b> {idea.tp2:.6g}\n\n"
+        "<i>Not added to ActiveIdea, BR/TP/LS statistics, diagnostics DB, "
+        "watchlist, cooldowns, or signal counters.</i>"
+    )
+
+
+def _format_sim_plan(plan: ExecutionPlan, instrument: Dict[str, Any]) -> str:
+    base = format_execution_plan(plan, instrument)
+    base = base.replace(
+        "🧮 <b>Execution Plan — Phase 9C</b>",
+        "🧪🧮 <b>SIMULATED Execution Plan — Phase 9D</b>",
+        1,
+    )
+    return base
+
+
+def _sim_lifecycle_report(
+    case: str,
+    idea: ActiveIdea,
+    plan: ExecutionPlan,
+    instrument: Dict[str, Any],
+) -> str:
+    """
+    Produce an immediate deterministic lifecycle report. No market state,
+    production shadow state, or Bybit order is changed.
+    """
+    if case == "PLAN":
+        return (
+            "✅ <b>Simulation result — PLAN</b>\n"
+            "Planner path completed. No lifecycle event was injected."
+        )
+
+    if case == "NO_MARGIN":
+        return (
+            "🧪 <b>Simulation result — NO_MARGIN</b>\n"
+            f"Planner status: <b>{html.escape(plan.status)}</b>\n"
+            f"Reason: <code>{html.escape(plan.reason)}</code>\n"
+            "The $0.01 available-balance override existed only inside this simulation."
+        )
+
+    if case == "SAME_SYMBOL_LOCK":
+        return (
+            "🧪 <b>Simulation result — SAME_SYMBOL_LOCK</b>\n"
+            f"Planner status: <b>{html.escape(plan.status)}</b>\n"
+            f"Reason: <code>{html.escape(plan.reason)}</code>\n"
+            "A fake existing Bybit position was injected only into the pure planner input."
+        )
+
+    if case == "MIN_SPLIT":
+        lot = instrument.get("lotSizeFilter") or {}
+        worst_price = min(
+            x for x in (plan.entry_price, plan.tp1, plan.tp2) if x > 0
+        )
+        leg_notional = plan.tp1_qty * worst_price
+        return (
+            "🧪 <b>Simulation result — MIN_SPLIT</b>\n"
+            f"Bybit min qty: {plan.min_order_qty:g}\n"
+            f"Qty step: {plan.qty_step:g}\n"
+            f"Min notional: ${plan.min_notional_usdt:g}\n"
+            f"Chosen total qty: {plan.qty:g}\n"
+            f"TP1 qty: {plan.tp1_qty:g} · TP2 qty: {plan.tp2_qty:g}\n"
+            f"Worst-price notional per 50% leg: ${leg_notional:.3f}\n"
+            f"50/50 split check: {'✅ PASS' if plan.tp1_qty == plan.tp2_qty else '❌ FAIL'}"
+        )
+
+    if plan.status != "EXECUTABLE":
+        return (
+            "⛔ <b>Simulation lifecycle not run</b>\n"
+            f"Planner blocked the synthetic position: {html.escape(plan.status)} / "
+            f"<code>{html.escape(plan.reason)}</code>"
+        )
+
+    if not plan.economics_ready and case.startswith("EXPIRY"):
+        return (
+            "⚠️ <b>Simulation lifecycle incomplete</b>\n"
+            "Expiry scenarios require the authenticated Bybit account fee rate "
+            "to calculate net break-even."
+        )
+
+    if case == "TP1_TP2":
+        _, fees1, fund1, net1 = _sim_leg_net(
+            plan, plan.tp1_qty, plan.tp1, 3.0
+        )
+        _, fees2, fund2, net2 = _sim_leg_net(
+            plan, plan.tp2_qty, plan.tp2, 7.0
+        )
+        return (
+            "✅ <b>Simulation result — TP1 → TP2</b>\n"
+            f"Day 3: TP1 closes 50% · net est. ${net1:+.3f} "
+            f"(fees ${fees1:.3f}, funding ${fund1:+.3f})\n"
+            "Shadow margin after TP1: ~50% remains reserved\n"
+            f"Day 7: TP2 closes remaining 50% · net est. ${net2:+.3f} "
+            f"(fees ${fees2:.3f}, funding ${fund2:+.3f})\n"
+            f"Combined net est.: ${net1 + net2:+.3f}\n"
+            "Final shadow margin: $0.00"
+        )
+
+    if case == "TP1_SL":
+        _, fees1, fund1, net1 = _sim_leg_net(
+            plan, plan.tp1_qty, plan.tp1, 3.0
+        )
+        _, fees2, fund2, net2 = _sim_leg_net(
+            plan, plan.tp2_qty, plan.stop_loss, 6.0
+        )
+        return (
+            "🟠 <b>Simulation result — TP1 → SL</b>\n"
+            f"Day 3: TP1 closes 50% · net est. ${net1:+.3f}\n"
+            f"Day 6: original SL closes remaining 50% · net est. ${net2:+.3f}\n"
+            f"Combined trade net est.: ${net1 + net2:+.3f}\n"
+            f"Second-leg costs: fees ${fees2:.3f}, funding ${fund2:+.3f}\n"
+            "TP1 profit does not alter the second leg's SL/break-even rules."
+        )
+
+    if case == "SL":
+        _, fees, funding, net = _sim_leg_net(
+            plan, plan.qty, plan.stop_loss, 4.0
+        )
+        return (
+            "🛑 <b>Simulation result — SL</b>\n"
+            f"Day 4: original SL closes 100%.\n"
+            f"Net est.: ${net:+.3f} · fees ${fees:.3f} · funding ${funding:+.3f}\n"
+            "Shadow margin released after the simulated close."
+        )
+
+    # Expiry scenarios: no TP was assumed before day 10.
+    row = _sim_shadow_row(plan, idea)
+    expiry_ts = idea.emitted_at + MAX_IDEA_DURATION_DAYS * 86400
+    entry = plan.entry_price
+    stop = plan.stop_loss
+
+    if case == "EXPIRY_PROFIT":
+        # Use the day-10 BE plus a modest favourable buffer.
+        _, day10_be, _ = _shadow_remaining_net_pnl(row, entry, expiry_ts)
+        if plan.side == "LONG":
+            exit_px = max(day10_be, entry) * 1.0025
+        else:
+            exit_px = min(day10_be, entry) * 0.9975
+        _, _, _, net = _sim_leg_net(
+            plan, plan.qty, exit_px, float(MAX_IDEA_DURATION_DAYS)
+        )
+        return (
+            "✅ <b>Simulation result — EXPIRY_PROFIT</b>\n"
+            f"Day {MAX_IDEA_DURATION_DAYS}: price {exit_px:.6g} · "
+            f"net est. ${net:+.3f}\n"
+            "Decision: simulated reduce-only expiry exit.\n"
+            "Future live rule: original SL stays active until Bybit confirms position size = 0."
+        )
+
+    # Pick a negative price between entry and original SL for the expiry snapshot.
+    expiry_px = (entry + stop) / 2.0
+    expiry_net, expiry_be, expiry_funding = _shadow_remaining_net_pnl(
+        row, expiry_px, expiry_ts
+    )
+
+    if case == "EXPIRY_LOSS_BE":
+        wait_ts = expiry_ts + 24 * 3600
+        _, updated_be, updated_funding = _shadow_remaining_net_pnl(
+            row, entry, wait_ts
+        )
+        close_net, _, _ = _shadow_remaining_net_pnl(
+            row, updated_be, wait_ts
+        )
+        return (
+            "⏳ <b>Simulation result — EXPIRY_LOSS → NET BE</b>\n"
+            f"Day {MAX_IDEA_DURATION_DAYS}: price {expiry_px:.6g} · "
+            f"net est. ${expiry_net:+.3f} → <b>EXPIRED_WAIT_EXIT</b>\n"
+            f"Original SL remains: {stop:.6g}\n"
+            f"Day-{MAX_IDEA_DURATION_DAYS} net BE: {expiry_be:.6g}\n"
+            f"Day {MAX_IDEA_DURATION_DAYS + 1}: funding-adjusted BE: {updated_be:.6g} · "
+            f"net at BE ~${close_net:+.3f}\n"
+            f"Accrued funding est.: ${updated_funding:+.3f}\n"
+            "Decision: close remainder at its own net break-even. TP1 profit is excluded."
+        )
+
+    if case == "EXPIRY_LOSS_SL":
+        wait_days = float(MAX_IDEA_DURATION_DAYS + 2)
+        _, fees, funding, net = _sim_leg_net(
+            plan, plan.qty, stop, wait_days
+        )
+        return (
+            "🛑 <b>Simulation result — EXPIRY_LOSS → SL</b>\n"
+            f"Day {MAX_IDEA_DURATION_DAYS}: price {expiry_px:.6g} · "
+            f"net est. ${expiry_net:+.3f} → <b>EXPIRED_WAIT_EXIT</b>\n"
+            f"Net BE at expiry: {expiry_be:.6g} · funding ${expiry_funding:+.3f}\n"
+            f"Day {MAX_IDEA_DURATION_DAYS + 2}: original SL {stop:.6g} is hit.\n"
+            f"Final net est.: ${net:+.3f} · fees ${fees:.3f} · funding ${funding:+.3f}"
+        )
+
+    return f"⚠️ Unknown simulator case: {html.escape(case)}"
+
+
+async def run_execution_simulation(
+    app: web.Application,
+    cid: int,
+    symbol: str,
+    side: str,
+    case: str,
+) -> None:
+    tg: Tg = app["tg"]
+
+    if not EXECUTION_SIMULATOR_ENABLED:
+        await tg.send(cid, "⚠️ <b>Phase 9D simulator is disabled.</b>")
+        return
+
+    symbol = symbol.upper().strip()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    side = side.upper().strip()
+    case = case.upper().strip()
+
+    if side not in ("LONG", "SHORT"):
+        await tg.send(cid, "Side must be <code>LONG</code> or <code>SHORT</code>.")
+        return
+    if case not in _SIM_CASES:
+        await tg.send(
+            cid,
+            "Unknown simulator case.\nUse <code>/simcases</code> to see available scenarios.",
+        )
+        return
+
+    # Limit the simulator to the same validated execution universe.
+    mkt = app.get("mkt")
+    if not isinstance(mkt, Market) or symbol not in mkt.state:
+        await tg.send(
+            cid,
+            f"Symbol <b>{html.escape(symbol)}</b> is not in the current bot universe.",
+        )
+        return
+
+    try:
+        idea, plan, instrument, _ticker = await _build_simulation_plan(
+            app, symbol, side, case
+        )
+        await tg.send(cid, _format_simulated_signal(idea, case))
+        await tg.send(cid, _format_sim_plan(plan, instrument))
+        lifecycle = _sim_lifecycle_report(case, idea, plan, instrument)
+        await tg.send(cid, lifecycle)
+        _sim_record_run(app, symbol, side, case, plan.status)
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9D simulation failed {symbol}/{side}/{case}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _sim_record_run(app, symbol, side, case, "ERROR")
+        await tg.send(
+            cid,
+            "❌ <b>Phase 9D simulation failed</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n\n"
+            "<b>No strategy state and no Bybit order were changed.</b>",
+        )
+
+
+def _simcases_text() -> str:
+    return (
+        "🧪 <b>Phase 9D Execution Scenario Simulator</b>\n\n"
+        "Usage:\n"
+        "<code>/simcase BTCUSDT LONG PLAN</code>\n\n"
+        "<b>Cases:</b>\n"
+        "PLAN — planner only\n"
+        "TP1_TP2 — TP1 then TP2\n"
+        "TP1_SL — TP1 then original SL\n"
+        "SL — direct full stop\n"
+        "EXPIRY_PROFIT — expiry while net positive\n"
+        "EXPIRY_LOSS_BE — expiry negative, then own net break-even\n"
+        "EXPIRY_LOSS_SL — expiry negative, then original SL\n"
+        "NO_MARGIN — isolated insufficient-margin test\n"
+        "SAME_SYMBOL_LOCK — isolated existing-position lock test\n"
+        "MIN_SPLIT — 50/50 minimum-size/step/notional test\n\n"
+        "<i>All scenarios use real Bybit GET-only instrument/account metadata. "
+        "They never enter Phase 8M strategy statistics or create orders.</i>"
+    )
 
 
 
@@ -6976,6 +7536,27 @@ async def tg_loop(app: web.Application) -> None:
                         await tg.send(cid, "⛔ Unauthorized.")
                     else:
                         await _cmd_execshadow(app, cid)
+                elif text.startswith("/simcase"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split()
+                        if len(parts) != 4:
+                            await tg.send(cid, _simcases_text())
+                        else:
+                            await run_execution_simulation(
+                                app, cid, parts[1], parts[2], parts[3]
+                            )
+                elif text == "/simcases":
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await tg.send(cid, _simcases_text())
+                elif text == "/simstatus":
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await _cmd_simstatus(app, cid)
                 elif text in ("/statsdb", "/rawstats"):
                     await _cmd_statsdb(app, cid)
                 elif text in ("/brtp", "/detstats"):
@@ -7185,6 +7766,43 @@ async def _cmd_execshadow(app: web.Application, cid: int) -> None:
 
 
 
+async def _cmd_simstatus(app: web.Application, cid: int) -> None:
+    """Show in-memory Phase 9D simulator activity only."""
+    tg: Tg = app["tg"]
+    sim = _simulator_runtime(app)
+    runs = int(sim.get("runs") or 0)
+    last = sim.get("last")
+    rows = last if isinstance(last, list) else []
+
+    lines = [
+        "🧪 <b>Execution Scenario Simulator — Phase 9D</b>",
+        "",
+        f"<b>Status:</b> {'enabled ✅' if EXECUTION_SIMULATOR_ENABLED else 'off ⚪'}",
+        f"<b>Runs since startup:</b> {runs}",
+        "<b>Bybit access:</b> GET-only",
+        "<b>Strategy isolation:</b> enabled ✅",
+    ]
+    if rows:
+        lines.extend(["", "<b>Recent:</b>"])
+        for row in rows[-5:]:
+            ts = datetime.fromtimestamp(
+                int(row.get("ts") or 0), tz=timezone.utc
+            ).strftime("%m-%d %H:%M")
+            lines.append(
+                f"{ts}Z · {html.escape(str(row.get('symbol') or ''))} "
+                f"{html.escape(str(row.get('side') or ''))} · "
+                f"{html.escape(str(row.get('case') or ''))} → "
+                f"{html.escape(str(row.get('status') or ''))}"
+            )
+    lines.extend([
+        "",
+        "<i>Simulator runs are not persisted and are not written to the strategy diagnostics DB.</i>",
+    ])
+    await tg.send(cid, "\n".join(lines))
+
+
+
+
 async def _cmd_status(app: web.Application, cid: int) -> None:
     tg:  Tg     = app["tg"]
     mkt: Market = app["mkt"]
@@ -7212,7 +7830,7 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
         f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner · 9C net economics/expiry shadow"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner · 9C net economics/expiry shadow · 9D scenario simulator"
     ))
 
 
@@ -8222,8 +8840,12 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"<b>Bybit writes:</b> disabled by code\n"
         f"<b>Net economics:</b> {'enabled' if EXECUTION_ECONOMICS_ENABLED else 'off'} (Phase 9C) · "
         f"fees=Bybit account · funding=current-rate estimate\n"
-        f"<b>Expiry execution policy:</b> net ≥ 0 exit; net < 0 → EXPIRED_WAIT_EXIT → SL or own net BE\n"
+        f"<b>Expiry execution policy:</b> net ≥ 0 exit; negative net → EXPIRED_WAIT_EXIT → SL or own net BE\n"
         f"<b>Shadow state:</b> <code>{html.escape(EXECUTION_SHADOW_STATE_PATH)}</code>\n"
+        f"<b>Execution simulator:</b> {'enabled' if EXECUTION_SIMULATOR_ENABLED else 'off'} (Phase 9D) · "
+        f"synthetic SL {EXECUTION_SIMULATOR_SL_PCT:.2f}% · "
+        f"TP1 {EXECUTION_SIMULATOR_TP1_PCT:.2f}% · TP2 {EXECUTION_SIMULATOR_TP2_PCT:.2f}%\n"
+        f"<b>Simulator isolation:</b> strategy stats/DB/watchlist/cooldowns untouched · Bybit GET-only\n"
         f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
         f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
@@ -8556,7 +9178,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
-        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow)"
+        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow · Phase 9D isolated execution scenario simulator)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -8672,6 +9294,9 @@ async def on_startup(app: web.Application) -> None:
         "execution_shadow_reservations": _load_execution_shadow_state(
             EXECUTION_SHADOW_STATE_PATH
         ),
+        # Phase 9D is intentionally ephemeral and isolated from production
+        # strategy/execution shadow state.
+        "execution_simulator": {"runs": 0, "last": []},
     }
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
@@ -8737,9 +9362,14 @@ async def on_startup(app: web.Application) -> None:
                 f"{EXECUTION_PLANNER_LEVERAGE:.1f}x plan · {EXECUTION_PLANNER_RESERVE_PCT:.0f}% reserve · 50/50 · no orders\n"
                 f"<b>Phase 9C</b> net PnL + expiry safety shadow: "
                 f"{'active ✅' if EXECUTION_ECONOMICS_ENABLED else 'off ⚪'} · "
-                f"fees/funding estimates · EXPIRED_WAIT_EXIT · persistent shadow state\n\n"
+                f"fees/funding estimates · EXPIRED_WAIT_EXIT · persistent shadow state\n"
+                f"<b>Phase 9D</b> execution scenario simulator: "
+                f"{'active ✅' if EXECUTION_SIMULATOR_ENABLED else 'off ⚪'} · "
+                f"synthetic signals · real GET-only Bybit metadata · strategy-isolated\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /execshadow /statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
+                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /execshadow "
+                f"/simcases /simcase SYMBOL SIDE CASE /simstatus "
+                f"/statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
 
 
@@ -9196,6 +9826,74 @@ def _selftest_phase_9c_net_economics() -> None:
     assert ps.remaining_break_even_price > 0
 
 
+def _selftest_phase_9d_scenario_simulator() -> None:
+    """Phase 9D synthetic ideas/plans must remain isolated and deterministic."""
+    instrument = {
+        "symbol": "TESTUSDT",
+        "status": "Trading",
+        "fundingInterval": 480,
+        "lotSizeFilter": {
+            "minOrderQty": "0.01",
+            "qtyStep": "0.01",
+            "minNotionalValue": "5",
+            "maxMktOrderQty": "1000",
+        },
+        "priceFilter": {"tickSize": "0.1"},
+        "leverageFilter": {"maxLeverage": "10"},
+    }
+    wallet = {"totalEquity": "30", "totalAvailableBalance": "30"}
+
+    long_idea = _sim_synthetic_idea("TESTUSDT", "LONG", 100.0, instrument)
+    short_idea = _sim_synthetic_idea("TESTUSDT", "SHORT", 100.0, instrument)
+
+    assert long_idea.setup_type == "SIMULATOR"
+    assert long_idea.stop_loss < long_idea.current_price_at_signal < long_idea.tp1 < long_idea.tp2
+    assert short_idea.stop_loss > short_idea.current_price_at_signal > short_idea.tp1 > short_idea.tp2
+
+    p = calculate_execution_plan(long_idea, instrument, wallet, [], 0.0)
+    _apply_execution_economics(
+        p,
+        long_idea,
+        instrument,
+        {"fundingRate": "0.0001"},
+        {"takerFeeRate": "0.00055", "makerFeeRate": "0.0002"},
+    )
+    assert p.status == "EXECUTABLE"
+    assert p.economics_ready
+    assert p.tp1_qty == p.tp2_qty
+    assert p.total_net_profit_usdt < p.total_gross_profit_usdt
+
+    no_margin_wallet = dict(wallet)
+    no_margin_wallet["totalAvailableBalance"] = "0.01"
+    p_no = calculate_execution_plan(
+        long_idea, instrument, no_margin_wallet, [], 0.0
+    )
+    assert p_no.status == "SKIPPED_NO_MARGIN"
+
+    p_lock = calculate_execution_plan(
+        long_idea,
+        instrument,
+        wallet,
+        [{"symbol": "TESTUSDT", "size": "1", "side": "Buy"}],
+        0.0,
+    )
+    assert p_lock.status == "SKIPPED_ALREADY_OPEN"
+
+    row = _sim_shadow_row(p, long_idea)
+    expiry_ts = long_idea.emitted_at + MAX_IDEA_DURATION_DAYS * 86400
+    expiry_px = (p.entry_price + p.stop_loss) / 2.0
+    expiry_net, expiry_be, _ = _shadow_remaining_net_pnl(
+        row, expiry_px, expiry_ts
+    )
+    assert expiry_net < 0
+    assert expiry_be > p.entry_price
+
+    # Critical isolation property: simulator helpers work on local objects only.
+    # No Market, DiagnosticStore, ActiveIdea slot, or app runtime state is needed.
+    assert "SIMULATOR" not in _DIAG_DETECTOR_ABBR
+
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -9219,4 +9917,5 @@ if __name__ == "__main__":
     _selftest_phase_9a_readonly_bridge()
     _selftest_phase_9b_execution_planner()
     _selftest_phase_9c_net_economics()
+    _selftest_phase_9d_scenario_simulator()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
