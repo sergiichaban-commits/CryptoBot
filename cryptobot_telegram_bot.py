@@ -33,6 +33,8 @@ Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /by
 Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margin planning · 10% equity reserve · shadow margin reservations · /plan (planning only; no Bybit write endpoints; no trading-rule changes)
 Phase 9C Net PnL & Expiry Safety Shadow: account fee-rate + funding estimate · net TP/SL economics · remaining-leg break-even · persistent EXPIRED_WAIT_EXIT shadow lifecycle (still GET-only; no order endpoints; no trading-rule changes)
 Phase 9D Execution Scenario Simulator: isolated synthetic signals · real Bybit read-only limits/fees/funding · PLAN/TP/SL/expiry/no-margin/min-split scenarios (simulation-only; never enters strategy stats/diagnostics; no order endpoints)
+Phase 9E.1 LS Live Dual Mode: DRY_RUN strategy signals remain active while only LS may execute live; native Telegram setMyCommands menu
+Phase 9E LS Live Executor: Liquidity Sweep only · 10x isolated · 95% available margin · market entry · one full-position TP at TP1 · full-position strategy SL · persistent live state/reconciliation
 
 Architecture:
   - REST polling only; no WebSocket in MVP (BybitWS class kept for v19 upgrade)
@@ -53,6 +55,7 @@ import base64
 import contextlib
 import html
 import math
+import hashlib
 import json
 import logging
 import os
@@ -152,6 +155,37 @@ EXECUTION_SIMULATOR_TP1_PCT = max(
 EXECUTION_SIMULATOR_TP2_PCT = max(
     EXECUTION_SIMULATOR_TP1_PCT + 0.25,
     min(float(os.getenv("EXECUTION_SIMULATOR_TP2_PCT", "4.0")), 50.0),
+)
+
+# ── Phase 9E.1: Liquidity Sweep live execution + Telegram command menu ─────────────────────────────────
+# Hard safety model:
+# - ONLY LIQUIDITY_SWEEP may place a live order. BR/TP remain signal/diagnostic only.
+# - DRY_RUN_MODE controls strategy/Telegram labelling only and MAY remain true.
+# - LIVE_LS_EXECUTION_ENABLED independently arms the LS live-execution layer.
+# - UTA account margin mode must already be ISOLATED_MARGIN; the bot will not
+#   change account-wide margin mode automatically.
+# - one-way mode is assumed (positionIdx=0); incompatible mode fails closed.
+# - 95% maximum of available USDT margin is allocated to one position.
+# - TP is the strategy TP1 and closes 100% of the position; TP2 is not used live.
+# - strategy SL protects 100% of the position. Full-position TP/SL are attached
+#   to the entry order and then verified against the live Bybit position.
+# - if protection cannot be verified after fill, the bot emergency-closes the
+#   position with a reduce-only market order.
+LIVE_LS_EXECUTION_ENABLED = _bool_env("LIVE_LS_EXECUTION_ENABLED", False)
+LIVE_LS_LEVERAGE = max(1.0, min(float(os.getenv("LIVE_LS_LEVERAGE", "10")), 100.0))
+LIVE_LS_MARGIN_USE_PCT = max(1.0, min(float(os.getenv("LIVE_LS_MARGIN_USE_PCT", "95")), 95.0))
+LIVE_LS_SINGLE_TP_ENABLED = _bool_env("LIVE_LS_SINGLE_TP_ENABLED", True)
+LIVE_LS_REQUIRE_ISOLATED_MARGIN = _bool_env("LIVE_LS_REQUIRE_ISOLATED_MARGIN", True)
+LIVE_LS_TRIGGER_BY = (os.getenv("LIVE_LS_TRIGGER_BY") or "LastPrice").strip()
+if LIVE_LS_TRIGGER_BY not in ("LastPrice", "MarkPrice", "IndexPrice"):
+    LIVE_LS_TRIGGER_BY = "LastPrice"
+LIVE_LS_FILL_TIMEOUT_SEC = max(3, min(int(os.getenv("LIVE_LS_FILL_TIMEOUT_SEC", "15")), 60))
+LIVE_LS_VERIFY_TIMEOUT_SEC = max(3, min(int(os.getenv("LIVE_LS_VERIFY_TIMEOUT_SEC", "10")), 60))
+LIVE_LS_STATE_PATH = (
+    os.getenv("LIVE_LS_STATE_PATH") or "/data/bybit_live_ls_state.json"
+).strip()
+LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL = _bool_env(
+    "LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL", True
 )
 
 
@@ -850,6 +884,23 @@ class Tg:
             )
         return []
 
+    async def set_my_commands(self, commands: List[Dict[str, str]]) -> bool:
+        """Register Telegram's native slash-command dropdown via Bot API setMyCommands."""
+        url = f"{self.base_url}/setMyCommands"
+        try:
+            async with self.session.post(url, json={"commands": commands}) as r:
+                if r.status != 200:
+                    try:
+                        body = await r.json()
+                    except Exception:
+                        body = await r.text()
+                    logger.warning(f"setMyCommands failed status={r.status} response={body}")
+                    return False
+                return True
+        except Exception as exc:
+            logger.warning(f"setMyCommands exception: {exc}")
+            return False
+
     async def send(
         self,
         chat_id: Any,
@@ -882,30 +933,29 @@ class Tg:
             return False
 
 
-def command_keyboard() -> Dict[str, Any]:
-    """
-    Telegram ReplyKeyboardMarkup with quick-access buttons for frequently used
-    no-argument commands.
-
-    Preserved for possible future private/group use (e.g. personal admin chats).
-    It MUST NOT be attached to channel broadcasts — Telegram channels reject
-    ReplyKeyboardMarkup and the message will silently fail to deliver.
-    (Phase 8B.1 removed reply_markup from all channel sends.)
-
-    Intentionally omits commands that require symbol input (/idea, /close,
-    /score) or that can perform irreversible state changes without confirmation.
-    """
-    return {
-        "keyboard": [
-            [{"text": "/status"}, {"text": "/regime"}],
-            [{"text": "/ideas"},  {"text": "/config"}],
-            [{"text": "/apikey"}, {"text": "/bybit"}],
-            [{"text": "/diag"},   {"text": "/ping"}],
-        ],
-        "resize_keyboard":   True,
-        "one_time_keyboard": False,
-        "is_persistent":     True,
-    }
+def telegram_bot_commands() -> List[Dict[str, str]]:
+    """Canonical Telegram native command menu (Bot API setMyCommands)."""
+    return [
+        {"command": "status", "description": "Bot status and active ideas"},
+        {"command": "regime", "description": "Market regime summary"},
+        {"command": "ideas", "description": "Active strategy ideas"},
+        {"command": "watchlist", "description": "Pending signal-eligible setups"},
+        {"command": "candidates", "description": "Recent rejected/dead candidates"},
+        {"command": "config", "description": "Current strategy and execution config"},
+        {"command": "diag", "description": "Runtime diagnostics"},
+        {"command": "statsdb", "description": "Persistent setup statistics"},
+        {"command": "brtp", "description": "BR/TP detector statistics"},
+        {"command": "tpdiag", "description": "Trend Pullback diagnostics"},
+        {"command": "brshadow", "description": "BR shadow outcomes"},
+        {"command": "calibration", "description": "Phase 8M calibration review"},
+        {"command": "bybit", "description": "Bybit account snapshot"},
+        {"command": "apikey", "description": "Bybit API key status"},
+        {"command": "liveexec", "description": "LS live-execution status and gates"},
+        {"command": "execshadow", "description": "Execution shadow state"},
+        {"command": "simcases", "description": "Available execution simulator cases"},
+        {"command": "simstatus", "description": "Execution simulator status"},
+        {"command": "ping", "description": "Telegram bot health check"},
+    ]
 
 
 class BybitRest:
@@ -1169,6 +1219,161 @@ class BybitPrivateReadOnly:
             except Exception as exc:
                 out["errors"][name] = f"{type(exc).__name__}: {exc}"
         return out
+
+
+
+class BybitPrivateExecution(BybitPrivateReadOnly):
+    """Phase 9E authenticated RSA client with a deliberately narrow write surface.
+
+    The only state-changing methods implemented here are those required for
+    USDT-perpetual LS execution and protection: set leverage, place/close order,
+    set full-position TP/SL, and disable auto-add-margin. There are intentionally
+    no transfer, withdrawal, asset-management, API-key-management, or wallet
+    movement methods.
+    """
+
+    def _sign_post(self, timestamp_ms: int, body_text: str) -> str:
+        key = self._load_private_key()
+        payload = (
+            f"{timestamp_ms}{self.api_key}{self.recv_window}{body_text}"
+        ).encode("utf-8")
+        signature = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+        return base64.b64encode(signature).decode("ascii")
+
+    async def _post(
+        self,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("BYBIT_API_KEY is empty")
+
+        clean_payload = {
+            str(k): v for k, v in (payload or {}).items() if v is not None
+        }
+        body_text = json.dumps(
+            clean_payload,
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        timestamp_ms = now_ms()
+        signature = self._sign_post(timestamp_ms, body_text)
+        headers = {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-TIMESTAMP": str(timestamp_ms),
+            "X-BAPI-RECV-WINDOW": str(self.recv_window),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        url = f"{self.base}{path}"
+        async with self.http.post(
+            url,
+            headers=headers,
+            data=body_text.encode("utf-8"),
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            try:
+                body = await response.json()
+            except Exception as exc:
+                raw = await response.text()
+                raise RuntimeError(
+                    f"Bybit private POST {path} returned non-JSON HTTP "
+                    f"{response.status}: {raw[:300]}"
+                ) from exc
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Bybit private POST {path} HTTP {response.status}: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            if int(body.get("retCode", -1)) != 0:
+                raise RuntimeError(
+                    f"Bybit private POST {path} failed: "
+                    f"retCode={body.get('retCode')} retMsg={body.get('retMsg')}"
+                )
+            return body
+
+    async def account_info(self) -> Dict[str, Any]:
+        body = await self._get("/v5/account/info")
+        return body.get("result", {}) or {}
+
+    async def position_linear(self, symbol: str) -> Optional[Dict[str, Any]]:
+        body = await self._get(
+            "/v5/position/list",
+            {"category": "linear", "symbol": symbol},
+        )
+        rows = body.get("result", {}).get("list", []) or []
+        for row in rows:
+            if str(row.get("symbol") or "") == symbol and _safe_float(row.get("size")) > 0:
+                return row
+        return None
+
+    async def order_realtime(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        order_link_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        body = await self._get("/v5/order/realtime", params)
+        rows = body.get("result", {}).get("list", []) or []
+        return rows[0] if rows else None
+
+    async def set_leverage_linear(self, symbol: str, leverage: str) -> None:
+        await self._post(
+            "/v5/position/set-leverage",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "buyLeverage": leverage,
+                "sellLeverage": leverage,
+            },
+        )
+
+    async def create_order_linear(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        body = await self._post("/v5/order/create", payload)
+        return body.get("result", {}) or {}
+
+    async def set_trading_stop_full(
+        self,
+        symbol: str,
+        take_profit: str,
+        stop_loss: str,
+        trigger_by: str,
+    ) -> None:
+        await self._post(
+            "/v5/position/trading-stop",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "tpslMode": "Full",
+                "positionIdx": 0,
+                "takeProfit": take_profit,
+                "stopLoss": stop_loss,
+                "tpTriggerBy": trigger_by,
+                "slTriggerBy": trigger_by,
+                "tpOrderType": "Market",
+                "slOrderType": "Market",
+            },
+        )
+
+    async def set_auto_add_margin_off(self, symbol: str) -> None:
+        await self._post(
+            "/v5/position/set-auto-add-margin",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "autoAddMargin": 0,
+                "positionIdx": 0,
+            },
+        )
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -2126,7 +2331,10 @@ def _update_execution_shadow_reservation(
         return
 
     if event == "TP1_HIT":
-        if not row.get("tp1_released"):
+        if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_SINGLE_TP_ENABLED:
+            reservations.pop(idea.symbol, None)
+            _save_execution_shadow_state(app)
+        elif not row.get("tp1_released"):
             row["margin_usdt"] = max(0.0, _safe_float(row.get("margin_usdt")) * 0.5)
             row["open_qty"] = max(0.0, _safe_float(row.get("tp2_qty")))
             row["status"] = "TP1_HIT"
@@ -2489,6 +2697,731 @@ async def send_execution_plan(
     for cid in get_broadcast_targets():
         with contextlib.suppress(Exception):
             await tg.send(cid, text)
+
+
+
+# =============================================================================
+# === 5B. PHASE 9E LIQUIDITY-SWEEP LIVE EXECUTION =============================
+# =============================================================================
+
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_FLOOR)
+    return units * step
+
+
+def _live_ls_is_armed() -> bool:
+    """Phase 9E.1 live gate. Strategy DRY_RUN is intentionally independent."""
+    return bool(LIVE_LS_EXECUTION_ENABLED)
+
+
+def _empty_live_ls_state() -> Dict[str, Any]:
+    return {"positions": {}, "executed_setups": {}, "updated_at": 0}
+
+
+def _load_live_ls_state(path: str) -> Dict[str, Any]:
+    if not path:
+        return _empty_live_ls_state()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            return _empty_live_ls_state()
+        if not isinstance(raw.get("positions"), dict):
+            raw["positions"] = {}
+        if not isinstance(raw.get("executed_setups"), dict):
+            raw["executed_setups"] = {}
+        raw.setdefault("updated_at", 0)
+        return raw
+    except FileNotFoundError:
+        return _empty_live_ls_state()
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9E live-state load failed {path}: {type(exc).__name__}: {exc}"
+        )
+        return _empty_live_ls_state()
+
+
+def _live_ls_state(app: web.Application) -> Dict[str, Any]:
+    runtime = app.get("runtime_state")
+    if not isinstance(runtime, dict):
+        return _empty_live_ls_state()
+    state = runtime.get("live_ls_execution")
+    if not isinstance(state, dict):
+        state = _empty_live_ls_state()
+        runtime["live_ls_execution"] = state
+    state.setdefault("positions", {})
+    state.setdefault("executed_setups", {})
+    return state
+
+
+def _save_live_ls_state(app: web.Application) -> None:
+    if not LIVE_LS_STATE_PATH:
+        return
+    state = _live_ls_state(app)
+    state["updated_at"] = now_s()
+    # Bound the setup-idempotency ledger. Newest 500 setup records are enough
+    # to prevent same-setup re-entry across ordinary redeploys while avoiding
+    # unbounded growth on the persistent volume.
+    executed = state.get("executed_setups")
+    if isinstance(executed, dict) and len(executed) > 500:
+        newest = sorted(
+            executed.items(),
+            key=lambda kv: int((kv[1] or {}).get("ts") or 0),
+            reverse=True,
+        )[:500]
+        state["executed_setups"] = dict(newest)
+    try:
+        parent = os.path.dirname(LIVE_LS_STATE_PATH) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = LIVE_LS_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, sort_keys=True, indent=2)
+        os.replace(tmp, LIVE_LS_STATE_PATH)
+    except Exception as exc:
+        logger.warning(
+            f"Phase 9E live-state save failed {LIVE_LS_STATE_PATH}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _live_ls_setup_key(idea: ActiveIdea) -> str:
+    return f"{idea.symbol}|{idea.side}|{idea.setup_type}|{int(idea.setup_ts)}"
+
+
+def _live_order_link_id(prefix: str, setup_key: str) -> str:
+    digest = hashlib.sha256(setup_key.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}-{digest}"[:36]
+
+
+def _live_bybit_entry_side(side: str) -> str:
+    return "Buy" if side == "LONG" else "Sell"
+
+
+def _live_bybit_close_side(side: str) -> str:
+    return "Sell" if side == "LONG" else "Buy"
+
+
+def _live_price_protection_present(
+    position: Dict[str, Any],
+    expected_tp: float,
+    expected_sl: float,
+    tick_size: float,
+) -> bool:
+    tp = _safe_float(position.get("takeProfit"))
+    sl = _safe_float(position.get("stopLoss"))
+    tol = max(abs(tick_size) * 1.1, 1e-12)
+    return tp > 0 and sl > 0 and abs(tp - expected_tp) <= tol and abs(sl - expected_sl) <= tol
+
+
+async def _wait_live_position(
+    private: BybitPrivateExecution,
+    symbol: str,
+    timeout_sec: int,
+) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + max(1, int(timeout_sec))
+    last: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        last = await private.position_linear(symbol)
+        if last is not None and _safe_float(last.get("size")) > 0:
+            return last
+        await asyncio.sleep(0.5)
+    return last
+
+
+async def _wait_live_position_flat(
+    private: BybitPrivateExecution,
+    symbol: str,
+    timeout_sec: int = 15,
+) -> bool:
+    deadline = time.monotonic() + max(1, int(timeout_sec))
+    while time.monotonic() < deadline:
+        pos = await private.position_linear(symbol)
+        if pos is None or _safe_float(pos.get("size")) <= 0:
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _send_live_ls_notice(app: web.Application, text: str) -> None:
+    tg = app.get("tg")
+    if not isinstance(tg, Tg):
+        return
+    for cid in get_broadcast_targets():
+        with contextlib.suppress(Exception):
+            await tg.send(cid, text)
+
+
+async def _close_live_position_reduce_only(
+    private: BybitPrivateExecution,
+    symbol: str,
+    strategy_side: str,
+    qty: float,
+    qty_step: Any,
+    link_seed: str,
+) -> Dict[str, Any]:
+    q = _fmt_step(qty, qty_step)
+    if _dec(q) <= 0:
+        raise RuntimeError("Cannot close zero live quantity")
+    return await private.create_order_linear({
+        "category": "linear",
+        "symbol": symbol,
+        "side": _live_bybit_close_side(strategy_side),
+        "orderType": "Market",
+        "qty": q,
+        "positionIdx": 0,
+        "reduceOnly": True,
+        "orderLinkId": _live_order_link_id("cb9e-close", link_seed + str(now_s())),
+    })
+
+
+async def _ensure_live_ls_protection(
+    private: BybitPrivateExecution,
+    symbol: str,
+    expected_tp: float,
+    expected_sl: float,
+    tick_size: float,
+    tp_text: str,
+    sl_text: str,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    pos = await private.position_linear(symbol)
+    if pos is None:
+        return False, None
+    if _live_price_protection_present(pos, expected_tp, expected_sl, tick_size):
+        return True, pos
+
+    await private.set_trading_stop_full(
+        symbol=symbol,
+        take_profit=tp_text,
+        stop_loss=sl_text,
+        trigger_by=LIVE_LS_TRIGGER_BY,
+    )
+    deadline = time.monotonic() + LIVE_LS_VERIFY_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        pos = await private.position_linear(symbol)
+        if pos is None:
+            return False, None
+        if _live_price_protection_present(pos, expected_tp, expected_sl, tick_size):
+            return True, pos
+        await asyncio.sleep(0.5)
+    return False, pos
+
+
+def _live_ls_net_estimate(
+    row: Dict[str, Any],
+    position: Dict[str, Any],
+    price: float,
+    taker_fee_rate: float,
+    funding_rate: float,
+    funding_interval_min: int,
+    at_ts: Optional[int] = None,
+) -> float:
+    """Conservative expiry net estimate; funding remains an estimate, not ledger truth."""
+    at_ts = int(at_ts or now_s())
+    entry = _dec(position.get("avgPrice") or row.get("avg_entry_price"))
+    qty = _dec(position.get("size") or row.get("qty"))
+    px = _dec(price)
+    taker = _dec(taker_fee_rate)
+    if entry <= 0 or qty <= 0 or px <= 0:
+        return float("-inf")
+
+    opened_at = int(row.get("opened_at") or row.get("emitted_at") or at_ts)
+    elapsed_min = Decimal(str(max(0, at_ts - opened_at))) / Decimal("60")
+    periods = elapsed_min / Decimal(str(max(1, funding_interval_min)))
+    entry_notional = qty * entry
+    funding_cost = _signed_funding_cost(
+        str(row.get("side") or ""), entry_notional, _dec(funding_rate), periods
+    )
+    if row.get("side") == "LONG":
+        gross = qty * (px - entry)
+    else:
+        gross = qty * (entry - px)
+    entry_fee = entry_notional * taker
+    exit_fee = qty * px * taker
+    return float(gross - entry_fee - exit_fee - funding_cost)
+
+
+async def execute_live_ls_signal(
+    app: web.Application,
+    idea: ActiveIdea,
+    state: SymbolState,
+) -> None:
+    """Execute exactly one Phase-9E live LS position, fail-closed on any mismatch."""
+    if idea.setup_type != "LIQUIDITY_SWEEP":
+        return
+    if not LIVE_LS_EXECUTION_ENABLED:
+        return
+    if DRY_RUN_MODE:
+        await _send_live_ls_notice(
+            app,
+            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
+            "LIVE_LS_EXECUTION_ENABLED=1 but DRY_RUN_MODE is still enabled.\n"
+            "<b>No Bybit order was sent.</b>",
+        )
+        return
+    if not LIVE_LS_SINGLE_TP_ENABLED:
+        await _send_live_ls_notice(
+            app,
+            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
+            "LIVE_LS_SINGLE_TP_ENABLED must remain enabled for this phase.\n"
+            "<b>No Bybit order was sent.</b>",
+        )
+        return
+
+    private = app.get("bybit_private")
+    rest = app.get("rest")
+    if not isinstance(private, BybitPrivateExecution) or not isinstance(rest, BybitRest):
+        await _send_live_ls_notice(
+            app,
+            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
+            "Authenticated execution client is unavailable.\n"
+            "<b>No Bybit order was sent.</b>",
+        )
+        return
+
+    setup_key = _live_ls_setup_key(idea)
+    live_state = _live_ls_state(app)
+    executed = live_state.setdefault("executed_setups", {})
+    if setup_key in executed:
+        logger.warning(f"Phase 9E duplicate setup blocked: {setup_key}")
+        return
+
+    try:
+        instrument, wallet, positions, ticker, account_info, api_info = await asyncio.gather(
+            rest.instrument_linear(idea.symbol),
+            private.wallet_balance(),
+            private.positions_linear(),
+            rest.ticker_linear(idea.symbol),
+            private.account_info(),
+            private.api_key_info(),
+        )
+
+        if int(api_info.get("readOnly", 1)) == 1:
+            raise RuntimeError("Bybit API key is read-only")
+        contract_perms = (api_info.get("permissions") or {}).get("ContractTrade") or []
+        if not {"Order", "Position"}.issubset(set(str(x) for x in contract_perms)):
+            raise RuntimeError("Bybit API key lacks Contract Order/Position permissions")
+
+        margin_mode = str(account_info.get("marginMode") or "")
+        if LIVE_LS_REQUIRE_ISOLATED_MARGIN and margin_mode != "ISOLATED_MARGIN":
+            raise RuntimeError(
+                f"account marginMode={margin_mode or 'UNKNOWN'}, expected ISOLATED_MARGIN"
+            )
+
+        open_positions = [p for p in positions if _safe_float(p.get("size")) > 0]
+        if open_positions:
+            raise RuntimeError(
+                "global one-position lock: an open USDT perpetual position already exists"
+            )
+
+        if instrument.get("status") not in (None, "", "Trading"):
+            raise RuntimeError("instrument is not Trading")
+
+        lot = instrument.get("lotSizeFilter") or {}
+        price_filter = instrument.get("priceFilter") or {}
+        leverage_filter = instrument.get("leverageFilter") or {}
+        min_qty = _dec(lot.get("minOrderQty"))
+        qty_step = _dec(lot.get("qtyStep"))
+        min_notional = _dec(lot.get("minNotionalValue"))
+        max_mkt_qty = _dec(lot.get("maxMktOrderQty"))
+        tick = _dec(price_filter.get("tickSize"))
+        max_lev = _dec(leverage_filter.get("maxLeverage"))
+        requested_lev = _dec(LIVE_LS_LEVERAGE)
+        if max_lev > 0 and requested_lev > max_lev:
+            raise RuntimeError(
+                f"instrument max leverage {max_lev}x is below required {requested_lev}x"
+            )
+        if qty_step <= 0 or min_qty <= 0 or tick <= 0:
+            raise RuntimeError("invalid Bybit instrument quantity/tick limits")
+
+        last_price = _dec(ticker.get("lastPrice"))
+        if last_price <= 0:
+            last_price = _dec(get_current_price(state) or idea.current_price_at_signal)
+        if last_price <= 0:
+            raise RuntimeError("live market price unavailable")
+
+        tp = _round_to_tick(_dec(idea.tp1), tick)
+        sl = _round_to_tick(_dec(idea.stop_loss), tick)
+        if idea.side == "LONG":
+            geometry_ok = sl < last_price < tp
+        else:
+            geometry_ok = sl > last_price > tp
+        if not geometry_ok:
+            raise RuntimeError(
+                "live price is no longer between strategy SL and TP1; stale execution blocked"
+            )
+
+        equity = _dec(wallet.get("totalEquity"))
+        available = _dec(wallet.get("totalAvailableBalance"))
+        if available <= 0:
+            raise RuntimeError("Bybit available balance is zero")
+        margin_budget = available * _dec(LIVE_LS_MARGIN_USE_PCT) / Decimal("100")
+        target_notional = margin_budget * requested_lev
+        qty = _floor_to_step(target_notional / last_price, qty_step)
+        if max_mkt_qty > 0:
+            qty = min(qty, _floor_to_step(max_mkt_qty, qty_step))
+        if qty < min_qty:
+            raise RuntimeError(f"calculated qty {qty} is below minOrderQty {min_qty}")
+        if min_notional > 0 and qty * last_price < min_notional:
+            raise RuntimeError(
+                f"calculated notional {qty * last_price} is below minNotionalValue {min_notional}"
+            )
+
+        qty_text = _fmt_step(float(qty), qty_step)
+        tp_text = _fmt_step(float(tp), tick)
+        sl_text = _fmt_step(float(sl), tick)
+        lev_text = f"{float(requested_lev):g}"
+        estimated_notional = qty * last_price
+        estimated_margin = estimated_notional / requested_lev
+        gross_sl_loss = qty * abs(last_price - sl)
+        account_risk_pct = (
+            gross_sl_loss / equity * Decimal("100") if equity > 0 else Decimal("0")
+        )
+
+        # Leverage is explicit and symmetrical because Phase 9E requires one-way mode.
+        try:
+            await private.set_leverage_linear(idea.symbol, lev_text)
+        except RuntimeError as exc:
+            # Bybit returns a specific non-zero code when leverage is already set.
+            # Treat only that idempotent case as success; all other errors fail closed.
+            if "110043" not in str(exc):
+                raise
+
+        order_link_id = _live_order_link_id("cb9e-entry", setup_key)
+        order_payload = {
+            "category": "linear",
+            "symbol": idea.symbol,
+            "side": _live_bybit_entry_side(idea.side),
+            "orderType": "Market",
+            "qty": qty_text,
+            "positionIdx": 0,
+            "orderLinkId": order_link_id,
+            "takeProfit": tp_text,
+            "stopLoss": sl_text,
+            "tpTriggerBy": LIVE_LS_TRIGGER_BY,
+            "slTriggerBy": LIVE_LS_TRIGGER_BY,
+            "tpslMode": "Full",
+            "tpOrderType": "Market",
+            "slOrderType": "Market",
+        }
+
+        order_result: Dict[str, Any] = {}
+        try:
+            order_result = await private.create_order_linear(order_payload)
+        except Exception:
+            # Network ambiguity after POST is dangerous. Query by idempotent link ID
+            # before deciding that no order exists.
+            existing_order = None
+            with contextlib.suppress(Exception):
+                existing_order = await private.order_realtime(
+                    idea.symbol, order_link_id=order_link_id
+                )
+            if not existing_order:
+                raise
+            order_result = existing_order
+
+        order_id = str(order_result.get("orderId") or "")
+        executed[setup_key] = {
+            "ts": now_s(),
+            "symbol": idea.symbol,
+            "side": idea.side,
+            "setup_ts": idea.setup_ts,
+            "order_link_id": order_link_id,
+            "order_id": order_id,
+        }
+        _save_live_ls_state(app)
+
+        pos = await _wait_live_position(private, idea.symbol, LIVE_LS_FILL_TIMEOUT_SEC)
+        if pos is None or _safe_float(pos.get("size")) <= 0:
+            raise RuntimeError(
+                "entry order was accepted but no live position was confirmed before timeout"
+            )
+
+        actual_qty = _safe_float(pos.get("size"))
+        avg_entry = _safe_float(pos.get("avgPrice"), float(last_price))
+        opened_at = now_s()
+
+        # Isolated positions must never silently consume more wallet collateral.
+        with contextlib.suppress(Exception):
+            await private.set_auto_add_margin_off(idea.symbol)
+
+        protected = False
+        protected_pos: Optional[Dict[str, Any]] = None
+        try:
+            protected, protected_pos = await _ensure_live_ls_protection(
+                private,
+                idea.symbol,
+                float(tp),
+                float(sl),
+                float(tick),
+                tp_text,
+                sl_text,
+            )
+        except Exception as exc:
+            logger.error(
+                f"Phase 9E protection verification failed {idea.symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if not protected:
+            if LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL:
+                await _close_live_position_reduce_only(
+                    private,
+                    idea.symbol,
+                    idea.side,
+                    actual_qty,
+                    qty_step,
+                    setup_key + "|protect-fail",
+                )
+                flat_after_emergency = await _wait_live_position_flat(private, idea.symbol, 15)
+                live_state.setdefault("positions", {})[idea.symbol] = {
+                    "status": ("ERROR_CLOSED_UNPROTECTED" if flat_after_emergency else "EMERGENCY_CLOSE_SENT"),
+                    "symbol": idea.symbol,
+                    "side": idea.side,
+                    "setup_key": setup_key,
+                    "qty": actual_qty,
+                    "avg_entry_price": avg_entry,
+                    "tp": float(tp),
+                    "sl": float(sl),
+                    "opened_at": opened_at,
+                    "closed_at": now_s(),
+                    "order_id": order_id,
+                    "order_link_id": order_link_id,
+                }
+                _save_live_ls_state(app)
+                await _send_live_ls_notice(
+                    app,
+                    "🚨 <b>LIVE LS emergency close</b>\n"
+                    f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
+                    "Bybit position opened, but full TP/SL protection could not be verified.\n"
+                    "A reduce-only market close was sent. Check Bybit immediately.",
+                )
+                return
+            raise RuntimeError("full-position TP/SL protection could not be verified")
+
+        live_state.setdefault("positions", {})[idea.symbol] = {
+            "status": "OPEN",
+            "symbol": idea.symbol,
+            "side": idea.side,
+            "setup_type": idea.setup_type,
+            "setup_key": setup_key,
+            "setup_ts": idea.setup_ts,
+            "signal_price": idea.current_price_at_signal,
+            "avg_entry_price": avg_entry,
+            "qty": actual_qty,
+            "leverage": float(requested_lev),
+            "margin_use_pct": LIVE_LS_MARGIN_USE_PCT,
+            "estimated_margin_usdt": float(estimated_margin),
+            "tp": float(tp),
+            "sl": float(sl),
+            "tick_size": float(tick),
+            "qty_step": float(qty_step),
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+            "emitted_at": idea.emitted_at,
+            "opened_at": opened_at,
+            "expires_at": idea.expires_at,
+            "trigger_by": LIVE_LS_TRIGGER_BY,
+            "updated_at": now_s(),
+        }
+        _save_live_ls_state(app)
+
+        await _send_live_ls_notice(
+            app,
+            "🚀 <b>LIVE LS POSITION OPEN</b>\n\n"
+            f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
+            f"<b>Qty:</b> <code>{html.escape(_fmt_step(actual_qty, qty_step))}</code>\n"
+            f"<b>Avg entry:</b> <code>{avg_entry:.8g}</code>\n"
+            f"<b>Leverage:</b> {float(requested_lev):.0f}x · isolated account mode\n"
+            f"<b>Margin allocation:</b> {LIVE_LS_MARGIN_USE_PCT:.0f}% of available · "
+            f"~${float(estimated_margin):.2f}\n"
+            f"<b>TP:</b> <code>{html.escape(tp_text)}</code> · 100% position (strategy TP1)\n"
+            f"<b>SL:</b> <code>{html.escape(sl_text)}</code> · 100% position\n"
+            f"<b>Gross risk to SL from execution price:</b> ~${float(gross_sl_loss):.2f} "
+            f"({float(account_risk_pct):.1f}% of equity)\n"
+            f"<b>Protection:</b> verified on Bybit ✅\n"
+            f"<b>Order:</b> <code>{html.escape(order_id or order_link_id)}</code>",
+        )
+    except Exception as exc:
+        logger.error(
+            f"Phase 9E.1 live execution blocked/failed {idea.symbol}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        await _send_live_ls_notice(
+            app,
+            "🛑 <b>LIVE LS ORDER NOT OPENED</b>\n\n"
+            f"<b>{html.escape(idea.symbol)} {html.escape(idea.side)}</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n\n"
+            "No new unprotected position is intentionally left by Phase 9E.",
+        )
+
+
+async def reconcile_live_ls_execution(app: web.Application) -> None:
+    """Reconcile tracked Phase-9E positions with Bybit and enforce expiry policy."""
+    live_state = _live_ls_state(app)
+    tracked = live_state.get("positions") or {}
+    if not isinstance(tracked, dict) or not tracked:
+        return
+    private = app.get("bybit_private")
+    rest = app.get("rest")
+    if not isinstance(private, BybitPrivateExecution) or not isinstance(rest, BybitRest):
+        return
+
+    try:
+        positions = await private.positions_linear()
+    except Exception as exc:
+        logger.warning(f"Phase 9E reconcile positions failed: {type(exc).__name__}: {exc}")
+        return
+    by_symbol = {
+        str(p.get("symbol") or ""): p
+        for p in positions
+        if _safe_float(p.get("size")) > 0
+    }
+
+    changed = False
+    for symbol, row in list(tracked.items()):
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "")
+        if status not in (
+            "OPEN", "EXPIRED_WAIT_EXIT", "EXPIRY_EXIT_SENT",
+            "EMERGENCY_CLOSE_SENT", "MANUAL_CLOSE_SENT",
+        ):
+            continue
+        pos = by_symbol.get(symbol)
+        if pos is None:
+            row["status"] = "CLOSED"
+            row["closed_at"] = now_s()
+            row["updated_at"] = now_s()
+            changed = True
+            await _send_live_ls_notice(
+                app,
+                "✅ <b>LIVE LS position is flat</b>\n"
+                f"<b>{html.escape(symbol)} {html.escape(str(row.get('side') or ''))}</b>\n"
+                "Bybit reports position size = 0. Attached full-position TP/SL is no longer active.",
+            )
+            continue
+
+        # Every reconciliation also checks that the exchange still reports both
+        # protective levels. This is independent of strategy candle lifecycle.
+        expected_tp = _safe_float(row.get("tp"))
+        expected_sl = _safe_float(row.get("sl"))
+        tick = _safe_float(row.get("tick_size"))
+        if not _live_price_protection_present(pos, expected_tp, expected_sl, tick):
+            if _live_ls_is_armed():
+                try:
+                    ok, pos2 = await _ensure_live_ls_protection(
+                        private,
+                        symbol,
+                        expected_tp,
+                        expected_sl,
+                        tick,
+                        _fmt_step(expected_tp, tick),
+                        _fmt_step(expected_sl, tick),
+                    )
+                    if pos2 is not None:
+                        pos = pos2
+                    if not ok:
+                        raise RuntimeError("protective TP/SL still missing after repair attempt")
+                except Exception as exc:
+                    logger.error(
+                        f"Phase 9E protection lost {symbol}: {type(exc).__name__}: {exc}"
+                    )
+                    if LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL:
+                        try:
+                            await _close_live_position_reduce_only(
+                                private,
+                                symbol,
+                                str(row.get("side") or ""),
+                                _safe_float(pos.get("size")),
+                                row.get("qty_step") or 0.0,
+                                str(row.get("setup_key") or symbol) + "|lost-protection",
+                            )
+                            row["status"] = "EMERGENCY_CLOSE_SENT"
+                            row["updated_at"] = now_s()
+                            changed = True
+                            await _send_live_ls_notice(
+                                app,
+                                "🚨 <b>LIVE LS protection lost</b>\n"
+                                f"<b>{html.escape(symbol)}</b>\n"
+                                "TP/SL could not be restored. A reduce-only emergency market close was sent.",
+                            )
+                        except Exception as close_exc:
+                            await _send_live_ls_notice(
+                                app,
+                                "🚨 <b>CRITICAL: LIVE LS protection failure</b>\n"
+                                f"<b>{html.escape(symbol)}</b>\n"
+                                f"Protection repair failed and emergency close also failed: "
+                                f"<code>{html.escape(str(close_exc)[:500])}</code>\n"
+                                "Check Bybit immediately.",
+                            )
+            continue
+
+        expires_at = int(row.get("expires_at") or 0)
+        if expires_at <= 0 or now_s() < expires_at or status == "EXPIRY_EXIT_SENT":
+            continue
+        if not _live_ls_is_armed():
+            continue
+
+        try:
+            ticker, fee_row, instrument = await asyncio.gather(
+                rest.ticker_linear(symbol),
+                private.fee_rate_linear(symbol),
+                rest.instrument_linear(symbol),
+            )
+            px = _safe_float(ticker.get("lastPrice"))
+            taker = _safe_float(fee_row.get("takerFeeRate"))
+            funding_rate = _safe_float(ticker.get("fundingRate"))
+            interval_min = _funding_interval_minutes(instrument, ticker)
+            net_est = _live_ls_net_estimate(
+                row, pos, px, taker, funding_rate, interval_min
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Phase 9E expiry net estimate failed {symbol}: {type(exc).__name__}: {exc}"
+            )
+            continue
+
+        if net_est >= 0:
+            try:
+                await _close_live_position_reduce_only(
+                    private,
+                    symbol,
+                    str(row.get("side") or ""),
+                    _safe_float(pos.get("size")),
+                    row.get("qty_step") or 0.0,
+                    str(row.get("setup_key") or symbol) + "|expiry-net",
+                )
+                row["status"] = "EXPIRY_EXIT_SENT"
+                row["expiry_net_est_usdt"] = net_est
+                row["updated_at"] = now_s()
+                changed = True
+                await _send_live_ls_notice(
+                    app,
+                    "⏳✅ <b>LIVE LS expiry exit sent</b>\n"
+                    f"<b>{html.escape(symbol)}</b> · estimated net ${net_est:+.3f}\n"
+                    "A reduce-only market close was sent. Original SL was not removed first.",
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Phase 9E expiry close failed {symbol}: {type(exc).__name__}: {exc}"
+                )
+        elif status == "OPEN":
+            row["status"] = "EXPIRED_WAIT_EXIT"
+            row["expiry_net_est_usdt"] = net_est
+            row["updated_at"] = now_s()
+            changed = True
+            await _send_live_ls_notice(
+                app,
+                "⏳ <b>LIVE LS — EXPIRED_WAIT_EXIT</b>\n"
+                f"<b>{html.escape(symbol)}</b> · estimated net ${net_est:+.3f}\n"
+                "Position is not force-closed at a loss. Full-position TP and original SL remain active; "
+                "the bot will also close at estimated net break-even when reached.",
+            )
+
+    if changed:
+        _save_live_ls_state(app)
 
 
 
@@ -6738,9 +7671,15 @@ async def scan_symbol(
                 logger.warning(f"send_signal failed {sym}: {e}")
                 await report_error(app, f"send_signal/{sym}", e)
 
-            # Phase 9B is downstream of the existing signal engine. It cannot
-            # create or block an ActiveIdea and never calls a Bybit write endpoint.
-            if EXECUTION_PLANNER_ENABLED and EXECUTION_PLANNER_AUTO_SEND:
+            # Phase 9E is strictly downstream of the signal engine. Only LS may
+            # reach the live executor. BR/TP remain signal/diagnostic-only.
+            if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_EXECUTION_ENABLED:
+                try:
+                    await execute_live_ls_signal(app, idea, state)
+                except Exception as e:
+                    logger.exception(f"Phase 9E live executor failed {sym}")
+                    await report_error(app, f"live_ls_execution/{sym}", e)
+            elif EXECUTION_PLANNER_ENABLED and EXECUTION_PLANNER_AUTO_SEND:
                 try:
                     await send_execution_plan(
                         app, idea, state, reserve_shadow_margin=True
@@ -6952,6 +7891,13 @@ async def poll_loop(app: web.Application) -> None:
             if "BTCUSDT" in mkt.state:
                 mkt.btc_regime        = mkt.state["BTCUSDT"].regime
                 mkt.btc_regime_reason = mkt.state["BTCUSDT"].regime_reason
+            # Phase 9E reconciles real exchange state once per poll cycle, not
+            # once per symbol, to keep authenticated request volume bounded.
+            try:
+                await reconcile_live_ls_execution(app)
+            except Exception as exc:
+                logger.exception("Phase 9E reconcile top-level error")
+                await report_error(app, "live_ls_reconcile", exc)
             mkt.last_poll_ts = now_s()
             mkt.poll_count  += 1
         except Exception as e:
@@ -7079,6 +8025,30 @@ async def check_idea_lifecycle(
             except Exception as e:
                 logger.warning(f"send_idea_update SL_HIT failed {sym}: {e}")
                 await report_error(app, f"send_idea_update/{sym}/SL_HIT", e)
+            return
+
+        if (
+            idea.setup_type == "LIQUIDITY_SWEEP"
+            and LIVE_LS_SINGLE_TP_ENABLED
+            and tp1_hit
+            and idea.status == "ACTIVE"
+        ):
+            idea.status = "TP1_HIT"
+            idea.tp1_hit_at = now
+            state.active_idea = None
+            state.last_exit_ts = now
+            state.last_exit_event = "TP1_HIT"
+            _reset_sl_streak_after_success(state)
+            mkt.signal_stats["tp1_hit"] += 1
+            logger.info(
+                f"IDEA TP1_HIT_FINAL {sym} {idea.side} {idea.setup_type} "
+                f"tp1={idea.tp1:.4f}"
+            )
+            try:
+                await send_idea_update(app, idea, "TP1_HIT")
+            except Exception as e:
+                logger.warning(f"send_idea_update TP1_HIT_FINAL failed {sym}: {e}")
+                await report_error(app, f"send_idea_update/{sym}/TP1_HIT_FINAL", e)
             return
 
         if tp2_hit and idea.status in ("ACTIVE", "TP1_HIT"):
@@ -7304,10 +8274,18 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     sym_pretty  = idea.symbol.replace("USDT", "/USDT")
     setup_label = _SETUP_LABELS.get(idea.setup_type, idea.setup_type.replace("_", " "))
     regime_e    = _regime_emoji(state.regime)
-    dry_banner  = "🧪 <b>DRY RUN</b>\n" if DRY_RUN_MODE else ""
-    disclaimer  = ("Dry-run signal. Not financial advice. Manage risk."
-                   if DRY_RUN_MODE else
-                   "Not financial advice. Manage risk.")
+    if DRY_RUN_MODE:
+        dry_banner = "🧪 <b>DRY RUN</b>\n"
+        disclaimer = "Dry-run signal. Not financial advice. Manage risk."
+    elif LIVE_LS_EXECUTION_ENABLED and idea.setup_type == "LIQUIDITY_SWEEP":
+        dry_banner = "🔴 <b>LIVE LS EXECUTION ELIGIBLE</b>\n"
+        disclaimer = "Phase 9E may execute this LS on Bybit. Manage risk."
+    elif LIVE_LS_EXECUTION_ENABLED:
+        dry_banner = "📡 <b>SIGNAL ONLY — NOT LIVE-EXECUTED</b>\n"
+        disclaimer = "BR/TP remain signal/diagnostic only in Phase 9E."
+    else:
+        dry_banner = ""
+        disclaimer = "Not financial advice. Manage risk."
 
     # Current price and entry zone status (Phase 8A)
     if idea.current_price_at_signal > 0.0:
@@ -7326,6 +8304,20 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
     else:
         age_line    = f"⏱ Expires in: {MAX_IDEA_DURATION_DAYS} days\n"
 
+    if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_SINGLE_TP_ENABLED:
+        targets_block = (
+            f"🎯 <b>Take Profit:</b>  <code>{idea.tp1:.5f}</code>  "
+            f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n"
+            f"<b>Exit size:</b> 100% of position\n\n"
+        )
+    else:
+        targets_block = (
+            f"🎯 <b>TP1:</b>  <code>{idea.tp1:.5f}</code>  "
+            f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n"
+            f"🎯 <b>TP2:</b>  <code>{idea.tp2:.5f}</code>  "
+            f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}</i>\n\n"
+        )
+
     return (
         f"{dry_banner}"
         f"{side_emoji} <b>{side_label} — {sym_pretty}</b>\n"
@@ -7337,10 +8329,7 @@ def format_signal(idea: ActiveIdea, state: SymbolState) -> str:
         f"{status_line}"
         f"🛡 <b>Stop Loss:</b>   <code>{idea.stop_loss:.5f}</code>  "
         f"<i>{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}</i>\n\n"
-        f"🎯 <b>TP1:</b>  <code>{idea.tp1:.5f}</code>  "
-        f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n"
-        f"🎯 <b>TP2:</b>  <code>{idea.tp2:.5f}</code>  "
-        f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}</i>\n\n"
+        f"{targets_block}"
         f"{age_line}"
         f"🛑 <b>Idea invalid if:</b> {html.escape(idea.invalidation)}\n\n"
         f"<i>{disclaimer}</i>"
@@ -7360,6 +8349,13 @@ def format_idea_update(idea: ActiveIdea, event: str) -> str:
     dry_prefix = "🧪 <b>DRY RUN</b>\n" if DRY_RUN_MODE else ""
 
     if event == "TP1_HIT":
+        if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_SINGLE_TP_ENABLED:
+            return (
+                f"{dry_prefix}✅ <b>TAKE PROFIT HIT — Idea completed!</b>\n{header}\n\n"
+                f"<b>TP:</b> <code>{idea.tp1:.5f}</code>  "
+                f"<i>{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}</i>\n"
+                f"<b>Exit:</b> 100% of position"
+            )
         return (
             f"{dry_prefix}🟡 <b>TP1 HIT</b> — {header}\n\n"
             f"<b>TP1:</b> <code>{idea.tp1:.5f}</code>  "
@@ -7498,6 +8494,14 @@ async def tg_loop(app: web.Application) -> None:
                 elif text.startswith("/idea "):
                     sym = text.split(maxsplit=1)[1].upper().strip()
                     await _cmd_idea_detail(app, cid, sym)
+                elif text.startswith("/liveclose"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split()
+                        sym = parts[1].upper().strip() if len(parts) > 1 else ""
+                        confirm = parts[2].upper().strip() if len(parts) > 2 else ""
+                        await _cmd_liveclose(app, cid, sym, confirm)
                 elif text.startswith("/close "):
                     if cid not in ALLOWED_CHAT_IDS:
                         await tg.send(cid, "⛔ Unauthorized.")
@@ -7536,6 +8540,11 @@ async def tg_loop(app: web.Application) -> None:
                         await tg.send(cid, "⛔ Unauthorized.")
                     else:
                         await _cmd_execshadow(app, cid)
+                elif text in ("/liveexec", "/live"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        await _cmd_liveexec(app, cid)
                 elif text.startswith("/simcase"):
                     if cid not in ALLOWED_CHAT_IDS:
                         await tg.send(cid, "⛔ Unauthorized.")
@@ -7629,7 +8638,8 @@ async def _cmd_apikey(app: web.Application, cid: int) -> None:
         f"<b>API-key mode:</b> {html.escape(key_mode)}\n"
         f"<b>Contract permissions:</b> {html.escape(perm_text)}\n"
         f"<b>IP bindings:</b> {expiry.get('ips_bound', 0)}\n"
-        "<b>Bot bridge:</b> GET-only (Phase 9A) ✅"
+        f"<b>Bot bridge:</b> {'Phase 9E execution-capable' if isinstance(client, BybitPrivateExecution) else 'GET-only (Phase 9A)'} · "
+        f"live {'ARMED' if _live_ls_is_armed() else 'not armed'}"
     ))
 
 
@@ -7681,12 +8691,12 @@ async def _cmd_bybit(app: web.Application, cid: int) -> None:
         error_text = f"\n\n⚠️ <b>Partial errors:</b> <code>{html.escape(compact)}</code>"
 
     await tg.send(cid, (
-        "🏦 <b>Bybit Read-Only Bridge — Phase 9A</b>\n\n"
+        "🏦 <b>Bybit Private Bridge — Phase 9E</b>\n\n"
         f"<b>API:</b> {key_line}\n"
         f"<b>Unified account:</b> {html.escape(wallet_line)}\n"
         f"<b>Open USDT-perp positions:</b> {len(positions)}\n"
         f"{positions_text}\n\n"
-        "<b>Trading actions:</b> disabled by code — GET endpoints only ✅"
+        f"<b>Trading actions:</b> {'LS-only live execution ARMED 🔴' if _live_ls_is_armed() else 'live execution not armed ✅'}"
         + error_text
     ))
 
@@ -7766,6 +8776,66 @@ async def _cmd_execshadow(app: web.Application, cid: int) -> None:
 
 
 
+async def _cmd_liveexec(app: web.Application, cid: int) -> None:
+    """Show Phase 9E live-execution gates and tracked exchange state."""
+    tg: Tg = app["tg"]
+    client = app.get("bybit_private")
+    margin_mode = "unavailable"
+    bybit_positions: List[Dict[str, Any]] = []
+    account_error = ""
+    if isinstance(client, BybitPrivateExecution):
+        try:
+            info, bybit_positions = await asyncio.gather(
+                client.account_info(), client.positions_linear()
+            )
+            margin_mode = str(info.get("marginMode") or "UNKNOWN")
+        except Exception as exc:
+            account_error = f"{type(exc).__name__}: {exc}"
+
+    live_state = _live_ls_state(app)
+    tracked = live_state.get("positions") or {}
+    active_rows = [
+        row for row in tracked.values()
+        if isinstance(row, dict) and str(row.get("status") or "")
+        in ("OPEN", "EXPIRED_WAIT_EXIT", "EXPIRY_EXIT_SENT", "EMERGENCY_CLOSE_SENT", "MANUAL_CLOSE_SENT")
+    ]
+    armed = _live_ls_is_armed()
+    lines = [
+        "⚡ <b>Phase 9E.1 — LS Live Executor</b>",
+        "",
+        f"<b>ENV enabled:</b> {'yes ✅' if LIVE_LS_EXECUTION_ENABLED else 'no ⚪'}",
+        f"<b>Strategy signals DRY_RUN:</b> {'ON 🧪' if DRY_RUN_MODE else 'OFF'}",
+        f"<b>LS live execution:</b> {'ARMED 🔴' if armed else 'OFF ⚪'}",
+        "<b>Mode separation:</b> DRY_RUN does not block LS live execution",
+        "<b>Executable setup:</b> LIQUIDITY_SWEEP only",
+        f"<b>Leverage:</b> {LIVE_LS_LEVERAGE:g}x",
+        f"<b>Margin allocation:</b> {LIVE_LS_MARGIN_USE_PCT:g}% of available",
+        "<b>Concurrent live positions:</b> max 1",
+        "<b>Take Profit:</b> strategy TP1 · 100% close",
+        "<b>Stop Loss:</b> strategy SL · 100% protection",
+        f"<b>Trigger:</b> {html.escape(LIVE_LS_TRIGGER_BY)}",
+        f"<b>Required margin mode:</b> ISOLATED_MARGIN",
+        f"<b>Bybit margin mode:</b> {html.escape(margin_mode)}",
+        f"<b>Bybit open USDT-perp positions:</b> {len(bybit_positions)}",
+        f"<b>Tracked active rows:</b> {len(active_rows)}",
+        f"<b>State:</b> <code>{html.escape(LIVE_LS_STATE_PATH)}</code>",
+    ]
+    for row in active_rows[:5]:
+        lines.append(
+            f"  {html.escape(str(row.get('symbol') or '?'))} "
+            f"{html.escape(str(row.get('side') or ''))} · "
+            f"{html.escape(str(row.get('status') or ''))} · "
+            f"qty {_safe_float(row.get('qty')):g}"
+        )
+    if account_error:
+        lines.extend(["", f"⚠️ <code>{html.escape(account_error[:500])}</code>"])
+    if DRY_RUN_MODE:
+        lines.extend(["", "🧪 Strategy/Telegram signals remain in DRY RUN mode; this does not block LS live execution in Phase 9E.1."])
+    if armed and margin_mode != "ISOLATED_MARGIN":
+        lines.extend(["", "🛑 Live entries will be rejected until Bybit account margin mode is ISOLATED_MARGIN."])
+    await tg.send(cid, "\n".join(lines))
+
+
 async def _cmd_simstatus(app: web.Application, cid: int) -> None:
     """Show in-memory Phase 9D simulator activity only."""
     tg: Tg = app["tg"]
@@ -7828,9 +8898,9 @@ async def _cmd_status(app: web.Application, cid: int) -> None:
         f"SL:{stats['sl_hit']}  Exp:{stats['expired']}  "
         f"Amb:{stats['ambiguous']}\n\n"
         f"<b>Last poll:</b> {poll_ago}  (#{mkt.poll_count})\n"
-        f"<b>Mode:</b> {'🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS'}\n"
+        f"<b>Mode:</b> {'🔴 LIVE LS ARMED' if _live_ls_is_armed() else ('🧪 DRY RUN' if DRY_RUN_MODE else '✅ LIVE SIGNALS')}\n"
         f"<b>Phase:</b> 3 det · 4 RR · 5 lifecycle · 6 Tg · 7 dry-run · "
-        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner · 9C net economics/expiry shadow · 9D scenario simulator"
+        f"8A entry gate · 8B.1 safe-send · 8C diag · 8D actionable · 8E watchlist · 8F candidates · 8G dead-diag · 8H LS recency · 8I dedup · 8J TP/SL % · 8K entry retest · 8L eligible watchlist · 8L.2 temporal fixes · 8L.3 signal-flow rollback · 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · 9A Bybit read-only · 9B execution planner · 9C net economics/expiry shadow · 9D scenario simulator · 9E LS live executor"
     ))
 
 
@@ -7878,16 +8948,25 @@ async def _cmd_ideas(app: web.Application, cid: int) -> None:
     for sym, idea in ideas:
         e     = "🟢" if idea.side == "LONG" else "🔴"
         age_h = (now_s() - idea.emitted_at) // 3600
+        if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_SINGLE_TP_ENABLED:
+            target_line = (
+                f"   TP {idea.tp1:.4f} "
+                f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)} · 100% close\n"
+            )
+        else:
+            target_line = (
+                f"   TP1 {idea.tp1:.4f} "
+                f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)} | "
+                f"TP2 {idea.tp2:.4f} "
+                f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n"
+            )
         lines.append(
             f"{e} <b>{sym.replace('USDT','')}</b> {idea.side} | "
             f"{idea.setup_type.replace('_',' ')} | score {idea.setup_score}\n"
             f"   Entry {idea.entry_low:.4f}–{idea.entry_high:.4f} | "
             f"SL {idea.stop_loss:.4f} "
             f"{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}\n"
-            f"   TP1 {idea.tp1:.4f} "
-            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)} | "
-            f"TP2 {idea.tp2:.4f} "
-            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n"
+            f"{target_line}"
             f"   Status: {idea.status} | Age: {age_h}h\n"
         )
     await tg.send(cid, "\n".join(lines))
@@ -7909,6 +8988,19 @@ async def _cmd_idea_detail(app: web.Application, cid: int, sym: str) -> None:
     age_h = (now_s() - idea.emitted_at) // 3600
     exp_h = max(0, (idea.expires_at - now_s()) // 3600)
 
+    if idea.setup_type == "LIQUIDITY_SWEEP" and LIVE_LS_SINGLE_TP_ENABLED:
+        targets_text = (
+            f"<b>Take Profit:</b> {idea.tp1:.5f}  "
+            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)} · 100% close\n\n"
+        )
+    else:
+        targets_text = (
+            f"<b>TP1:</b>        {idea.tp1:.5f}  "
+            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}\n"
+            f"<b>TP2:</b>        {idea.tp2:.5f}  "
+            f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n\n"
+        )
+
     await tg.send(cid, (
         f"{e} <b>{sym} — {idea.side}</b>\n\n"
         f"<b>Setup:</b>  {idea.setup_type.replace('_',' ')} (score {idea.setup_score})\n"
@@ -7916,10 +9008,7 @@ async def _cmd_idea_detail(app: web.Application, cid: int, sym: str) -> None:
         f"<b>Entry zone:</b> {idea.entry_low:.5f} – {idea.entry_high:.5f}\n"
         f"<b>Stop Loss:</b>  {idea.stop_loss:.5f}  "
         f"{format_level_pct(idea.side, idea.entry_low, idea.entry_high, idea.stop_loss)}\n"
-        f"<b>TP1:</b>        {idea.tp1:.5f}  "
-        f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp1, idea.rr_tp1)}\n"
-        f"<b>TP2:</b>        {idea.tp2:.5f}  "
-        f"{format_tp_with_rr(idea.side, idea.entry_low, idea.entry_high, idea.tp2, idea.rr_tp2)}\n\n"
+        f"{targets_text}"
         f"<b>Invalidation:</b> {html.escape(idea.invalidation)}\n\n"
         f"<b>Age:</b> {age_h}h  |  <b>Expires in:</b> {exp_h}h"
     ))
@@ -7931,6 +9020,19 @@ async def _cmd_close(app: web.Application, cid: int, sym: str) -> None:
 
     if not sym.endswith("USDT"):
         sym += "USDT"
+    live_rows = (_live_ls_state(app).get("positions") or {})
+    live_row = live_rows.get(sym) if isinstance(live_rows, dict) else None
+    if isinstance(live_row, dict) and str(live_row.get("status") or "") in (
+        "OPEN", "EXPIRED_WAIT_EXIT", "EXPIRY_EXIT_SENT",
+        "EMERGENCY_CLOSE_SENT", "MANUAL_CLOSE_SENT",
+    ):
+        await tg.send(
+            cid,
+            f"🛑 <b>/close refused for {html.escape(sym)}</b>\n"
+            "A tracked LIVE Bybit position exists. /close only invalidates the strategy idea.\n"
+            f"To close the real position use: <code>/liveclose {html.escape(sym)} CONFIRM</code>",
+        )
+        return
     state = mkt.state.get(sym)
     if state is None or state.active_idea is None:
         await tg.send(cid, f"No active idea for <b>{sym}</b> to close.")
@@ -7957,6 +9059,68 @@ async def _cmd_close(app: web.Application, cid: int, sym: str) -> None:
             f"{sym} {idea.side} | {idea.setup_type.replace('_', ' ')}\n"
             f"Closed at {ts}"
         ))
+
+
+async def _cmd_liveclose(app: web.Application, cid: int, sym: str, confirm: str) -> None:
+    """Explicit emergency/manual close for a tracked Phase-9E live position."""
+    tg: Tg = app["tg"]
+    if not sym:
+        await tg.send(cid, "Usage: <code>/liveclose BTCUSDT CONFIRM</code>")
+        return
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+    if confirm != "CONFIRM":
+        await tg.send(
+            cid,
+            f"⚠️ <b>Confirmation required</b>\n"
+            f"Send exactly: <code>/liveclose {html.escape(sym)} CONFIRM</code>\n"
+            "This sends a real reduce-only market close order.",
+        )
+        return
+    private = app.get("bybit_private")
+    if not isinstance(private, BybitPrivateExecution):
+        await tg.send(cid, "❌ Phase 9E execution client unavailable.")
+        return
+    live_state = _live_ls_state(app)
+    tracked = live_state.get("positions") or {}
+    row = tracked.get(sym) if isinstance(tracked, dict) else None
+    if not isinstance(row, dict):
+        await tg.send(cid, f"No tracked Phase 9E live position for <b>{html.escape(sym)}</b>.")
+        return
+    try:
+        pos = await private.position_linear(sym)
+        if pos is None or _safe_float(pos.get("size")) <= 0:
+            row["status"] = "CLOSED"
+            row["closed_at"] = now_s()
+            _save_live_ls_state(app)
+            await tg.send(cid, f"✅ <b>{html.escape(sym)}</b> is already flat on Bybit.")
+            return
+        result = await _close_live_position_reduce_only(
+            private,
+            sym,
+            str(row.get("side") or ""),
+            _safe_float(pos.get("size")),
+            row.get("qty_step") or 0.0,
+            str(row.get("setup_key") or sym) + "|manual-close",
+        )
+        row["status"] = "MANUAL_CLOSE_SENT"
+        row["manual_close_order_id"] = str(result.get("orderId") or "")
+        row["updated_at"] = now_s()
+        _save_live_ls_state(app)
+        await tg.send(
+            cid,
+            f"🧯 <b>LIVE close sent — {html.escape(sym)}</b>\n"
+            "Reduce-only market close submitted. Existing TP/SL was not cancelled first; "
+            "reconciliation will confirm position size = 0.",
+        )
+    except Exception as exc:
+        await tg.send(
+            cid,
+            f"🚨 <b>LIVE close FAILED — {html.escape(sym)}</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n"
+            "Check Bybit immediately.",
+        )
+
 
 
 _SETUP_ABBREV = {
@@ -8846,6 +10010,12 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"synthetic SL {EXECUTION_SIMULATOR_SL_PCT:.2f}% · "
         f"TP1 {EXECUTION_SIMULATOR_TP1_PCT:.2f}% · TP2 {EXECUTION_SIMULATOR_TP2_PCT:.2f}%\n"
         f"<b>Simulator isolation:</b> strategy stats/DB/watchlist/cooldowns untouched · Bybit GET-only\n"
+        f"<b>LS live executor:</b> {'ARMED' if _live_ls_is_armed() else 'off'} (Phase 9E.1; independent of DRY_RUN)\n"
+        f"<b>Live setup:</b> LIQUIDITY_SWEEP only · {LIVE_LS_LEVERAGE:g}x · {LIVE_LS_MARGIN_USE_PCT:g}% available margin · max 1 position\n"
+        f"<b>Live TP:</b> strategy TP1 closes 100% · TP2 not used for LS exit\n"
+        f"<b>Live SL:</b> strategy SL protects 100% · verified on Bybit after fill\n"
+        f"<b>Live margin mode:</b> requires ISOLATED_MARGIN · one-way positionIdx=0 · auto-add margin disabled\n"
+        f"<b>Live trigger:</b> {html.escape(LIVE_LS_TRIGGER_BY)} · state <code>{html.escape(LIVE_LS_STATE_PATH)}</code>\n"
         f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
         f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
@@ -9178,7 +10348,8 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.2 post-confirmation timing/diagnostics hotfix · "
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
-        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow · Phase 9D isolated execution scenario simulator)"
+        "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow · Phase 9D isolated execution scenario simulator · "
+        "Phase 9E.1 LS-only live executor + dual-mode signals + command menu)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -9188,11 +10359,22 @@ async def on_startup(app: web.Application) -> None:
         logger.warning("⚠️  No broadcast targets configured (PRIMARY_RECIPIENTS and ALLOWED_CHAT_IDS are both empty)")
     if not DRY_RUN_MODE:
         logger.warning("⚠️  DRY_RUN_MODE=False — bot is in LIVE SIGNALS mode")
+    if LIVE_LS_EXECUTION_ENABLED and DRY_RUN_MODE:
+        logger.warning("Phase 9E.1 dual mode: strategy signals DRY_RUN=1 while LS live execution is independently enabled")
+    if _live_ls_is_armed():
+        logger.warning(
+            "🔴 PHASE 9E LIVE LS EXECUTION ARMED — real Bybit orders may be sent "
+            f"at {LIVE_LS_LEVERAGE:g}x using up to {LIVE_LS_MARGIN_USE_PCT:g}% available margin"
+        )
 
     http        = aiohttp.ClientSession()
     app["http"] = http
     app["tg"]   = Tg(TELEGRAM_TOKEN, http)
     app["rest"] = BybitRest(BYBIT_REST, http)
+
+    if TELEGRAM_TOKEN:
+        commands_ok = await app["tg"].set_my_commands(telegram_bot_commands())
+        logger.info("Telegram setMyCommands: %s", "PASS" if commands_ok else "FAIL")
 
     # Phase 9A authenticated bridge is non-critical and GET-only.  Failure here
     # never blocks public market polling or the existing signal engine.
@@ -9204,7 +10386,7 @@ async def on_startup(app: web.Application) -> None:
         elif not BYBIT_PRIVATE_KEY_PATH:
             logger.warning("Phase 9A Bybit bridge disabled: BYBIT_PRIVATE_KEY_PATH is empty")
         else:
-            private_client = BybitPrivateReadOnly(
+            private_client = BybitPrivateExecution(
                 BYBIT_REST, http, BYBIT_API_KEY, BYBIT_PRIVATE_KEY_PATH, BYBIT_RECV_WINDOW
             )
             app["bybit_private"] = private_client
@@ -9297,6 +10479,9 @@ async def on_startup(app: web.Application) -> None:
         # Phase 9D is intentionally ephemeral and isolated from production
         # strategy/execution shadow state.
         "execution_simulator": {"runs": 0, "last": []},
+        # Phase 9E.1 live execution state persists setup idempotency and exchange
+        # reconciliation across redeploys. It never stores API credentials.
+        "live_ls_execution": _load_live_ls_state(LIVE_LS_STATE_PATH),
     }
     app["poll_task"]      = asyncio.create_task(poll_loop(app))
     app["tg_task"]        = asyncio.create_task(tg_loop(app))
@@ -9318,7 +10503,10 @@ async def on_startup(app: web.Application) -> None:
     bullish = sum(1 for s in mkt.symbols if mkt.state[s].regime == "BULLISH")
     bearish = sum(1 for s in mkt.symbols if mkt.state[s].regime == "BEARISH")
     neutral = sum(1 for s in mkt.symbols if mkt.state[s].regime == "NEUTRAL")
-    mode_line = "🧪 <b>DRY RUN</b>" if DRY_RUN_MODE else "✅ <b>LIVE SIGNALS</b>"
+    mode_line = (
+        ("🧪 <b>Strategy signals: DRY RUN</b>" if DRY_RUN_MODE else "✅ <b>Strategy signals: LIVE-labelled</b>")
+        + (" · 🔴 <b>LS live execution: ARMED</b>" if _live_ls_is_armed() else " · ⚪ <b>LS live execution: OFF</b>")
+    )
 
     for chat_id in get_broadcast_targets():
         with contextlib.suppress(Exception):
@@ -9365,9 +10553,12 @@ async def on_startup(app: web.Application) -> None:
                 f"fees/funding estimates · EXPIRED_WAIT_EXIT · persistent shadow state\n"
                 f"<b>Phase 9D</b> execution scenario simulator: "
                 f"{'active ✅' if EXECUTION_SIMULATOR_ENABLED else 'off ⚪'} · "
-                f"synthetic signals · real GET-only Bybit metadata · strategy-isolated\n\n"
+                f"synthetic signals · strategy-isolated\n"
+                f"<b>Phase 9E</b> LS live executor: "
+                f"{'ARMED 🔴' if _live_ls_is_armed() else 'off ⚪'} · "
+                f"LS only · {LIVE_LS_LEVERAGE:g}x · {LIVE_LS_MARGIN_USE_PCT:g}% available margin · TP1 closes 100%\n\n"
                 f"Commands: /status /regime /ideas /idea SYMBOL "
-                f"/close SYMBOL /config /diag /apikey /bybit /plan SYMBOL /execshadow "
+                f"/close SYMBOL /config /diag /apikey /bybit /liveexec /plan SYMBOL /execshadow "
                 f"/simcases /simcase SYMBOL SIDE CASE /simstatus "
                 f"/statsdb /brtp /tpdiag /brshadow /calibration /watchlist /candidates"
     ))
@@ -9894,6 +11085,32 @@ def _selftest_phase_9d_scenario_simulator() -> None:
 
 
 
+def _selftest_phase_9e_live_helpers() -> None:
+    """Offline checks for Phase 9E single-target/live safety helpers."""
+    idea = ActiveIdea(
+        symbol="TESTUSDT", side="LONG", setup_type="LIQUIDITY_SWEEP", setup_score=80,
+        entry_low=100.0, entry_high=101.0, stop_loss=95.0,
+        tp1=105.0, tp2=110.0, rr_tp1=1.0, rr_tp2=2.0,
+        status="ACTIVE", emitted_at=now_s(), expires_at=now_s() + 86400,
+        invalidation="test", current_price_at_signal=100.5,
+        setup_ts=now_ms() - 3_600_000, setup_tf="1h",
+    )
+    state = SymbolState()
+    state.regime = "BULLISH"
+    msg = format_signal(idea, state)
+    assert "Exit size:</b> 100%" in msg
+    assert "TP2:" not in msg
+    link = _live_order_link_id("cb9e-entry", _live_ls_setup_key(idea))
+    assert len(link) <= 36
+    assert _live_price_protection_present(
+        {"takeProfit": "105", "stopLoss": "95"}, 105.0, 95.0, 0.01
+    )
+    assert not _live_price_protection_present(
+        {"takeProfit": "105", "stopLoss": "0"}, 105.0, 95.0, 0.01
+    )
+
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/",        handle_health)
@@ -9918,4 +11135,5 @@ if __name__ == "__main__":
     _selftest_phase_9b_execution_planner()
     _selftest_phase_9c_net_economics()
     _selftest_phase_9d_scenario_simulator()
+    _selftest_phase_9e_live_helpers()
     web.run_app(make_app(), host="0.0.0.0", port=PORT)
