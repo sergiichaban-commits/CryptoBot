@@ -33,7 +33,7 @@ Phase 9A Bybit Read-Only Bridge: RSA auth · account/key health · /apikey + /by
 Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margin planning · 10% equity reserve · shadow margin reservations · /plan (planning only; no Bybit write endpoints; no trading-rule changes)
 Phase 9C Net PnL & Expiry Safety Shadow: account fee-rate + funding estimate · net TP/SL economics · remaining-leg break-even · persistent EXPIRED_WAIT_EXIT shadow lifecycle (still GET-only; no order endpoints; no trading-rule changes)
 Phase 9D Execution Scenario Simulator: isolated synthetic signals · real Bybit read-only limits/fees/funding · PLAN/TP/SL/expiry/no-margin/min-split scenarios (simulation-only; never enters strategy stats/diagnostics; no order endpoints)
-Phase 9E.1 LS Live Dual Mode: DRY_RUN strategy signals remain active while only LS may execute live; native Telegram setMyCommands menu
+Phase 9E.2 Isolated Balance + Telegram Hotfix: correct USDT available balance in UTA isolated margin; preserve dual-mode LS live execution; remove legacy ReplyKeyboard while keeping native setMyCommands menu
 Phase 9E LS Live Executor: Liquidity Sweep only · 10x isolated · 95% available margin · market entry · one full-position TP at TP1 · full-position strategy SL · persistent live state/reconciliation
 
 Architecture:
@@ -157,7 +157,7 @@ EXECUTION_SIMULATOR_TP2_PCT = max(
     min(float(os.getenv("EXECUTION_SIMULATOR_TP2_PCT", "4.0")), 50.0),
 )
 
-# ── Phase 9E.1: Liquidity Sweep live execution + Telegram command menu ─────────────────────────────────
+# ── Phase 9E.2: LS live execution + isolated-balance + Telegram hotfix ─────────────────────
 # Hard safety model:
 # - ONLY LIQUIDITY_SWEEP may place a live order. BR/TP remain signal/diagnostic only.
 # - DRY_RUN_MODE controls strategy/Telegram labelling only and MAY remain true.
@@ -915,6 +915,14 @@ class Tg:
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        elif isinstance(chat_id, int) and chat_id > 0:
+            # Phase 9E.2: Telegram clients can keep an old ReplyKeyboard forever
+            # even after the bot stops creating it. Every normal response in a
+            # private chat therefore carries ReplyKeyboardRemove. This is
+            # harmless after the keyboard is gone and does not affect the
+            # native setMyCommands dropdown. Groups/channels use negative IDs
+            # and intentionally receive no reply markup.
+            payload["reply_markup"] = {"remove_keyboard": True}
         try:
             async with self.session.post(url, json=payload) as r:
                 if r.status != 200:
@@ -1381,6 +1389,59 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _wallet_coin_row(wallet: Dict[str, Any], coin: str = "USDT") -> Dict[str, Any]:
+    """Return one coin row from Bybit /v5/account/wallet-balance."""
+    wanted = str(coin or "").upper()
+    rows = wallet.get("coin") or []
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and str(row.get("coin") or "").upper() == wanted:
+            return row
+    return {}
+
+
+def _wallet_usdt_available(wallet: Dict[str, Any]) -> Decimal:
+    """Usable USDT for derivatives, safe for UTA isolated margin.
+
+    Bybit account-wide totalAvailableBalance is not applicable in UTA isolated
+    margin and can be returned as zero/blank while USDT is fully available.
+    Prefer the coin-level isolated calculation:
+
+        walletBalance - totalPositionIM - totalOrderIM - locked - bonus
+
+    Clamp at zero. If a legacy/test payload has no coin row, fall back to the
+    account-wide field so Phase 9B/9C/9D offline tests and non-isolated legacy
+    payloads remain compatible.
+    """
+    coin = _wallet_coin_row(wallet, "USDT")
+    if coin:
+        wallet_balance = _dec(coin.get("walletBalance"))
+        position_im = _dec(coin.get("totalPositionIM"))
+        order_im = _dec(coin.get("totalOrderIM"))
+        locked = _dec(coin.get("locked"))
+        bonus = _dec(coin.get("bonus"))
+        return max(
+            Decimal("0"),
+            wallet_balance - position_im - order_im - locked - bonus,
+        )
+    return max(Decimal("0"), _dec(wallet.get("totalAvailableBalance")))
+
+
+def _wallet_usdt_equity(wallet: Dict[str, Any]) -> Decimal:
+    """Prefer account totalEquity; fall back to the USDT coin equity/balance."""
+    total = _dec(wallet.get("totalEquity"))
+    if total > 0:
+        return total
+    coin = _wallet_coin_row(wallet, "USDT")
+    if coin:
+        equity = _dec(coin.get("equity"))
+        if equity > 0:
+            return equity
+        return max(Decimal("0"), _dec(coin.get("walletBalance")))
+    return Decimal("0")
 
 
 def _parse_bybit_datetime(value: Any) -> Optional[datetime]:
@@ -2394,8 +2455,8 @@ def calculate_execution_plan(
     tp1 = _round_to_tick(_dec(idea.tp1), tick)
     tp2 = _round_to_tick(_dec(idea.tp2), tick)
 
-    equity = _dec(wallet.get("totalEquity"))
-    available = _dec(wallet.get("totalAvailableBalance"))
+    equity = _wallet_usdt_equity(wallet)
+    available = _wallet_usdt_available(wallet)
     reserve = equity * _dec(EXECUTION_PLANNER_RESERVE_PCT) / Decimal("100")
     alloc_cap = max(Decimal("0"), equity - reserve)
     planner_available = max(
@@ -2712,7 +2773,7 @@ def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
 
 
 def _live_ls_is_armed() -> bool:
-    """Phase 9E.1 live gate. Strategy DRY_RUN is intentionally independent."""
+    """Phase 9E.2 live gate. Strategy DRY_RUN is intentionally independent."""
     return bool(LIVE_LS_EXECUTION_ENABLED)
 
 
@@ -2952,18 +3013,12 @@ async def execute_live_ls_signal(
         return
     if not LIVE_LS_EXECUTION_ENABLED:
         return
-    if DRY_RUN_MODE:
-        await _send_live_ls_notice(
-            app,
-            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
-            "LIVE_LS_EXECUTION_ENABLED=1 but DRY_RUN_MODE is still enabled.\n"
-            "<b>No Bybit order was sent.</b>",
-        )
-        return
+    # Phase 9E.2 dual-mode rule: DRY_RUN_MODE controls strategy/Telegram
+    # labelling only. It intentionally does NOT block LS live execution.
     if not LIVE_LS_SINGLE_TP_ENABLED:
         await _send_live_ls_notice(
             app,
-            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
+            "🛑 <b>Phase 9E.2 live order blocked</b>\n"
             "LIVE_LS_SINGLE_TP_ENABLED must remain enabled for this phase.\n"
             "<b>No Bybit order was sent.</b>",
         )
@@ -2974,7 +3029,7 @@ async def execute_live_ls_signal(
     if not isinstance(private, BybitPrivateExecution) or not isinstance(rest, BybitRest):
         await _send_live_ls_notice(
             app,
-            "🛑 <b>Phase 9E.1 live order blocked</b>\n"
+            "🛑 <b>Phase 9E.2 live order blocked</b>\n"
             "Authenticated execution client is unavailable.\n"
             "<b>No Bybit order was sent.</b>",
         )
@@ -3052,8 +3107,8 @@ async def execute_live_ls_signal(
                 "live price is no longer between strategy SL and TP1; stale execution blocked"
             )
 
-        equity = _dec(wallet.get("totalEquity"))
-        available = _dec(wallet.get("totalAvailableBalance"))
+        equity = _wallet_usdt_equity(wallet)
+        available = _wallet_usdt_available(wallet)
         if available <= 0:
             raise RuntimeError("Bybit available balance is zero")
         margin_budget = available * _dec(LIVE_LS_MARGIN_USE_PCT) / Decimal("100")
@@ -3245,7 +3300,7 @@ async def execute_live_ls_signal(
         )
     except Exception as exc:
         logger.error(
-            f"Phase 9E.1 live execution blocked/failed {idea.symbol}: "
+            f"Phase 9E.2 live execution blocked/failed {idea.symbol}: "
             f"{type(exc).__name__}: {exc}"
         )
         await _send_live_ls_notice(
@@ -3791,7 +3846,21 @@ async def _build_simulation_plan(
 
     if case == "NO_MARGIN":
         # Isolated simulation override only; real Bybit balance is untouched.
+        # Phase 9E.2 prefers coin-level USDT available, so override both the
+        # legacy account-wide field and a copied USDT coin row.
         calc_wallet["totalAvailableBalance"] = "0.01"
+        coin_rows = []
+        for row in (wallet.get("coin") or []):
+            copied = dict(row) if isinstance(row, dict) else row
+            if isinstance(copied, dict) and str(copied.get("coin") or "").upper() == "USDT":
+                copied["walletBalance"] = "0.01"
+                copied["totalPositionIM"] = "0"
+                copied["totalOrderIM"] = "0"
+                copied["locked"] = "0"
+                copied["bonus"] = "0"
+            coin_rows.append(copied)
+        if coin_rows:
+            calc_wallet["coin"] = coin_rows
     elif case == "SAME_SYMBOL_LOCK":
         # Inject a fake existing position into the pure planner input only.
         calc_positions.append({
@@ -8668,8 +8737,8 @@ async def _cmd_bybit(app: web.Application, cid: int) -> None:
         key_line = "❌ API-key info unavailable"
 
     if wallet:
-        equity = _safe_float(wallet.get("totalEquity"))
-        available = _safe_float(wallet.get("totalAvailableBalance"))
+        equity = float(_wallet_usdt_equity(wallet))
+        available = float(_wallet_usdt_available(wallet))
         wallet_line = f"${equity:.2f} equity · ${available:.2f} available"
     else:
         wallet_line = "unavailable"
@@ -8691,7 +8760,7 @@ async def _cmd_bybit(app: web.Application, cid: int) -> None:
         error_text = f"\n\n⚠️ <b>Partial errors:</b> <code>{html.escape(compact)}</code>"
 
     await tg.send(cid, (
-        "🏦 <b>Bybit Private Bridge — Phase 9E</b>\n\n"
+        "🏦 <b>Bybit Private Bridge — Phase 9E.2</b>\n\n"
         f"<b>API:</b> {key_line}\n"
         f"<b>Unified account:</b> {html.escape(wallet_line)}\n"
         f"<b>Open USDT-perp positions:</b> {len(positions)}\n"
@@ -8782,13 +8851,15 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
     client = app.get("bybit_private")
     margin_mode = "unavailable"
     bybit_positions: List[Dict[str, Any]] = []
+    available_usdt: Optional[float] = None
     account_error = ""
     if isinstance(client, BybitPrivateExecution):
         try:
-            info, bybit_positions = await asyncio.gather(
-                client.account_info(), client.positions_linear()
+            info, wallet, bybit_positions = await asyncio.gather(
+                client.account_info(), client.wallet_balance(), client.positions_linear()
             )
             margin_mode = str(info.get("marginMode") or "UNKNOWN")
+            available_usdt = float(_wallet_usdt_available(wallet))
         except Exception as exc:
             account_error = f"{type(exc).__name__}: {exc}"
 
@@ -8801,7 +8872,7 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
     ]
     armed = _live_ls_is_armed()
     lines = [
-        "⚡ <b>Phase 9E.1 — LS Live Executor</b>",
+        "⚡ <b>Phase 9E.2 — LS Live Executor</b>",
         "",
         f"<b>ENV enabled:</b> {'yes ✅' if LIVE_LS_EXECUTION_ENABLED else 'no ⚪'}",
         f"<b>Strategy signals DRY_RUN:</b> {'ON 🧪' if DRY_RUN_MODE else 'OFF'}",
@@ -8816,6 +8887,7 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
         f"<b>Trigger:</b> {html.escape(LIVE_LS_TRIGGER_BY)}",
         f"<b>Required margin mode:</b> ISOLATED_MARGIN",
         f"<b>Bybit margin mode:</b> {html.escape(margin_mode)}",
+        f"<b>Bybit available USDT:</b> ${available_usdt:.2f}" if available_usdt is not None else "<b>Bybit available USDT:</b> unavailable",
         f"<b>Bybit open USDT-perp positions:</b> {len(bybit_positions)}",
         f"<b>Tracked active rows:</b> {len(active_rows)}",
         f"<b>State:</b> <code>{html.escape(LIVE_LS_STATE_PATH)}</code>",
@@ -8830,7 +8902,7 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
     if account_error:
         lines.extend(["", f"⚠️ <code>{html.escape(account_error[:500])}</code>"])
     if DRY_RUN_MODE:
-        lines.extend(["", "🧪 Strategy/Telegram signals remain in DRY RUN mode; this does not block LS live execution in Phase 9E.1."])
+        lines.extend(["", "🧪 Strategy/Telegram signals remain in DRY RUN mode; this does not block LS live execution in Phase 9E.2."])
     if armed and margin_mode != "ISOLATED_MARGIN":
         lines.extend(["", "🛑 Live entries will be rejected until Bybit account margin mode is ISOLATED_MARGIN."])
     await tg.send(cid, "\n".join(lines))
@@ -10010,7 +10082,7 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"synthetic SL {EXECUTION_SIMULATOR_SL_PCT:.2f}% · "
         f"TP1 {EXECUTION_SIMULATOR_TP1_PCT:.2f}% · TP2 {EXECUTION_SIMULATOR_TP2_PCT:.2f}%\n"
         f"<b>Simulator isolation:</b> strategy stats/DB/watchlist/cooldowns untouched · Bybit GET-only\n"
-        f"<b>LS live executor:</b> {'ARMED' if _live_ls_is_armed() else 'off'} (Phase 9E.1; independent of DRY_RUN)\n"
+        f"<b>LS live executor:</b> {'ARMED' if _live_ls_is_armed() else 'off'} (Phase 9E.2; independent of DRY_RUN)\n"
         f"<b>Live setup:</b> LIQUIDITY_SWEEP only · {LIVE_LS_LEVERAGE:g}x · {LIVE_LS_MARGIN_USE_PCT:g}% available margin · max 1 position\n"
         f"<b>Live TP:</b> strategy TP1 closes 100% · TP2 not used for LS exit\n"
         f"<b>Live SL:</b> strategy SL protects 100% · verified on Bybit after fill\n"
@@ -10349,7 +10421,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
         "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow · Phase 9D isolated execution scenario simulator · "
-        "Phase 9E.1 LS-only live executor + dual-mode signals + command menu)"
+        "Phase 9E.2 LS live executor + isolated-balance + Telegram hotfix)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -10360,7 +10432,7 @@ async def on_startup(app: web.Application) -> None:
     if not DRY_RUN_MODE:
         logger.warning("⚠️  DRY_RUN_MODE=False — bot is in LIVE SIGNALS mode")
     if LIVE_LS_EXECUTION_ENABLED and DRY_RUN_MODE:
-        logger.warning("Phase 9E.1 dual mode: strategy signals DRY_RUN=1 while LS live execution is independently enabled")
+        logger.warning("Phase 9E.2 dual mode: strategy signals DRY_RUN=1 while LS live execution is independently enabled")
     if _live_ls_is_armed():
         logger.warning(
             "🔴 PHASE 9E LIVE LS EXECUTION ARMED — real Bybit orders may be sent "
@@ -10479,7 +10551,7 @@ async def on_startup(app: web.Application) -> None:
         # Phase 9D is intentionally ephemeral and isolated from production
         # strategy/execution shadow state.
         "execution_simulator": {"runs": 0, "last": []},
-        # Phase 9E.1 live execution state persists setup idempotency and exchange
+        # Phase 9E.2 live execution state persists setup idempotency and exchange
         # reconciliation across redeploys. It never stores API credentials.
         "live_ls_execution": _load_live_ls_state(LIVE_LS_STATE_PATH),
     }
@@ -11108,6 +11180,26 @@ def _selftest_phase_9e_live_helpers() -> None:
     assert not _live_price_protection_present(
         {"takeProfit": "105", "stopLoss": "0"}, 105.0, 95.0, 0.01
     )
+
+    # Phase 9E.2 isolated UTA balance hotfix: account-wide available may be
+    # zero while coin-level USDT remains available.
+    isolated_wallet = {
+        "totalEquity": "29.99",
+        "totalAvailableBalance": "0",
+        "coin": [{
+            "coin": "USDT",
+            "equity": "29.99",
+            "walletBalance": "30.00",
+            "totalPositionIM": "0",
+            "totalOrderIM": "0",
+            "locked": "0",
+            "bonus": "0",
+        }],
+    }
+    assert _wallet_usdt_available(isolated_wallet) == Decimal("30.00")
+    assert _wallet_usdt_equity(isolated_wallet) == Decimal("29.99")
+    legacy_wallet = {"totalEquity": "30", "totalAvailableBalance": "27"}
+    assert _wallet_usdt_available(legacy_wallet) == Decimal("27")
 
 
 
