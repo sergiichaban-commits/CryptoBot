@@ -34,6 +34,7 @@ Phase 9B Minimum-Size Execution Planner: 50/50-safe minimum quantity · 2x margi
 Phase 9C Net PnL & Expiry Safety Shadow: account fee-rate + funding estimate · net TP/SL economics · remaining-leg break-even · persistent EXPIRED_WAIT_EXIT shadow lifecycle (still GET-only; no order endpoints; no trading-rule changes)
 Phase 9D Execution Scenario Simulator: isolated synthetic signals · real Bybit read-only limits/fees/funding · PLAN/TP/SL/expiry/no-margin/min-split scenarios (simulation-only; never enters strategy stats/diagnostics; no order endpoints)
 Phase 9E.2 Isolated Balance + Telegram Hotfix: correct USDT available balance in UTA isolated margin; preserve dual-mode LS live execution; remove legacy ReplyKeyboard while keeping native setMyCommands menu
+Phase 9E.3 Manual Protection Override + Command Templates: accept non-zero manual Bybit TP/SL as new official live-state boundaries; restore missing protection from last-known values; add symbol-command templates
 Phase 9E LS Live Executor: Liquidity Sweep only · 10x isolated · 95% available margin · market entry · one full-position TP at TP1 · full-position strategy SL · persistent live state/reconciliation
 
 Architecture:
@@ -157,7 +158,7 @@ EXECUTION_SIMULATOR_TP2_PCT = max(
     min(float(os.getenv("EXECUTION_SIMULATOR_TP2_PCT", "4.0")), 50.0),
 )
 
-# ── Phase 9E.2: LS live execution + isolated-balance + Telegram hotfix ─────────────────────
+# ── Phase 9E.3: LS live execution + manual protection override + command templates ────────
 # Hard safety model:
 # - ONLY LIQUIDITY_SWEEP may place a live order. BR/TP remain signal/diagnostic only.
 # - DRY_RUN_MODE controls strategy/Telegram labelling only and MAY remain true.
@@ -186,6 +187,13 @@ LIVE_LS_STATE_PATH = (
 ).strip()
 LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL = _bool_env(
     "LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL", True
+)
+# Phase 9E.3: a non-zero TP/SL changed directly on Bybit is treated as an
+# explicit manual override and becomes the new persistent protection boundary.
+# A missing/zero TP or SL is NEVER adopted; the bot restores the last-known
+# persistent level and emergency-closes if protection cannot be restored.
+LIVE_LS_ADOPT_MANUAL_PROTECTION = _bool_env(
+    "LIVE_LS_ADOPT_MANUAL_PROTECTION", True
 )
 
 
@@ -942,11 +950,21 @@ class Tg:
 
 
 def telegram_bot_commands() -> List[Dict[str, str]]:
-    """Canonical Telegram native command menu (Bot API setMyCommands)."""
+    """Canonical Telegram native slash-command dropdown (Bot API setMyCommands)."""
     return [
         {"command": "status", "description": "Bot status and active ideas"},
         {"command": "regime", "description": "Market regime summary"},
         {"command": "ideas", "description": "Active strategy ideas"},
+        {"command": "idea", "description": "Template: /idea SYMBOL"},
+        {"command": "score", "description": "Template: /score SYMBOL"},
+        {"command": "plan", "description": "Template: /plan SYMBOL"},
+        {"command": "close", "description": "Template: /close SYMBOL"},
+        {"command": "liveclose", "description": "Template: /liveclose SYMBOL CONFIRM"},
+        {"command": "liveprotect", "description": "Template: override live TP/SL"},
+        {"command": "livetp", "description": "Template: override live TP only"},
+        {"command": "livesl", "description": "Template: override live SL only"},
+        {"command": "simcase", "description": "Template: /simcase SYMBOL SIDE CASE"},
+        {"command": "cmdtemplates", "description": "Copy-ready symbol command templates"},
         {"command": "watchlist", "description": "Pending signal-eligible setups"},
         {"command": "candidates", "description": "Recent rejected/dead candidates"},
         {"command": "config", "description": "Current strategy and execution config"},
@@ -964,6 +982,63 @@ def telegram_bot_commands() -> List[Dict[str, str]]:
         {"command": "simstatus", "description": "Execution simulator status"},
         {"command": "ping", "description": "Telegram bot health check"},
     ]
+
+
+_SYMBOL_COMMAND_TEMPLATES: Dict[str, str] = {
+    "idea": "/idea SYMBOL",
+    "score": "/score SYMBOL",
+    "plan": "/plan SYMBOL",
+    "close": "/close SYMBOL",
+    "liveclose": "/liveclose SYMBOL CONFIRM",
+    "liveprotect": "/liveprotect SYMBOL TP KEEP SL KEEP CONFIRM",
+    "livetp": "/livetp SYMBOL PRICE CONFIRM",
+    "livesl": "/livesl SYMBOL PRICE CONFIRM",
+    "simcase": "/simcase SYMBOL LONG PLAN",
+}
+
+
+def _command_template_markup(template: str) -> Dict[str, Any]:
+    """One-tap clipboard copy; Telegram Bot API cannot prefill arbitrary slash-command drafts."""
+    return {
+        "inline_keyboard": [[
+            {"text": "📋 Copy command template", "copy_text": {"text": template}}
+        ]]
+    }
+
+
+async def _send_command_template(
+    tg: "Tg", chat_id: int, command: str, note: str = ""
+) -> None:
+    key = command.lstrip("/").lower()
+    template = _SYMBOL_COMMAND_TEMPLATES.get(key)
+    if not template:
+        await tg.send(chat_id, "No command template is registered for this command.")
+        return
+    extra = f"\n{note}" if note else ""
+    await tg.send(
+        chat_id,
+        f"🧩 <b>Command template</b>\n<code>{html.escape(template)}</code>{extra}\n\n"
+        "Tap the button to copy it, paste it into the input field, then replace the placeholders.",
+        reply_markup=_command_template_markup(template),
+    )
+
+
+async def _cmd_command_templates(app: web.Application, cid: int) -> None:
+    tg: Tg = app["tg"]
+    rows = []
+    for key, template in _SYMBOL_COMMAND_TEMPLATES.items():
+        rows.append([{
+            "text": f"📋 /{key}",
+            "copy_text": {"text": template},
+        }])
+    await tg.send(
+        cid,
+        "🧩 <b>Symbol command templates</b>\n"
+        "Each button copies a ready-to-edit command to the clipboard. Telegram's Bot API "
+        "does not allow a bot to inject an arbitrary slash-command draft directly into the normal composer.",
+        reply_markup={"inline_keyboard": rows},
+    )
+
 
 
 class BybitRest:
@@ -2773,7 +2848,7 @@ def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
 
 
 def _live_ls_is_armed() -> bool:
-    """Phase 9E.2 live gate. Strategy DRY_RUN is intentionally independent."""
+    """Phase 9E.3 live gate. Strategy DRY_RUN is intentionally independent."""
     return bool(LIVE_LS_EXECUTION_ENABLED)
 
 
@@ -2874,6 +2949,56 @@ def _live_price_protection_present(
     sl = _safe_float(position.get("stopLoss"))
     tol = max(abs(tick_size) * 1.1, 1e-12)
     return tp > 0 and sl > 0 and abs(tp - expected_tp) <= tol and abs(sl - expected_sl) <= tol
+
+
+def _live_level_differs(actual: float, expected: float, tick_size: float) -> bool:
+    tol = max(abs(tick_size) * 1.1, 1e-12)
+    return actual > 0 and expected > 0 and abs(actual - expected) > tol
+
+
+def _live_protection_values(position: Dict[str, Any]) -> Tuple[float, float]:
+    return _safe_float(position.get("takeProfit")), _safe_float(position.get("stopLoss"))
+
+
+def _live_protection_geometry_ok(side: str, price: float, tp: float, sl: float) -> bool:
+    if price <= 0 or tp <= 0 or sl <= 0:
+        return False
+    if side == "LONG":
+        return sl < price < tp
+    if side == "SHORT":
+        return sl > price > tp
+    return False
+
+
+def _adopt_live_protection_from_exchange(
+    row: Dict[str, Any], position: Dict[str, Any], tick_size: float, at_ts: Optional[int] = None
+) -> List[str]:
+    """Adopt non-zero exchange TP/SL differences as explicit manual overrides.
+
+    Zero/missing values are never adopted: they represent lost protection and
+    must be restored from row['tp']/row['sl'].
+    """
+    if not LIVE_LS_ADOPT_MANUAL_PROTECTION:
+        return []
+    at_ts = int(at_ts or now_s())
+    actual_tp, actual_sl = _live_protection_values(position)
+    changed: List[str] = []
+    expected_tp = _safe_float(row.get("tp"))
+    expected_sl = _safe_float(row.get("sl"))
+    if actual_tp > 0 and (expected_tp <= 0 or _live_level_differs(actual_tp, expected_tp, tick_size)):
+        row["tp"] = actual_tp
+        row["tp_source"] = "manual_bybit"
+        row["tp_updated_at"] = at_ts
+        changed.append("TP")
+    if actual_sl > 0 and (expected_sl <= 0 or _live_level_differs(actual_sl, expected_sl, tick_size)):
+        row["sl"] = actual_sl
+        row["sl_source"] = "manual_bybit"
+        row["sl_updated_at"] = at_ts
+        changed.append("SL")
+    if changed:
+        row["protection_revision"] = int(row.get("protection_revision") or 0) + 1
+        row["updated_at"] = at_ts
+    return changed
 
 
 async def _wait_live_position(
@@ -3013,12 +3138,12 @@ async def execute_live_ls_signal(
         return
     if not LIVE_LS_EXECUTION_ENABLED:
         return
-    # Phase 9E.2 dual-mode rule: DRY_RUN_MODE controls strategy/Telegram
+    # Phase 9E.3 dual-mode rule: DRY_RUN_MODE controls strategy/Telegram
     # labelling only. It intentionally does NOT block LS live execution.
     if not LIVE_LS_SINGLE_TP_ENABLED:
         await _send_live_ls_notice(
             app,
-            "🛑 <b>Phase 9E.2 live order blocked</b>\n"
+            "🛑 <b>Phase 9E.3 live order blocked</b>\n"
             "LIVE_LS_SINGLE_TP_ENABLED must remain enabled for this phase.\n"
             "<b>No Bybit order was sent.</b>",
         )
@@ -3029,7 +3154,7 @@ async def execute_live_ls_signal(
     if not isinstance(private, BybitPrivateExecution) or not isinstance(rest, BybitRest):
         await _send_live_ls_notice(
             app,
-            "🛑 <b>Phase 9E.2 live order blocked</b>\n"
+            "🛑 <b>Phase 9E.3 live order blocked</b>\n"
             "Authenticated execution client is unavailable.\n"
             "<b>No Bybit order was sent.</b>",
         )
@@ -3239,6 +3364,11 @@ async def execute_live_ls_signal(
                     "avg_entry_price": avg_entry,
                     "tp": float(tp),
                     "sl": float(sl),
+                    "tp_source": "strategy",
+                    "sl_source": "strategy",
+                    "tp_updated_at": opened_at,
+                    "sl_updated_at": opened_at,
+                    "protection_revision": 0,
                     "opened_at": opened_at,
                     "closed_at": now_s(),
                     "order_id": order_id,
@@ -3270,6 +3400,11 @@ async def execute_live_ls_signal(
             "estimated_margin_usdt": float(estimated_margin),
             "tp": float(tp),
             "sl": float(sl),
+            "tp_source": "strategy",
+            "sl_source": "strategy",
+            "tp_updated_at": opened_at,
+            "sl_updated_at": opened_at,
+            "protection_revision": 0,
             "tick_size": float(tick),
             "qty_step": float(qty_step),
             "order_id": order_id,
@@ -3300,7 +3435,7 @@ async def execute_live_ls_signal(
         )
     except Exception as exc:
         logger.error(
-            f"Phase 9E.2 live execution blocked/failed {idea.symbol}: "
+            f"Phase 9E.3 live execution blocked/failed {idea.symbol}: "
             f"{type(exc).__name__}: {exc}"
         )
         await _send_live_ls_notice(
@@ -3358,59 +3493,92 @@ async def reconcile_live_ls_execution(app: web.Application) -> None:
             )
             continue
 
-        # Every reconciliation also checks that the exchange still reports both
-        # protective levels. This is independent of strategy candle lifecycle.
+        # Phase 9E.3 protection policy:
+        # 1) any non-zero TP/SL changed directly on Bybit becomes the new
+        #    persistent official boundary (manual override);
+        # 2) a zero/missing TP or SL is never adopted and is restored from the
+        #    latest persistent value, whether strategy-originated or user-originated.
+        tick = _safe_float(row.get("tick_size"))
+        adopted = _adopt_live_protection_from_exchange(row, pos, tick)
+        if adopted:
+            changed = True
+            await _send_live_ls_notice(
+                app,
+                "✍️ <b>LIVE protection override adopted</b>\n"
+                f"<b>{html.escape(symbol)}</b> · {html.escape(', '.join(adopted))}\n"
+                f"TP <code>{_safe_float(row.get('tp')):.8g}</code> · "
+                f"SL <code>{_safe_float(row.get('sl')):.8g}</code>\n"
+                "These levels are now persistent and are used by expiry/exit management.",
+            )
+
         expected_tp = _safe_float(row.get("tp"))
         expected_sl = _safe_float(row.get("sl"))
-        tick = _safe_float(row.get("tick_size"))
-        if not _live_price_protection_present(pos, expected_tp, expected_sl, tick):
-            if _live_ls_is_armed():
-                try:
-                    ok, pos2 = await _ensure_live_ls_protection(
-                        private,
-                        symbol,
-                        expected_tp,
-                        expected_sl,
-                        tick,
-                        _fmt_step(expected_tp, tick),
-                        _fmt_step(expected_sl, tick),
-                    )
-                    if pos2 is not None:
-                        pos = pos2
-                    if not ok:
-                        raise RuntimeError("protective TP/SL still missing after repair attempt")
-                except Exception as exc:
-                    logger.error(
-                        f"Phase 9E protection lost {symbol}: {type(exc).__name__}: {exc}"
-                    )
-                    if LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL:
-                        try:
-                            await _close_live_position_reduce_only(
-                                private,
-                                symbol,
-                                str(row.get("side") or ""),
-                                _safe_float(pos.get("size")),
-                                row.get("qty_step") or 0.0,
-                                str(row.get("setup_key") or symbol) + "|lost-protection",
-                            )
-                            row["status"] = "EMERGENCY_CLOSE_SENT"
-                            row["updated_at"] = now_s()
-                            changed = True
-                            await _send_live_ls_notice(
-                                app,
-                                "🚨 <b>LIVE LS protection lost</b>\n"
-                                f"<b>{html.escape(symbol)}</b>\n"
-                                "TP/SL could not be restored. A reduce-only emergency market close was sent.",
-                            )
-                        except Exception as close_exc:
-                            await _send_live_ls_notice(
-                                app,
-                                "🚨 <b>CRITICAL: LIVE LS protection failure</b>\n"
-                                f"<b>{html.escape(symbol)}</b>\n"
-                                f"Protection repair failed and emergency close also failed: "
-                                f"<code>{html.escape(str(close_exc)[:500])}</code>\n"
-                                "Check Bybit immediately.",
-                            )
+        actual_tp, actual_sl = _live_protection_values(pos)
+        protection_missing = actual_tp <= 0 or actual_sl <= 0
+        protection_mismatch = (
+            not protection_missing
+            and not _live_price_protection_present(pos, expected_tp, expected_sl, tick)
+        )
+        # Mismatch is repaired only when manual adoption is disabled. With
+        # adoption enabled, non-zero differences were already accepted above.
+        need_repair = protection_missing or (protection_mismatch and not LIVE_LS_ADOPT_MANUAL_PROTECTION)
+        if need_repair:
+            try:
+                if expected_tp <= 0 or expected_sl <= 0:
+                    raise RuntimeError("no valid last-known TP/SL exists in persistent live state")
+                ok, pos2 = await _ensure_live_ls_protection(
+                    private,
+                    symbol,
+                    expected_tp,
+                    expected_sl,
+                    tick,
+                    _fmt_step(expected_tp, tick),
+                    _fmt_step(expected_sl, tick),
+                )
+                if pos2 is not None:
+                    pos = pos2
+                if not ok:
+                    raise RuntimeError("protective TP/SL still missing after repair attempt")
+                changed = True
+                await _send_live_ls_notice(
+                    app,
+                    "🛡️ <b>LIVE protection restored</b>\n"
+                    f"<b>{html.escape(symbol)}</b>\n"
+                    f"Restored last-known TP <code>{expected_tp:.8g}</code> and "
+                    f"SL <code>{expected_sl:.8g}</code>.",
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Phase 9E.3 protection lost {symbol}: {type(exc).__name__}: {exc}"
+                )
+                if LIVE_LS_EMERGENCY_CLOSE_ON_PROTECTION_FAIL:
+                    try:
+                        await _close_live_position_reduce_only(
+                            private,
+                            symbol,
+                            str(row.get("side") or ""),
+                            _safe_float(pos.get("size")),
+                            row.get("qty_step") or 0.0,
+                            str(row.get("setup_key") or symbol) + "|lost-protection",
+                        )
+                        row["status"] = "EMERGENCY_CLOSE_SENT"
+                        row["updated_at"] = now_s()
+                        changed = True
+                        await _send_live_ls_notice(
+                            app,
+                            "🚨 <b>LIVE LS protection lost</b>\n"
+                            f"<b>{html.escape(symbol)}</b>\n"
+                            "Last-known TP/SL could not be restored. A reduce-only emergency market close was sent.",
+                        )
+                    except Exception as close_exc:
+                        await _send_live_ls_notice(
+                            app,
+                            "🚨 <b>CRITICAL: LIVE LS protection failure</b>\n"
+                            f"<b>{html.escape(symbol)}</b>\n"
+                            f"Protection repair failed and emergency close also failed: "
+                            f"<code>{html.escape(str(close_exc)[:500])}</code>\n"
+                            "Check Bybit immediately.",
+                        )
             continue
 
         expires_at = int(row.get("expires_at") or 0)
@@ -3456,7 +3624,7 @@ async def reconcile_live_ls_execution(app: web.Application) -> None:
                     app,
                     "⏳✅ <b>LIVE LS expiry exit sent</b>\n"
                     f"<b>{html.escape(symbol)}</b> · estimated net ${net_est:+.3f}\n"
-                    "A reduce-only market close was sent. Original SL was not removed first.",
+                    "A reduce-only market close was sent. Current persistent SL was not removed first.",
                 )
             except Exception as exc:
                 logger.error(
@@ -3471,7 +3639,7 @@ async def reconcile_live_ls_execution(app: web.Application) -> None:
                 app,
                 "⏳ <b>LIVE LS — EXPIRED_WAIT_EXIT</b>\n"
                 f"<b>{html.escape(symbol)}</b> · estimated net ${net_est:+.3f}\n"
-                "Position is not force-closed at a loss. Full-position TP and original SL remain active; "
+                "Position is not force-closed at a loss. Full-position TP and current persistent SL remain active; "
                 "the bot will also close at estimated net break-even when reached.",
             )
 
@@ -8560,9 +8728,59 @@ async def tg_loop(app: web.Application) -> None:
                     await _cmd_regime(app, cid)
                 elif text == "/ideas":
                     await _cmd_ideas(app, cid)
+                elif text == "/cmdtemplates":
+                    await _cmd_command_templates(app, cid)
+                elif text == "/idea":
+                    await _send_command_template(tg, cid, "idea")
                 elif text.startswith("/idea "):
                     sym = text.split(maxsplit=1)[1].upper().strip()
                     await _cmd_idea_detail(app, cid, sym)
+                elif text == "/score":
+                    await _send_command_template(tg, cid, "score")
+                elif text == "/plan":
+                    await _send_command_template(tg, cid, "plan")
+                elif text == "/close":
+                    await _send_command_template(tg, cid, "close")
+                elif text == "/liveclose":
+                    await _send_command_template(tg, cid, "liveclose")
+                elif text == "/liveprotect":
+                    await _send_command_template(
+                        tg, cid, "liveprotect",
+                        "TP/SL may be replaced with prices; KEEP preserves the current persistent level."
+                    )
+                elif text == "/livetp":
+                    await _send_command_template(tg, cid, "livetp")
+                elif text == "/livesl":
+                    await _send_command_template(tg, cid, "livesl")
+                elif text == "/simcase":
+                    await _send_command_template(tg, cid, "simcase")
+                elif text.startswith("/liveprotect"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split()
+                        if len(parts) == 7 and parts[2].upper() == "TP" and parts[4].upper() == "SL":
+                            await _cmd_liveprotect(app, cid, parts[1], parts[3], parts[5], parts[6])
+                        else:
+                            await _send_command_template(tg, cid, "liveprotect")
+                elif text.startswith("/livetp"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split()
+                        if len(parts) == 4:
+                            await _cmd_livetp(app, cid, parts[1], parts[2], parts[3])
+                        else:
+                            await _send_command_template(tg, cid, "livetp")
+                elif text.startswith("/livesl"):
+                    if cid not in ALLOWED_CHAT_IDS:
+                        await tg.send(cid, "⛔ Unauthorized.")
+                    else:
+                        parts = text.split()
+                        if len(parts) == 4:
+                            await _cmd_livesl(app, cid, parts[1], parts[2], parts[3])
+                        else:
+                            await _send_command_template(tg, cid, "livesl")
                 elif text.startswith("/liveclose"):
                     if cid not in ALLOWED_CHAT_IDS:
                         await tg.send(cid, "⛔ Unauthorized.")
@@ -8760,7 +8978,7 @@ async def _cmd_bybit(app: web.Application, cid: int) -> None:
         error_text = f"\n\n⚠️ <b>Partial errors:</b> <code>{html.escape(compact)}</code>"
 
     await tg.send(cid, (
-        "🏦 <b>Bybit Private Bridge — Phase 9E.2</b>\n\n"
+        "🏦 <b>Bybit Private Bridge — Phase 9E.3</b>\n\n"
         f"<b>API:</b> {key_line}\n"
         f"<b>Unified account:</b> {html.escape(wallet_line)}\n"
         f"<b>Open USDT-perp positions:</b> {len(positions)}\n"
@@ -8872,7 +9090,7 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
     ]
     armed = _live_ls_is_armed()
     lines = [
-        "⚡ <b>Phase 9E.2 — LS Live Executor</b>",
+        "⚡ <b>Phase 9E.3 — LS Live Executor</b>",
         "",
         f"<b>ENV enabled:</b> {'yes ✅' if LIVE_LS_EXECUTION_ENABLED else 'no ⚪'}",
         f"<b>Strategy signals DRY_RUN:</b> {'ON 🧪' if DRY_RUN_MODE else 'OFF'}",
@@ -8882,8 +9100,10 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
         f"<b>Leverage:</b> {LIVE_LS_LEVERAGE:g}x",
         f"<b>Margin allocation:</b> {LIVE_LS_MARGIN_USE_PCT:g}% of available",
         "<b>Concurrent live positions:</b> max 1",
-        "<b>Take Profit:</b> strategy TP1 · 100% close",
-        "<b>Stop Loss:</b> strategy SL · 100% protection",
+        "<b>Take Profit:</b> strategy TP1 initially · manual non-zero override becomes official · 100% close",
+        "<b>Stop Loss:</b> strategy SL initially · manual non-zero override becomes official · 100% protection",
+        f"<b>Manual protection sync:</b> {'ON ✅' if LIVE_LS_ADOPT_MANUAL_PROTECTION else 'OFF ⚪'}",
+        "<b>Missing TP/SL:</b> restore last-known persistent values",
         f"<b>Trigger:</b> {html.escape(LIVE_LS_TRIGGER_BY)}",
         f"<b>Required margin mode:</b> ISOLATED_MARGIN",
         f"<b>Bybit margin mode:</b> {html.escape(margin_mode)}",
@@ -8897,12 +9117,14 @@ async def _cmd_liveexec(app: web.Application, cid: int) -> None:
             f"  {html.escape(str(row.get('symbol') or '?'))} "
             f"{html.escape(str(row.get('side') or ''))} · "
             f"{html.escape(str(row.get('status') or ''))} · "
-            f"qty {_safe_float(row.get('qty')):g}"
+            f"qty {_safe_float(row.get('qty')):g} · "
+            f"TP {_safe_float(row.get('tp')):.8g} ({html.escape(str(row.get('tp_source') or 'legacy'))}) · "
+            f"SL {_safe_float(row.get('sl')):.8g} ({html.escape(str(row.get('sl_source') or 'legacy'))})"
         )
     if account_error:
         lines.extend(["", f"⚠️ <code>{html.escape(account_error[:500])}</code>"])
     if DRY_RUN_MODE:
-        lines.extend(["", "🧪 Strategy/Telegram signals remain in DRY RUN mode; this does not block LS live execution in Phase 9E.2."])
+        lines.extend(["", "🧪 Strategy/Telegram signals remain in DRY RUN mode; this does not block LS live execution in Phase 9E.3."])
     if armed and margin_mode != "ISOLATED_MARGIN":
         lines.extend(["", "🛑 Live entries will be rejected until Bybit account margin mode is ISOLATED_MARGIN."])
     await tg.send(cid, "\n".join(lines))
@@ -9131,6 +9353,135 @@ async def _cmd_close(app: web.Application, cid: int, sym: str) -> None:
             f"{sym} {idea.side} | {idea.setup_type.replace('_', ' ')}\n"
             f"Closed at {ts}"
         ))
+
+
+async def _apply_live_protection_override(
+    app: web.Application,
+    cid: int,
+    sym: str,
+    tp_token: str,
+    sl_token: str,
+    confirm: str,
+) -> None:
+    """Apply a confirmed full-position TP/SL override and persist it as official state."""
+    tg: Tg = app["tg"]
+    if not sym:
+        await _send_command_template(tg, cid, "liveprotect")
+        return
+    sym = sym.upper().strip()
+    if not sym.endswith("USDT"):
+        sym += "USDT"
+    if confirm.upper() != "CONFIRM":
+        await tg.send(
+            cid,
+            "⚠️ <b>Confirmation required</b>\n"
+            f"Use: <code>/liveprotect {html.escape(sym)} TP KEEP SL KEEP CONFIRM</code>",
+            reply_markup=_command_template_markup(f"/liveprotect {sym} TP KEEP SL KEEP CONFIRM"),
+        )
+        return
+
+    private = app.get("bybit_private")
+    rest = app.get("rest")
+    if not isinstance(private, BybitPrivateExecution) or not isinstance(rest, BybitRest):
+        await tg.send(cid, "❌ Phase 9E.3 execution client unavailable.")
+        return
+    live_state = _live_ls_state(app)
+    tracked = live_state.get("positions") or {}
+    row = tracked.get(sym) if isinstance(tracked, dict) else None
+    if not isinstance(row, dict) or str(row.get("status") or "") not in (
+        "OPEN", "EXPIRED_WAIT_EXIT", "EXPIRY_EXIT_SENT"
+    ):
+        await tg.send(cid, f"No active tracked Phase 9E live position for <b>{html.escape(sym)}</b>.")
+        return
+    try:
+        pos = await private.position_linear(sym)
+        if pos is None or _safe_float(pos.get("size")) <= 0:
+            row["status"] = "CLOSED"
+            row["closed_at"] = now_s()
+            row["updated_at"] = now_s()
+            _save_live_ls_state(app)
+            await tg.send(cid, f"✅ <b>{html.escape(sym)}</b> is already flat on Bybit.")
+            return
+
+        instrument, ticker = await asyncio.gather(
+            rest.instrument_linear(sym), rest.ticker_linear(sym)
+        )
+        tick = _safe_float((instrument.get("priceFilter") or {}).get("tickSize")) or _safe_float(row.get("tick_size"))
+        if tick <= 0:
+            raise RuntimeError("tickSize unavailable")
+        current_tp = _safe_float(row.get("tp"))
+        current_sl = _safe_float(row.get("sl"))
+
+        def resolve(token: str, current: float, label: str) -> float:
+            token = token.strip().upper()
+            if token == "KEEP":
+                return current
+            value = _safe_float(token)
+            if value <= 0:
+                raise ValueError(f"{label} must be a positive price or KEEP")
+            return float(_round_to_tick(_dec(value), _dec(tick)))
+
+        new_tp = resolve(tp_token, current_tp, "TP")
+        new_sl = resolve(sl_token, current_sl, "SL")
+        last_price = _safe_float(ticker.get("lastPrice")) or _safe_float(pos.get("markPrice")) or _safe_float(pos.get("avgPrice"))
+        side = str(row.get("side") or "")
+        if not _live_protection_geometry_ok(side, last_price, new_tp, new_sl):
+            raise ValueError(
+                f"invalid protection geometry for {side}: SL={new_sl:g}, price={last_price:g}, TP={new_tp:g}"
+            )
+
+        await private.set_trading_stop_full(
+            symbol=sym,
+            take_profit=_fmt_step(new_tp, tick),
+            stop_loss=_fmt_step(new_sl, tick),
+            trigger_by=str(row.get("trigger_by") or LIVE_LS_TRIGGER_BY),
+        )
+        ok, verified = await _ensure_live_ls_protection(
+            private, sym, new_tp, new_sl, tick, _fmt_step(new_tp, tick), _fmt_step(new_sl, tick)
+        )
+        if not ok:
+            raise RuntimeError("Bybit did not confirm the requested TP/SL override")
+
+        ts = now_s()
+        if _live_level_differs(new_tp, current_tp, tick) or current_tp <= 0:
+            row["tp"] = new_tp
+            row["tp_source"] = "manual_command"
+            row["tp_updated_at"] = ts
+        if _live_level_differs(new_sl, current_sl, tick) or current_sl <= 0:
+            row["sl"] = new_sl
+            row["sl_source"] = "manual_command"
+            row["sl_updated_at"] = ts
+        row["protection_revision"] = int(row.get("protection_revision") or 0) + 1
+        row["updated_at"] = ts
+        _save_live_ls_state(app)
+        await tg.send(
+            cid,
+            f"✅ <b>LIVE protection updated — {html.escape(sym)}</b>\n"
+            f"TP: <code>{new_tp:.8g}</code> ({html.escape(str(row.get('tp_source') or 'persistent'))})\n"
+            f"SL: <code>{new_sl:.8g}</code> ({html.escape(str(row.get('sl_source') or 'persistent'))})\n"
+            "These values are now persistent and govern later expiry/exit management.",
+        )
+    except Exception as exc:
+        await tg.send(
+            cid,
+            "❌ <b>LIVE protection override failed</b>\n"
+            f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>\n"
+            "The persistent last-known TP/SL were not replaced by an unverified request.",
+        )
+
+
+async def _cmd_liveprotect(
+    app: web.Application, cid: int, sym: str, tp_token: str, sl_token: str, confirm: str
+) -> None:
+    await _apply_live_protection_override(app, cid, sym, tp_token, sl_token, confirm)
+
+
+async def _cmd_livetp(app: web.Application, cid: int, sym: str, price: str, confirm: str) -> None:
+    await _apply_live_protection_override(app, cid, sym, price, "KEEP", confirm)
+
+
+async def _cmd_livesl(app: web.Application, cid: int, sym: str, price: str, confirm: str) -> None:
+    await _apply_live_protection_override(app, cid, sym, "KEEP", price, confirm)
 
 
 async def _cmd_liveclose(app: web.Application, cid: int, sym: str, confirm: str) -> None:
@@ -10082,12 +10433,13 @@ async def _cmd_config(app: web.Application, cid: int) -> None:
         f"synthetic SL {EXECUTION_SIMULATOR_SL_PCT:.2f}% · "
         f"TP1 {EXECUTION_SIMULATOR_TP1_PCT:.2f}% · TP2 {EXECUTION_SIMULATOR_TP2_PCT:.2f}%\n"
         f"<b>Simulator isolation:</b> strategy stats/DB/watchlist/cooldowns untouched · Bybit GET-only\n"
-        f"<b>LS live executor:</b> {'ARMED' if _live_ls_is_armed() else 'off'} (Phase 9E.2; independent of DRY_RUN)\n"
+        f"<b>LS live executor:</b> {'ARMED' if _live_ls_is_armed() else 'off'} (Phase 9E.3; independent of DRY_RUN)\n"
         f"<b>Live setup:</b> LIQUIDITY_SWEEP only · {LIVE_LS_LEVERAGE:g}x · {LIVE_LS_MARGIN_USE_PCT:g}% available margin · max 1 position\n"
         f"<b>Live TP:</b> strategy TP1 closes 100% · TP2 not used for LS exit\n"
         f"<b>Live SL:</b> strategy SL protects 100% · verified on Bybit after fill\n"
         f"<b>Live margin mode:</b> requires ISOLATED_MARGIN · one-way positionIdx=0 · auto-add margin disabled\n"
         f"<b>Live trigger:</b> {html.escape(LIVE_LS_TRIGGER_BY)} · state <code>{html.escape(LIVE_LS_STATE_PATH)}</code>\n"
+        f"<b>Manual live protection:</b> {'adopt non-zero Bybit overrides' if LIVE_LS_ADOPT_MANUAL_PROTECTION else 'restore persistent values'}; missing TP/SL always restored\n"
         f"<b>API expiry reminders:</b> 30/21/14/7/1 days · check every "
         f"{max(3600, BYBIT_API_REMINDER_CHECK_SEC)}s"
     ))
@@ -10421,7 +10773,7 @@ async def on_startup(app: web.Application) -> None:
         "Phase 8L.3 signal-flow rollback · "
         "Phase 8L.4.3 persistent raw + BR/TP deep + BR shadow + TP stats analyzer · "
         "Phase 8M calibration review · Phase 9A Bybit RSA read-only bridge · Phase 9B minimum-size execution planner · Phase 9C net PnL + expiry safety shadow · Phase 9D isolated execution scenario simulator · "
-        "Phase 9E.2 LS live executor + isolated-balance + Telegram hotfix)"
+        "Phase 9E.3 LS live executor + manual protection override + command templates)"
     )
 
     # ── Startup safety warnings ───────────────────────────────────────────────
@@ -10432,7 +10784,7 @@ async def on_startup(app: web.Application) -> None:
     if not DRY_RUN_MODE:
         logger.warning("⚠️  DRY_RUN_MODE=False — bot is in LIVE SIGNALS mode")
     if LIVE_LS_EXECUTION_ENABLED and DRY_RUN_MODE:
-        logger.warning("Phase 9E.2 dual mode: strategy signals DRY_RUN=1 while LS live execution is independently enabled")
+        logger.warning("Phase 9E.3 dual mode: strategy signals DRY_RUN=1 while LS live execution is independently enabled")
     if _live_ls_is_armed():
         logger.warning(
             "🔴 PHASE 9E LIVE LS EXECUTION ARMED — real Bybit orders may be sent "
@@ -11181,7 +11533,7 @@ def _selftest_phase_9e_live_helpers() -> None:
         {"takeProfit": "105", "stopLoss": "0"}, 105.0, 95.0, 0.01
     )
 
-    # Phase 9E.2 isolated UTA balance hotfix: account-wide available may be
+    # Phase 9E.2/9E.3 isolated UTA balance hotfix: account-wide available may be
     # zero while coin-level USDT remains available.
     isolated_wallet = {
         "totalEquity": "29.99",
@@ -11200,6 +11552,25 @@ def _selftest_phase_9e_live_helpers() -> None:
     assert _wallet_usdt_equity(isolated_wallet) == Decimal("29.99")
     legacy_wallet = {"totalEquity": "30", "totalAvailableBalance": "27"}
     assert _wallet_usdt_available(legacy_wallet) == Decimal("27")
+
+    # Phase 9E.3 manual protection semantics: non-zero differences are adopted,
+    # zero/missing levels are not accepted as an override.
+    row = {"tp": 105.0, "sl": 95.0, "tp_source": "strategy", "sl_source": "strategy"}
+    changed = _adopt_live_protection_from_exchange(
+        row, {"takeProfit": "106", "stopLoss": "94"}, 0.01, at_ts=123
+    )
+    assert set(changed) == {"TP", "SL"}
+    assert row["tp"] == 106.0 and row["sl"] == 94.0
+    assert row["tp_source"] == "manual_bybit" and row["sl_source"] == "manual_bybit"
+    row2 = {"tp": 105.0, "sl": 95.0}
+    changed2 = _adopt_live_protection_from_exchange(
+        row2, {"takeProfit": "0", "stopLoss": "0"}, 0.01, at_ts=123
+    )
+    assert changed2 == [] and row2["tp"] == 105.0 and row2["sl"] == 95.0
+    assert _live_protection_geometry_ok("LONG", 100.0, 105.0, 95.0)
+    assert _live_protection_geometry_ok("SHORT", 100.0, 95.0, 105.0)
+    assert not _live_protection_geometry_ok("LONG", 100.0, 95.0, 105.0)
+    assert _SYMBOL_COMMAND_TEMPLATES["liveprotect"].startswith("/liveprotect SYMBOL")
 
 
 
